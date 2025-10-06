@@ -1,0 +1,7 @@
+livekit-agents
+ai-evaluation
+pandas
+livekit
+livekit-api
+pydantic
+python-dotenv
