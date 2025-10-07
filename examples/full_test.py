@@ -53,8 +53,8 @@ async def run_support_agent():
     # We'll keep the agent running by keeping the room connected
     print("Support agent is ready and waiting in the room...")
     
-    # Keep the connection alive
-    await asyncio.sleep(120)  # Wait for 2 minutes for testing
+    # Keep the connection alive for the test to run
+    await asyncio.sleep(45)  # Wait for 45 seconds
 
 async def run_test():
     """

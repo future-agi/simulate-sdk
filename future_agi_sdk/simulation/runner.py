@@ -4,22 +4,30 @@ from livekit.agents import stt, tts, llm, vad, Agent, AgentSession
 from livekit.plugins import openai, silero
 from livekit import rtc
 from livekit.api import AccessToken, VideoGrants
-from livekit.protocol import room
 import asyncio
 import os
 
-class TranscriptCollector:
-    def __init__(self):
-        self._parts = []
-        self._lock = asyncio.Lock()
+class _TestRunnerAgent(Agent):
+    """
+    An agent used by the TestRunner to simulate a customer.
+    """
+    def __init__(self, persona: Persona, **kwargs):
+        super().__init__(**kwargs)
+        self._persona = persona
+        self._session_future = asyncio.Future()
 
-    async def add_part(self, role: str, content: str):
-        async with self._lock:
-            self._parts.append(f"{role}: {content}")
+    async def run(self, room: rtc.Room):
+        session = AgentSession(
+            stt=self.stt,
+            llm=self.llm,
+            tts=self.tts,
+            vad=self.vad,
+        )
+        self._session_future.set_result(session)
+        await session.start(self, room=room)
 
-    async def get_transcript(self) -> str:
-        async with self._lock:
-            return "\n".join(self._parts)
+    async def get_session(self) -> AgentSession:
+        return await self._session_future
 
 class TestRunner:
     """
@@ -30,9 +38,6 @@ class TestRunner:
         agent_definition: AgentDefinition,
         scenario: Scenario,
     ) -> TestReport:
-        """
-        Executes the entire simulation against all test cases in a scenario.
-        """
         report = TestReport()
         for persona in scenario.dataset:
             print(f"Running test case for persona: {persona.persona.get('name', 'Unknown')}")
@@ -53,16 +58,12 @@ class TestRunner:
         agent_definition: AgentDefinition,
         persona: Persona,
     ) -> str:
-        """
-        Runs a single conversation between a simulated customer and the deployed agent.
-        """
         livekit_api_key = os.environ.get("LIVEKIT_API_KEY")
         livekit_api_secret = os.environ.get("LIVEKIT_API_SECRET")
 
         if not all([livekit_api_key, livekit_api_secret]):
             raise ValueError("LIVEKIT_API_KEY and LIVEKIT_API_SECRET must be set.")
 
-        collector = TranscriptCollector()
         customer_room = rtc.Room()
         
         try:
@@ -77,19 +78,25 @@ class TestRunner:
             print(f"✓ Customer '{persona.persona.get('name')}' connected to room")
             
             customer_agent = self._create_customer_agent(persona)
-            customer_session = AgentSession()
-
-            @customer_session.on("conversation_item_added")
-            def on_conversation_item(item: llm.ChatItem):
-                asyncio.create_task(collector.add_part(item.role, item.text))
-
-            # Start the session in a background task
+            
+            # Start the agent in a background task
             session_task = asyncio.create_task(
-                customer_session.start(customer_agent, room=customer_room)
+                customer_agent.run(room=customer_room)
             )
 
-            # Let the conversation run for a set duration
-            await asyncio.sleep(30)
+            # Wait for the session to be created
+            customer_session = await customer_agent.get_session()
+
+            # Let the conversation run
+            await asyncio.sleep(15)
+            
+            # Get transcript from history
+            if customer_agent.session:
+                print(f"DEBUG: customer_agent attributes: {dir(customer_agent)}")
+                print(f"DEBUG: Session history has {len(customer_agent.session.history.items)} items.")
+                transcript = "\n".join([f"{item.role}: {item.text}" for item in customer_agent.session.history.items])
+            else:
+                transcript = "Error: Agent session was not created."
             
         except Exception as e:
             print(f"Error during test case: {e}")
@@ -99,12 +106,13 @@ class TestRunner:
                 await customer_room.disconnect()
                 print(f"✓ Customer disconnected")
         
-        return await collector.get_transcript()
+        return transcript
 
-    def _create_customer_agent(self, persona: Persona) -> Agent:
+    def _create_customer_agent(self, persona: Persona) -> _TestRunnerAgent:
         customer_prompt = self._create_customer_prompt(persona)
         
-        agent = Agent(
+        agent = _TestRunnerAgent(
+            persona=persona,
             stt=openai.STT(),
             llm=openai.LLM(model="gpt-4o"),
             tts=openai.TTS(voice="onyx"),
@@ -114,9 +122,6 @@ class TestRunner:
         return agent
 
     def _create_customer_prompt(self, persona: Persona) -> str:
-        """
-        Generates the system prompt for the simulated customer.
-        """
         return f"You are a customer with the following characteristics: {persona.persona}. " \
                f"Currently, {persona.situation}. " \
                f"Your goal is to achieve this outcome: {persona.outcome}."
