@@ -1,5 +1,6 @@
 from .agent import (
     AgentDefinition,
+    SimulatorAgentDefinition,
     LLMConfig,
     TTSConfig,
     STTConfig,
@@ -16,6 +17,7 @@ from .simulation import (
 
 __all__ = [
     "AgentDefinition",
+    "SimulatorAgentDefinition",
     "LLMConfig",
     "TTSConfig",
     "STTConfig",

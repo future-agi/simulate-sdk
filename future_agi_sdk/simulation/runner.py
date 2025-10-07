@@ -1,4 +1,4 @@
-from ..agent.definition import AgentDefinition
+from ..agent.definition import AgentDefinition, SimulatorAgentDefinition
 from .models import Scenario, Persona, TestReport, TestCaseResult
 from livekit.agents import stt, tts, llm, vad, Agent, AgentSession
 from livekit.agents.voice.room_io import RoomInputOptions, RoomOutputOptions
@@ -8,6 +8,7 @@ from livekit.api import AccessToken, VideoGrants
 from livekit.agents.voice import ModelSettings
 from livekit.agents.voice.io import TimedString
 from typing import AsyncIterable
+from .generator import ScenarioGenerator
 import asyncio
 import os
 
@@ -57,13 +58,27 @@ class TestRunner:
     async def run_test(
         self,
         agent_definition: AgentDefinition,
-        scenario: Scenario,
+        scenario: Scenario | None,
+        simulator: SimulatorAgentDefinition | None = None,
+        num_scenarios: int = 1,
+        topic: str | None = None,
     ) -> TestReport:
+        # If no scenario provided, generate personas using generator
+        if scenario is None:
+            gen = ScenarioGenerator(agent_definition)
+            # Build a simple topic from provided context if none given
+            if topic is None:
+                agent_ctx = agent_definition.system_prompt
+                sim_ctx = simulator.instructions if simulator and simulator.instructions else ""
+                topic = (sim_ctx or agent_ctx or "customer support scenarios").strip()
+            personas = await gen.generate(topic=topic, num_personas=num_scenarios)
+            scenario = Scenario(name="Generated Scenario", dataset=personas)
+
         report = TestReport()
         for persona in scenario.dataset:
             print(f"Running test case for persona: {persona.persona.get('name', 'Unknown')}")
             
-            transcript = await self._run_single_test_case(agent_definition, persona)
+            transcript = await self._run_single_test_case(agent_definition, persona, simulator)
             
             report.results.append(
                 TestCaseResult(
@@ -78,6 +93,7 @@ class TestRunner:
         self,
         agent_definition: AgentDefinition,
         persona: Persona,
+        simulator: SimulatorAgentDefinition | None,
     ) -> str:
         livekit_api_key = os.environ.get("LIVEKIT_API_KEY")
         livekit_api_secret = os.environ.get("LIVEKIT_API_SECRET")
@@ -98,7 +114,7 @@ class TestRunner:
             await customer_room.connect(url=str(agent_definition.url), token=token)
             print(f"✓ Customer '{persona.persona.get('name')}' connected to room")
             
-            customer_agent = self._create_customer_agent(persona)
+            customer_agent = self._create_customer_agent(persona, simulator)
             
             # Start the agent in a background task
             session_task = asyncio.create_task(
@@ -181,16 +197,46 @@ class TestRunner:
         
         return transcript
 
-    def _create_customer_agent(self, persona: Persona) -> _TestRunnerAgent:
+    def _create_customer_agent(self, persona: Persona, simulator: SimulatorAgentDefinition | None) -> _TestRunnerAgent:
         customer_prompt = self._create_customer_prompt(persona)
-        
+
+        # Build components from simulator config or use sensible defaults
+        if simulator is None:
+            stt_model = openai.STT(language="en")
+            llm_model = openai.LLM(model="gpt-4o-mini", temperature=0.6)
+            tts_model = openai.TTS(model="tts-1", voice="alloy")
+            vad_model = silero.VAD.load()
+            instructions = customer_prompt
+            allow_interruptions = None
+            min_ep = None
+            max_ep = None
+            use_aligned = None
+        else:
+            stt_model = openai.STT(language=simulator.stt.language)
+            llm_model = openai.LLM(model=simulator.llm.model, temperature=simulator.llm.temperature)
+            tts_model = openai.TTS(model=simulator.tts.model, voice=simulator.tts.voice)
+            vad_model = silero.VAD.load()
+            # Merge simulator instructions with persona-derived prompt so both are applied
+            if simulator.instructions:
+                instructions = f"{simulator.instructions}\n\n{customer_prompt}"
+            else:
+                instructions = customer_prompt
+            allow_interruptions = simulator.allow_interruptions
+            min_ep = simulator.min_endpointing_delay
+            max_ep = simulator.max_endpointing_delay
+            use_aligned = simulator.use_tts_aligned_transcript
+
         agent = _TestRunnerAgent(
             persona=persona,
-            stt=openai.STT(),
-            llm=openai.LLM(model="gpt-4o"),
-            tts=openai.TTS(voice="onyx"),
-            vad=silero.VAD.load(),
-            instructions=customer_prompt,
+            stt=stt_model,
+            llm=llm_model,
+            tts=tts_model,
+            vad=vad_model,
+            instructions=instructions,
+            allow_interruptions=allow_interruptions,
+            min_endpointing_delay=min_ep,
+            max_endpointing_delay=max_ep,
+            use_tts_aligned_transcript=use_aligned,
         )
         return agent
 

@@ -3,6 +3,7 @@ from pydantic import BaseModel, Field
 from ..agent.definition import AgentDefinition
 from .models import Persona
 from livekit.plugins import openai
+from livekit.agents.llm.chat_context import ChatContext
 import json
 
 class ScenarioGenerator:
@@ -20,14 +21,35 @@ class ScenarioGenerator:
         """
         prompt = self._create_generation_prompt(topic, num_personas)
         
-        response = await self._llm.complete(prompt=prompt, json_mode=True)
+        # Use chat() with a ChatContext, request JSON response format
+        chat_ctx = ChatContext.empty()
+        chat_ctx.add_message(role="user", content=prompt)
+        # Do not force response_format; rely on prompt to return strict JSON
+        stream = self._llm.chat(chat_ctx=chat_ctx)
+        # Collect full text
+        text = ""
+        async for chunk in stream.to_str_iterable():
+            text += chunk
+        print("Scenario Generated:\n" + text)
         
         try:
-            generated_data = json.loads(response.text)
+            # Try direct parse; if it fails, attempt to extract fenced JSON
+            try:
+                generated_data = json.loads(text)
+            except Exception:
+                s = text.strip()
+                if "```" in s:
+                    parts = s.split("```")
+                    for p in parts:
+                        ps = p.strip()
+                        if ps.startswith("{") and ps.endswith("}"):
+                            s = ps
+                            break
+                generated_data = json.loads(s)
             personas = [Persona(**p) for p in generated_data["personas"]]
             return personas
         except (json.JSONDecodeError, KeyError) as e:
-            raise ValueError(f"Failed to parse generated scenarios: {e}\nRaw response: {response.text}")
+            raise ValueError(f"Failed to parse generated scenarios: {e}\nRaw response: {text}")
 
     def _create_generation_prompt(self, topic: str, num_personas: int) -> str:
         agent_context = self._agent_definition.system_prompt or self._agent_definition.description or ""
