@@ -4,6 +4,9 @@ from livekit.agents import stt, tts, llm, vad, Agent, AgentSession
 from livekit.plugins import openai, silero
 from livekit import rtc
 from livekit.api import AccessToken, VideoGrants
+from livekit.agents.voice import ModelSettings
+from livekit.agents.voice.io import TimedString
+from typing import AsyncIterable
 import asyncio
 import os
 
@@ -28,6 +31,18 @@ class _TestRunnerAgent(Agent):
 
     async def get_session(self) -> AgentSession:
         return await self._session_future
+
+    async def transcription_node(
+        self,
+        text: AsyncIterable[str | TimedString],
+        model_settings: ModelSettings,
+    ):
+        async for chunk in text:
+            if isinstance(chunk, TimedString):
+                print(f"ASR: '{chunk}' ({getattr(chunk, 'start_time', None)} - {getattr(chunk, 'end_time', None)})")
+            else:
+                print(f"LLM: {chunk}")
+            yield chunk
 
 class TestRunner:
     """
@@ -94,7 +109,14 @@ class TestRunner:
             if customer_agent.session:
                 print(f"DEBUG: customer_agent attributes: {dir(customer_agent)}")
                 print(f"DEBUG: Session history has {len(customer_agent.session.history.items)} items.")
-                transcript = "\n".join([f"{item.role}: {item.text}" for item in customer_agent.session.history.items])
+                lines = []
+                for item in customer_agent.session.history.items:
+                    item_type = getattr(item, "type", None)
+                    role = getattr(item, "role", None)
+                    text = getattr(item, "text_content", None)
+                    if item_type == "message" and text is not None:
+                        lines.append(f"{role}: {text}")
+                transcript = "\n".join(lines)
             else:
                 transcript = "Error: Agent session was not created."
             

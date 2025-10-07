@@ -49,8 +49,15 @@ async def run_support_agent():
     
     print(f"✓ Support agent connected to room: {TEST_ROOM}")
     
-    # Note: AgentSession initialization may vary by version
-    # We'll keep the agent running by keeping the room connected
+    # Start a Voice session for the agent and send a greeting
+    session = AgentSession(
+        stt=agent.stt,
+        llm=agent.llm,
+        tts=agent.tts,
+        vad=agent.vad,
+    )
+    await session.start(agent, room=room)
+    session.say("Hello! How can I help you today?")
     print("Support agent is ready and waiting in the room...")
     
     # Keep the connection alive for the test to run
