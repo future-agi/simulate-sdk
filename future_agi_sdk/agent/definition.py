@@ -48,3 +48,4 @@ class AgentDefinition(BaseModel):
                 "system_prompt": "You are a friendly and helpful support agent."
             }
         }
+

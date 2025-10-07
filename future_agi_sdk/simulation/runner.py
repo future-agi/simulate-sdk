@@ -1,6 +1,7 @@
 from ..agent.definition import AgentDefinition
 from .models import Scenario, Persona, TestReport, TestCaseResult
 from livekit.agents import stt, tts, llm, vad, Agent, AgentSession
+from livekit.agents.voice.room_io import RoomInputOptions, RoomOutputOptions
 from livekit.plugins import openai, silero
 from livekit import rtc
 from livekit.api import AccessToken, VideoGrants
@@ -27,7 +28,12 @@ class _TestRunnerAgent(Agent):
             vad=self.vad,
         )
         self._session_future.set_result(session)
-        await session.start(self, room=room)
+        await session.start(
+            self,
+            room=room,
+            room_input_options=RoomInputOptions(delete_room_on_close=False),
+            room_output_options=RoomOutputOptions(transcription_enabled=False),
+        )
 
     async def get_session(self) -> AgentSession:
         return await self._session_future
@@ -102,20 +108,54 @@ class TestRunner:
             # Wait for the session to be created
             customer_session = await customer_agent.get_session()
 
-            # Let the conversation run
-            await asyncio.sleep(15)
+            # Stream transcripts and messages in real-time
+            def _on_user_input_transcribed(ev):
+                try:
+                    suffix = "" if getattr(ev, "is_final", False) else "…"
+                    print(f"ASR(user): {getattr(ev, 'transcript', '')}{suffix}")
+                except Exception:
+                    pass
+
+            def _on_conversation_item_added(ev):
+                try:
+                    item = getattr(ev, "item", None)
+                    role = getattr(item, "role", None)
+                    text = getattr(item, "text_content", None)
+                    if role and text:
+                        print(f"MSG({role}): {text}")
+                except Exception:
+                    pass
+
+            customer_session.on("user_input_transcribed", _on_user_input_transcribed)
+            customer_session.on("conversation_item_added", _on_conversation_item_added)
+
+            # Wait for the agent session to close naturally
+            closed = asyncio.Event()
+            def _on_close(ev):
+                closed.set()
+            customer_session.on("close", _on_close)
+            await closed.wait()
             
-            # Get transcript from history
-            if customer_agent.session:
-                print(f"DEBUG: customer_agent attributes: {dir(customer_agent)}")
-                print(f"DEBUG: Session history has {len(customer_agent.session.history.items)} items.")
-                lines = []
-                for item in customer_agent.session.history.items:
+            # Get transcript from history (dedupe partial repeats)
+            if customer_session:
+                lines: list[str] = []
+                last_by_role: dict[str, str] = {}
+                for item in customer_session.history.items:
                     item_type = getattr(item, "type", None)
                     role = getattr(item, "role", None)
                     text = getattr(item, "text_content", None)
-                    if item_type == "message" and text is not None:
-                        lines.append(f"{role}: {text}")
+                    if item_type == "message" and text is not None and role is not None:
+                        prev = last_by_role.get(role)
+                        # Deduplicate streaming partials by collapsing near-duplicates
+                        if prev and (text.startswith(prev) or prev.startswith(text)):
+                            # Replace last line for this role
+                            for i in range(len(lines) - 1, -1, -1):
+                                if lines[i].startswith(f"{role}:"):
+                                    lines[i] = f"{role}: {text}"
+                                    break
+                        else:
+                            lines.append(f"{role}: {text}")
+                        last_by_role[role] = text
                 transcript = "\n".join(lines)
             else:
                 transcript = "Error: Agent session was not created."
@@ -124,8 +164,19 @@ class TestRunner:
             print(f"Error during test case: {e}")
             return f"Error: {e}"
         finally:
-            if customer_room.isconnected():
-                await customer_room.disconnect()
+            # Support both property and method across versions
+            try:
+                if getattr(customer_room, "isconnected", False):
+                    if callable(customer_room.isconnected):
+                        if customer_room.isconnected():
+                            await customer_room.disconnect()
+                    elif customer_room.isconnected:
+                        await customer_room.disconnect()
+                elif getattr(customer_room, "is_connected", False):
+                    if customer_room.is_connected:
+                        await customer_room.disconnect()
+            except Exception:
+                pass
                 print(f"✓ Customer disconnected")
         
         return transcript
@@ -144,6 +195,13 @@ class TestRunner:
         return agent
 
     def _create_customer_prompt(self, persona: Persona) -> str:
-        return f"You are a customer with the following characteristics: {persona.persona}. " \
-               f"Currently, {persona.situation}. " \
-               f"Your goal is to achieve this outcome: {persona.outcome}."
+        return (
+            "You are a realistic customer in a support call. "
+            f"Profile: {persona.persona}. "
+            f"Situation: {persona.situation}. "
+            f"Goal: {persona.outcome}. "
+            "Have a natural back-and-forth conversation, asking clarifying questions. "
+            "Keep the conversation going for at least 6 turns unless the problem is fully solved. "
+            "When you are satisfied and done, explicitly say: 'Thanks, that's all'. "
+            "Use short, spoken-style sentences."
+        )
