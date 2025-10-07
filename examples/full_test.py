@@ -1,6 +1,7 @@
 import sys
 import os
 import asyncio
+import contextlib
 
 # Add the project root to the Python path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -21,6 +22,7 @@ LIVEKIT_URL = os.environ.get("LIVEKIT_URL", "http://localhost:7880")
 LIVEKIT_API_KEY = os.environ.get("LIVEKIT_API_KEY", "devkey")
 LIVEKIT_API_SECRET = os.environ.get("LIVEKIT_API_SECRET", "secret")
 TEST_ROOM = "test-room-001"
+STOP_EVENT: asyncio.Event | None = None
 
 class SupportAgent(Agent):
     def __init__(self, *, room: rtc.Room, **kwargs):
@@ -108,13 +110,25 @@ async def run_support_agent():
     session.say("Hello! How can I help you today?")
     print("Support agent is ready and waiting in the room...")
     
-    # Wait for the agent session to close naturally (via end_call tool)
+    # Wait for the agent session to close naturally (via end_call tool) or STOP_EVENT
     closed = asyncio.Event()
     def _on_close(ev):
         closed.set()
     session.on("close", _on_close)
     try:
-        await closed.wait()
+        global STOP_EVENT
+        if STOP_EVENT is None:
+            STOP_EVENT = asyncio.Event()
+        # Wait for either session close or external stop
+        done, pending = await asyncio.wait(
+            [asyncio.create_task(closed.wait()), asyncio.create_task(STOP_EVENT.wait())],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        # If we were asked to stop explicitly, shutdown gracefully and wait for close
+        if STOP_EVENT.is_set() and not closed.is_set():
+            self_shutdown = True
+            session.shutdown()
+            await closed.wait()
     finally:
         # If still connected for any reason, disconnect the room
         try:
@@ -181,12 +195,18 @@ async def main():
     try:
         await run_test()
     finally:
-        # Clean up
-        agent_task.cancel()
+        # Signal support agent to shutdown gracefully
+        global STOP_EVENT
+        if STOP_EVENT is None:
+            STOP_EVENT = asyncio.Event()
+        STOP_EVENT.set()
+        # Give it a moment to drain and exit
         try:
-            await agent_task
-        except asyncio.CancelledError:
-            pass
+            await asyncio.wait_for(agent_task, timeout=10)
+        except asyncio.TimeoutError:
+            agent_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await agent_task
 
 if __name__ == "__main__":
     asyncio.run(main())
