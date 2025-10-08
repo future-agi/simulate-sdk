@@ -22,11 +22,21 @@ class _TestRunnerAgent(Agent):
         self._session_future = asyncio.Future()
 
     async def run(self, room: rtc.Room):
+        # Coalesce None simulator values to safe defaults
+        _min_ep = getattr(self, "min_endpointing_delay", None)
+        _max_ep = getattr(self, "max_endpointing_delay", None)
+
         session = AgentSession(
             stt=self.stt,
             llm=self.llm,
             tts=self.tts,
-            vad=self.vad,
+            vad=None,
+            allow_interruptions=getattr(self, "allow_interruptions", True),
+            # Use safe defaults for endpointing delays (required by bounce task)
+            min_endpointing_delay=(_min_ep if _min_ep is not None else 0.3),
+            max_endpointing_delay=(_max_ep if _max_ep is not None else 4.0),
+            # Use STT-based turn detection for stability
+            turn_detection=getattr(self, "turn_detection", "stt"),
         )
         self._session_future.set_result(session)
         await session.start(
@@ -35,9 +45,19 @@ class _TestRunnerAgent(Agent):
             room_input_options=RoomInputOptions(delete_room_on_close=False),
             room_output_options=RoomOutputOptions(transcription_enabled=False),
         )
+        # Reinforce numeric endpointing on the live session
+        try:
+            session.update_options(
+                min_endpointing_delay=(_min_ep if _min_ep is not None else 0.3),
+                max_endpointing_delay=(_max_ep if _max_ep is not None else 4.0),
+            )
+        except Exception:
+            pass
 
     async def get_session(self) -> AgentSession:
         return await self._session_future
+
+    # Use default stt_node; session-level endpointing is configured in AgentSession
 
     async def transcription_node(
         self,

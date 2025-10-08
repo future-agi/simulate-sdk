@@ -37,6 +37,18 @@ class TestCaseResult(BaseModel):
     """
     persona: Persona = Field(..., description="The original persona that was run.")
     transcript: str = Field(..., description="The full transcript of the conversation.")
+    evaluation: dict | None = Field(
+        default=None,
+        description="Optional evaluation results (scores, reasons) keyed by template.",
+    )
+    audio_input_path: str | None = Field(
+        default=None,
+        description="Optional path to recorded customer (input) audio for this test.",
+    )
+    audio_output_path: str | None = Field(
+        default=None,
+        description="Optional path to recorded agent (output) audio for this test.",
+    )
 
 class TestReport(BaseModel):
     """

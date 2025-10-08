@@ -14,6 +14,7 @@ from .simulation import (
     TestRunner,
     ScenarioGenerator,
 )
+from .evaluation import evaluate_report
 
 __all__ = [
     "AgentDefinition",
@@ -28,4 +29,5 @@ __all__ = [
     "TestCaseResult",
     "TestRunner",
     "ScenarioGenerator",
+    "evaluate_report",
 ]
