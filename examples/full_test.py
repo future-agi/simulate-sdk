@@ -2,8 +2,7 @@ import sys
 import os
 import asyncio
 import contextlib
-from glob import glob
-import numpy as np
+import uuid
 import wave
 
 # Add the project root to the Python path
@@ -60,12 +59,6 @@ class SupportAgent(Agent):
             except Exception:
                 pass
 
-    async def on_user_turn_completed(self, turn_ctx, new_message):
-        # If the user indicates they're done, end the call naturally
-        text = (getattr(new_message, "text_content", None) or "").lower()
-        if any(kw in text for kw in ["thanks", "thank you", "that's all", "thats all", "done", "goodbye", "bye"]):
-            await self.end_call()
-
     async def stt_node(self, audio, model_settings):
         # Use default behavior; no local disk tap to reduce overhead
         return Agent.default.stt_node(self, audio, model_settings)
@@ -74,7 +67,7 @@ class SupportAgent(Agent):
         # Use default behavior; no local disk tap to reduce overhead
         return Agent.default.tts_node(self, text, model_settings)
 
-async def run_support_agent():
+async def run_support_agent(room_name: str):
     """
     This simulates the 'agent-under-test' - the agent we want to test.
     In a real scenario, this would be the user's deployed agent.
@@ -85,7 +78,7 @@ async def run_support_agent():
     token = (
         AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
         .with_identity("support-agent")
-        .with_grants(VideoGrants(room_join=True, room=TEST_ROOM))
+        .with_grants(VideoGrants(room_join=True, room=room_name))
         .to_jwt()
     )
     
@@ -93,7 +86,7 @@ async def run_support_agent():
     room = rtc.Room()
     await room.connect(LIVEKIT_URL, token)
 
-    print(f"✓ Support agent connected to room: {TEST_ROOM}")
+    print(f"✓ Support agent connected to room: {room_name}")
 
     # Create and configure the support agent (after room exists)
     agent = SupportAgent(
@@ -127,7 +120,7 @@ async def run_support_agent():
         max_endpointing_delay=2.2,
         preemptive_generation=False,
         discard_audio_if_uninterruptible=False,
-        min_interruption_duration=0.2,
+        min_interruption_duration=0.3,
     )
     await session.start(
         agent,
@@ -163,7 +156,7 @@ async def run_support_agent():
             print(f"Local recording failed: {e}")
 
     session.say("Hello! How can I help you today?")
-    print("Support agent is ready and waiting in the room...")
+    print(f"Support agent is ready and waiting in room {room_name}...")
 
     # Wait for the agent session to close naturally (via end_call tool) or STOP_EVENT
     closed = asyncio.Event()
@@ -268,20 +261,6 @@ async def run_support_agent():
             with contextlib.suppress(Exception):
                 await record_task
 
-def _find_room_recordings(room_name: str, identity: str | None = None, output_dir: str = "recordings") -> list[str]:
-    pattern = f"{room_name}-*-track-*.wav" if identity is None else f"{room_name}-{identity}-track-*.wav"
-    paths = glob(os.path.join(output_dir, pattern))
-    # newest first
-    return sorted(paths, key=lambda p: os.path.getmtime(p), reverse=True)
-
-
-def _pick_best_recording(paths: list[str]) -> str | None:
-    if not paths:
-        return None
-    # prefer longest (by bytes), break ties by newest mtime
-    return max(paths, key=lambda p: (os.path.getsize(p), os.path.getmtime(p)))
-
-
 async def run_test():
     """
     This uses our SDK to test the deployed agent.
@@ -318,93 +297,64 @@ async def run_test():
         ]
     )
 
-    # 3. Run the test
+    # 3. Run each persona in a fresh room to avoid carryover state
     runner = TestRunner()
-    # Enable SDK recorder participant via TestRunner
-    report = await runner.run_test(
-        agent_definition,
-        scenario,
-        record_audio=True,
-        recorder_sample_rate=8000,
-        recorder_join_delay=0.1,
-        min_turn_messages=12,
-        max_seconds=120.0,
-    )
+    from future_agi_sdk.simulation.models import TestReport
+    full_report = TestReport()
+    for persona in scenario.dataset:
+        room_name = f"{TEST_ROOM}-{persona.persona.get('name','user').lower()}-{str(uuid.uuid4())[:8]}"
 
-    # Attach separate paths and build combined recording BEFORE evaluation
-    for r in report.results:
+        # Start the support agent for this persona/room
+        agent_task = asyncio.create_task(run_support_agent(room_name))
+        await asyncio.sleep(2.0)
+
+        case_scenario = Scenario(name=f"Case-{persona.persona.get('name','user')}", dataset=[persona])
+        case_agent_def = AgentDefinition(
+            name=agent_definition.name,
+            url=agent_definition.url,
+            room_name=room_name,
+            system_prompt=agent_definition.system_prompt,
+        )
+
         try:
-            persona_name = r.persona.persona.get("name")
-        except Exception:
-            persona_name = None
-
-        customer_paths = _find_room_recordings(TEST_ROOM, identity=persona_name) if persona_name else []
-        agent_paths = _find_room_recordings(TEST_ROOM, identity="support-agent")
-
-        if not getattr(r, "audio_input_path", None):
-            r.audio_input_path = _pick_best_recording(customer_paths)
-        if not getattr(r, "audio_output_path", None):
-            r.audio_output_path = _pick_best_recording(agent_paths)
-
-    # Build a single combined WAV
-    combined_path: str | None = None
-    try:
-        mix_inputs: list[str] = []
-        for r in report.results:
-            if getattr(r, "audio_input_path", None):
-                mix_inputs.append(r.audio_input_path)
-            if getattr(r, "audio_output_path", None):
-                mix_inputs.append(r.audio_output_path)
-        if not mix_inputs:
-            mix_inputs = _find_room_recordings(TEST_ROOM)
-        mix_inputs = [p for p in mix_inputs if p and os.path.basename(p) != f"{TEST_ROOM}-combined.wav"]
-
-        if mix_inputs:
-            os.makedirs("recordings", exist_ok=True)
-            combined_path = os.path.join("recordings", f"{TEST_ROOM}-combined.wav")
-            arrays = []
-            max_len = 0
-            for p in mix_inputs:
-                with wave.open(p, "rb") as wf:
-                    frames = wf.readframes(wf.getnframes())
-                    arr = np.frombuffer(frames, dtype=np.int16)
-                    arrays.append(arr)
-                    if arr.shape[0] > max_len:
-                        max_len = arr.shape[0]
-            if arrays and max_len > 0:
-                mix = np.zeros(max_len, dtype=np.int32)
-                for arr in arrays:
-                    if arr.shape[0] < max_len:
-                        pad = np.zeros(max_len - arr.shape[0], dtype=arr.dtype)
-                        arr = np.concatenate([arr, pad])
-                    mix += arr.astype(np.int32)
-                mix = np.clip(mix, -32768, 32767).astype(np.int16)
-                with wave.open(combined_path, "wb") as wf_out:
-                    wf_out.setnchannels(1)
-                    wf_out.setsampwidth(2)
-                    wf_out.setframerate(8000)
-                    wf_out.writeframes(mix.tobytes())
-                print(f"✓ Combined conversation saved: {combined_path}")
-    except Exception as e:
-        print(f"Combined mix failed: {e}")
-
-    # Attach combined path to each result (same file)
-    if combined_path:
-        for r in report.results:
-            r.audio_combined_path = combined_path
+            case_report = await runner.run_test(
+                case_agent_def,
+                case_scenario,
+                record_audio=True,
+                recorder_sample_rate=8000,
+                recorder_join_delay=0.1,
+                min_turn_messages=12,
+                max_seconds=300.0,
+            )
+            full_report.results.extend(case_report.results)
+        finally:
+            # Ask the agent to shutdown
+            global STOP_EVENT
+            if STOP_EVENT is None:
+                STOP_EVENT = asyncio.Event()
+            STOP_EVENT.set()
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(agent_task, timeout=10)
+            if not agent_task.done():
+                agent_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await agent_task
+            # reset STOP_EVENT for next loop
+            STOP_EVENT = None
+            await asyncio.sleep(1.0)
+    report = full_report
 
     # Evaluate with ai-evaluation (requires FI_API_KEY/FI_SECRET_KEY)
     try:
         eval_specs = [
             {"template": "task_completion", "map": {"input": "persona.situation", "output": "transcript"}},
             {"template": "tone", "map": {"input": "transcript"}},
-            # Example audio eval (template name depends on your templates)
-            {"template": "audio_transcription_accuracy", "map": {"audio_path": "audio_output_path"}},
+            {"template": "audio_transcription", "map": {"audio": "audio_combined_path", "transcription": "transcript"}},
         ]
         report = evaluate_report(
             report,
             eval_specs=eval_specs,
-            model_name="turing_flash",
+            model_name="turing_large",
             api_key=os.environ.get("FI_API_KEY"),
             secret_key=os.environ.get("FI_SECRET_KEY"),
         )
@@ -419,6 +369,8 @@ async def run_test():
         print(f"\nPersona: {result.persona.persona['name']}")
         print(f"\nTranscript:")
         print(result.transcript)
+        if getattr(result, "audio_combined_path", None):
+            print(f"Combined audio: {result.audio_combined_path}")
         if result.evaluation:
             print("\nEvaluation:")
             for k, v in result.evaluation.items():
@@ -429,31 +381,8 @@ async def main():
     """
     Run both the support agent and the test in sequence.
     """
-    # Start the support agent in a background task
-    agent_task = asyncio.create_task(run_support_agent())
-
-    # No passive recorder participant; relying on track_subscribed within the agent's room
-    
-    # Wait a moment for the agent to connect
-    await asyncio.sleep(2)
-    
-    # Run the test (this will block until complete)
-    try:
-        await run_test()
-    finally:
-        # Signal support agent to shutdown gracefully
-        global STOP_EVENT
-        if STOP_EVENT is None:
-            STOP_EVENT = asyncio.Event()
-        STOP_EVENT.set()
-        # Give it a moment to drain and exit
-        try:
-            await asyncio.wait_for(agent_task, timeout=10)
-        except asyncio.TimeoutError:
-            agent_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await agent_task
-        # Combined WAV already built earlier in run_test(); nothing to do here
+    # Run the test; per-persona agent lifecycles are handled inside run_test
+    await run_test()
 
 if __name__ == "__main__":
     asyncio.run(main())
