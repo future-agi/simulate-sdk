@@ -12,7 +12,7 @@ This SDK allows you to rigorously test your deployed voice AI agents by simulati
 - **Scenario Creation**: Define test cases with customer personas, situations, and desired outcomes
 - **Automated Testing**: Run multiple test scenarios against your agent
 - **Transcript Collection**: Automatically record full conversation transcripts
-- **Evaluation Integration**: (Coming soon) Integrate with Future AGI's evaluation service
+- **Evaluation Integration**: Integrate with Future AGI's evaluation service (ai-evaluation)
 
 ## Installation
 
@@ -64,7 +64,7 @@ FI_SECRET_KEY="your-fi-secret-key"
 ### Example Usage
 
 ```python
-from future_agi_sdk import AgentDefinition, Scenario, Persona, TestRunner
+from fi.simulate import AgentDefinition, Scenario, Persona, TestRunner
 
 # 1. Define your deployed agent
 agent_definition = AgentDefinition(
@@ -98,7 +98,7 @@ for result in report.results:
 ## Project Structure
 
 ```
-future_agi_sdk/
+fi/simulate/
 ├── agent/
 │   └── definition.py    # AgentDefinition and configuration models
 ├── simulation/

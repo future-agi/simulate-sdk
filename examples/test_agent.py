@@ -1,10 +1,7 @@
 import sys
 import os
 
-# Add the project root to the Python path
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-
-from future_agi_sdk import AgentDefinition, Scenario, Persona, TestRunner
+from ..fi.simulate import AgentDefinition, Scenario, Persona, TestRunner
 from dotenv import load_dotenv
 
 load_dotenv()

@@ -1,14 +1,12 @@
 import sys
 import os
 
-# Add the project root to the Python path so that future_agi_sdk can be imported
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 import asyncio
 import uuid
 import contextlib
 from dotenv import load_dotenv
-from future_agi_sdk import AgentDefinition, Scenario, Persona, TestRunner, evaluate_report
+from ..fi.simulate import AgentDefinition, Scenario, Persona, TestRunner, evaluate_report
 from livekit import rtc
 from livekit.api import AccessToken, VideoGrants
 from livekit.agents import Agent, AgentSession, function_tool
@@ -153,7 +151,7 @@ async def main():
                 pass
 
         # Aggregate report across personas
-        from future_agi_sdk.simulation.models import TestReport
+        from ..fi.simulate.simulation.models import TestReport
         full_report = TestReport()
 
         lk_api_key = os.environ.get("LIVEKIT_API_KEY")

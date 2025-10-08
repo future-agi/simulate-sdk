@@ -1,10 +1,7 @@
 import sys
 import os
 
-# Add the project root to the Python path to allow importing the SDK
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-
-from future_agi_sdk import AgentDefinition, Scenario, TestRunner, ScenarioGenerator
+from ..fi.simulate import AgentDefinition, Scenario, TestRunner, ScenarioGenerator
 from dotenv import load_dotenv
 import asyncio
 
