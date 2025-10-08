@@ -42,8 +42,8 @@ class _TestRunnerAgent(Agent):
             # Use STT-based turn detection for stability
             turn_detection=getattr(self, "turn_detection", "stt"),
             preemptive_generation=False,
-            discard_audio_if_uninterruptible=False,
-            min_interruption_duration=0.2,
+            discard_audio_if_uninterruptible=True,
+            min_interruption_duration=0.3,
         )
         self._session_future.set_result(session)
         await session.start(
