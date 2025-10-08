@@ -3,7 +3,7 @@ import os
 import asyncio
 import contextlib
 
-from ..fi.simulate import (
+from fi.simulate import (
     AgentDefinition,
     Scenario,
     Persona,

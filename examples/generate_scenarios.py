@@ -1,7 +1,7 @@
 import sys
 import os
 
-from ..fi.simulate import AgentDefinition, Scenario, TestRunner, ScenarioGenerator
+from fi.simulate import AgentDefinition, Scenario, TestRunner, ScenarioGenerator
 from dotenv import load_dotenv
 import asyncio
 
