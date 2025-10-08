@@ -49,6 +49,10 @@ class TestCaseResult(BaseModel):
         default=None,
         description="Optional path to recorded agent (output) audio for this test.",
     )
+    audio_combined_path: str | None = Field(
+        default=None,
+        description="Optional path to a single WAV containing the mixed conversation.",
+    )
 
 class TestReport(BaseModel):
     """

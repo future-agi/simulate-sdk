@@ -8,6 +8,10 @@ from livekit.api import AccessToken, VideoGrants
 from livekit.agents.voice import ModelSettings
 from livekit.agents.voice.io import TimedString
 from typing import AsyncIterable
+import contextlib
+from ..recording import RoomRecorder
+import wave
+import numpy as np
 from .generator import ScenarioGenerator
 import asyncio
 import os
@@ -31,12 +35,15 @@ class _TestRunnerAgent(Agent):
             llm=self.llm,
             tts=self.tts,
             vad=None,
-            allow_interruptions=getattr(self, "allow_interruptions", True),
-            # Use safe defaults for endpointing delays (required by bounce task)
-            min_endpointing_delay=(_min_ep if _min_ep is not None else 0.3),
-            max_endpointing_delay=(_max_ep if _max_ep is not None else 4.0),
+            allow_interruptions=True,
+            # Stable endpointing delays
+            min_endpointing_delay=(_min_ep if _min_ep is not None else 0.4),
+            max_endpointing_delay=(_max_ep if _max_ep is not None else 2.2),
             # Use STT-based turn detection for stability
             turn_detection=getattr(self, "turn_detection", "stt"),
+            preemptive_generation=False,
+            discard_audio_if_uninterruptible=False,
+            min_interruption_duration=0.2,
         )
         self._session_future.set_result(session)
         await session.start(
@@ -48,8 +55,8 @@ class _TestRunnerAgent(Agent):
         # Reinforce numeric endpointing on the live session
         try:
             session.update_options(
-                min_endpointing_delay=(_min_ep if _min_ep is not None else 0.3),
-                max_endpointing_delay=(_max_ep if _max_ep is not None else 4.0),
+                min_endpointing_delay=(_min_ep if _min_ep is not None else 0.4),
+                max_endpointing_delay=(_max_ep if _max_ep is not None else 2.2),
             )
         except Exception:
             pass
@@ -82,6 +89,11 @@ class TestRunner:
         simulator: SimulatorAgentDefinition | None = None,
         num_scenarios: int = 1,
         topic: str | None = None,
+        record_audio: bool = False,
+        recorder_sample_rate: int = 8000,
+        recorder_join_delay: float = 0.2,
+        min_turn_messages: int = 8,
+        max_seconds: float = 45.0,
     ) -> TestReport:
         # If no scenario provided, generate personas using generator
         if scenario is None:
@@ -98,12 +110,24 @@ class TestRunner:
         for persona in scenario.dataset:
             print(f"Running test case for persona: {persona.persona.get('name', 'Unknown')}")
             
-            transcript = await self._run_single_test_case(agent_definition, persona, simulator)
+            transcript, audio_in, audio_out, audio_combined = await self._run_single_test_case(
+                agent_definition,
+                persona,
+                simulator,
+                record_audio=record_audio,
+                recorder_sample_rate=recorder_sample_rate,
+                recorder_join_delay=recorder_join_delay,
+                min_turn_messages=min_turn_messages,
+                max_seconds=max_seconds,
+            )
             
             report.results.append(
                 TestCaseResult(
                     persona=persona,
                     transcript=transcript,
+                    audio_input_path=audio_in,
+                    audio_output_path=audio_out,
+                    audio_combined_path=audio_combined,
                 )
             )
             
@@ -114,7 +138,13 @@ class TestRunner:
         agent_definition: AgentDefinition,
         persona: Persona,
         simulator: SimulatorAgentDefinition | None,
-    ) -> str:
+        *,
+        record_audio: bool = False,
+        recorder_sample_rate: int = 8000,
+        recorder_join_delay: float = 0.2,
+        min_turn_messages: int = 8,
+        max_seconds: float = 45.0,
+    ) -> tuple[str, str | None, str | None, str | None]:
         livekit_api_key = os.environ.get("LIVEKIT_API_KEY")
         livekit_api_secret = os.environ.get("LIVEKIT_API_SECRET")
 
@@ -135,7 +165,22 @@ class TestRunner:
             print(f"✓ Customer '{persona.persona.get('name')}' connected to room")
             
             customer_agent = self._create_customer_agent(persona, simulator)
-            
+
+            # Optionally start a separate recorder participant to capture all audio
+            recorder: RoomRecorder | None = None
+            if record_audio:
+                if livekit_api_key and livekit_api_secret:
+                    recorder = RoomRecorder(
+                        url=str(agent_definition.url),
+                        api_key=livekit_api_key,
+                        api_secret=livekit_api_secret,
+                        room_name=agent_definition.room_name,
+                        sample_rate=recorder_sample_rate,
+                        join_delay_s=recorder_join_delay,
+                    )
+                    # Join immediately to capture early utterances
+                    await recorder.start()
+
             # Start the agent in a background task
             session_task = asyncio.create_task(
                 customer_agent.run(room=customer_room)
@@ -165,12 +210,19 @@ class TestRunner:
             customer_session.on("user_input_transcribed", _on_user_input_transcribed)
             customer_session.on("conversation_item_added", _on_conversation_item_added)
 
-            # Wait for the agent session to close naturally
+            # Wait for natural session close (tool-triggered or remote hangup), with hard timeout
             closed = asyncio.Event()
             def _on_close(ev):
                 closed.set()
             customer_session.on("close", _on_close)
-            await closed.wait()
+
+            try:
+                await asyncio.wait_for(closed.wait(), timeout=max_seconds)
+            except asyncio.TimeoutError:
+                with contextlib.suppress(Exception):
+                    customer_session.shutdown()
+                with contextlib.suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(closed.wait(), timeout=5)
             
             # Get transcript from history (dedupe partial repeats)
             if customer_session:
@@ -198,7 +250,7 @@ class TestRunner:
             
         except Exception as e:
             print(f"Error during test case: {e}")
-            return f"Error: {e}"
+            return (f"Error: {e}", None, None, None)
         finally:
             # Support both property and method across versions
             try:
@@ -214,8 +266,65 @@ class TestRunner:
             except Exception:
                 pass
                 print(f"✓ Customer disconnected")
-        
-        return transcript
+            # Stop recorder if running
+            if recorder is not None:
+                with contextlib.suppress(Exception):
+                    await recorder.aclose()
+
+        # Resolve per-persona input/output recordings and build combined WAV
+        def _find_paths_for_identity(room_name: str, identity: str) -> list[str]:
+            try:
+                base = os.path.join("recordings", f"{room_name}-{identity}-track-")
+                # listdir and filter to avoid glob deps
+                files = [os.path.join("recordings", f) for f in os.listdir("recordings") if f.startswith(f"{room_name}-{identity}-track-") and f.endswith(".wav")]
+                return sorted(files, key=lambda p: os.path.getmtime(p), reverse=True)
+            except Exception:
+                return []
+
+        def _pick_best(paths: list[str]) -> str | None:
+            if not paths:
+                return None
+            return max(paths, key=lambda p: (os.path.getsize(p), os.path.getmtime(p)))
+
+        persona_name = str(persona.persona.get("name", "customer"))
+        in_candidates = _find_paths_for_identity(agent_definition.room_name, persona_name)
+        out_candidates = _find_paths_for_identity(agent_definition.room_name, "support-agent")
+        audio_in = _pick_best(in_candidates)
+        audio_out = _pick_best(out_candidates)
+
+        audio_combined: str | None = None
+        try:
+            mix_inputs = [p for p in [audio_in, audio_out] if p]
+            if mix_inputs:
+                os.makedirs("recordings", exist_ok=True)
+                audio_combined = os.path.join("recordings", f"{agent_definition.room_name}-{persona_name}-combined.wav")
+                arrays = []
+                max_len = 0
+                for p in mix_inputs:
+                    with wave.open(p, "rb") as wf:
+                        frames = wf.readframes(wf.getnframes())
+                        arr = np.frombuffer(frames, dtype=np.int16)
+                        arrays.append(arr)
+                        if arr.shape[0] > max_len:
+                            max_len = arr.shape[0]
+                if arrays and max_len > 0:
+                    mix = np.zeros(max_len, dtype=np.int32)
+                    for arr in arrays:
+                        if arr.shape[0] < max_len:
+                            pad = np.zeros(max_len - arr.shape[0], dtype=arr.dtype)
+                            arr = np.concatenate([arr, pad])
+                        mix += arr.astype(np.int32)
+                    mix = np.clip(mix, -32768, 32767).astype(np.int16)
+                    with wave.open(audio_combined, "wb") as wf_out:
+                        wf_out.setnchannels(1)
+                        wf_out.setsampwidth(2)
+                        wf_out.setframerate(8000)
+                        wf_out.writeframes(mix.tobytes())
+                    print(f"✓ Combined conversation saved: {audio_combined}")
+        except Exception as e:
+            print(f"Combined mix failed: {e}")
+
+        return (transcript, audio_in, audio_out, audio_combined)
 
     def _create_customer_agent(self, persona: Persona, simulator: SimulatorAgentDefinition | None) -> _TestRunnerAgent:
         customer_prompt = self._create_customer_prompt(persona)
