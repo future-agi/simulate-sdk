@@ -1,6 +1,6 @@
 from ..agent.definition import AgentDefinition, SimulatorAgentDefinition
 from .models import Scenario, Persona, TestReport, TestCaseResult
-from livekit.agents import stt, tts, llm, vad, Agent, AgentSession
+from livekit.agents import stt, tts, llm, vad, Agent, AgentSession, function_tool
 from livekit.agents.voice.room_io import RoomInputOptions, RoomOutputOptions
 from livekit.plugins import openai, silero
 from livekit import rtc
@@ -24,6 +24,13 @@ class _TestRunnerAgent(Agent):
         super().__init__(**kwargs)
         self._persona = persona
         self._session_future = asyncio.Future()
+
+    @function_tool()
+    async def end_call(self) -> None:
+        # Simulated customer ends the call when satisfied
+        self.session.say("Thanks, that's all. Goodbye.")
+        await asyncio.sleep(0.2)
+        self.session.shutdown()
 
     async def run(self, room: rtc.Room):
         # Coalesce None simulator values to safe defaults
@@ -377,6 +384,6 @@ class TestRunner:
             f"Goal: {persona.outcome}. "
             "Have a natural back-and-forth conversation, asking clarifying questions. "
             "Keep the conversation going for at least 6 turns unless the problem is fully solved. "
-            "When you are satisfied and done, explicitly say: 'Thanks, that's all'. "
+            "When you are satisfied and done, call the `end_call` tool to hang up. "
             "Use short, spoken-style sentences."
         )

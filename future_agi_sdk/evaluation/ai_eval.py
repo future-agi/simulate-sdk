@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from typing import Iterable, Mapping, Sequence
+import os
+import base64
 
 from ..simulation.models import TestReport
 
@@ -50,10 +52,35 @@ def evaluate_report(
             if key == "persona.outcome":
                 return persona.outcome
             if key == "audio_input_path":
-                return getattr(result, "audio_input_path", None)
+                val = getattr(result, "audio_input_path", None)
+                return os.path.abspath(val) if val and os.path.exists(val) else val
             if key == "audio_output_path":
-                return getattr(result, "audio_output_path", None)
+                val = getattr(result, "audio_output_path", None)
+                return os.path.abspath(val) if val and os.path.exists(val) else val
+            if key == "audio_combined_path":
+                val = getattr(result, "audio_combined_path", None)
+                return os.path.abspath(val) if val and os.path.exists(val) else val
             return None
+
+        def _encode_audio_inputs(inputs: dict[str, str]) -> dict[str, str]:
+            """Strict encoding: if a value is a local audio file path, replace that value with base64.
+
+            - Never rename keys or add aliases.
+            - Do not add extra fields (no audio_mime or data URI).
+            """
+            audio_exts = {".wav", ".ogg", ".mp3", ".m4a", ".flac", ".aac"}
+            for k, v in list(inputs.items()):
+                if isinstance(v, str) and os.path.exists(v):
+                    _, ext = os.path.splitext(v.lower())
+                    if ext in audio_exts:
+                        try:
+                            with open(v, "rb") as f:
+                                data = f.read()
+                            inputs[k] = base64.b64encode(data).decode("ascii")
+                        except Exception:
+                            # Leave as-is on read failure
+                            pass
+            return inputs
 
         # If eval_specs provided, use explicit mappings per template
         if eval_specs:
@@ -69,6 +96,7 @@ def evaluate_report(
                         inputs[dest] = val
                 if extra_inputs:
                     inputs.update(extra_inputs)
+                inputs = _encode_audio_inputs(inputs)
                 try:
                     ev = evaluator.evaluate(eval_templates=template, inputs=inputs, model_name=model_name)
                     item = ev.eval_results[0] if ev and getattr(ev, "eval_results", None) else None
@@ -94,6 +122,7 @@ def evaluate_report(
 
                 if extra_inputs:
                     inputs.update(extra_inputs)
+                inputs = _encode_audio_inputs(inputs)
 
                 try:
                     ev = evaluator.evaluate(eval_templates=template, inputs=inputs, model_name=model_name)
