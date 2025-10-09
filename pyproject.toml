@@ -1,5 +1,5 @@
 [tool.poetry]
-name = "fi-simulate"
+name = "agent-simulate"
 version = "0.1.0"
 description = "Voice AI agent simulator and evaluation harness for LiveKit"
 authors = ["Future AGI <no-reply@futureagi.com>"]
