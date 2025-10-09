@@ -15,7 +15,7 @@ livekit-agents = { version = ">=1.2", extras = ["openai", "silero"] }
 python-dotenv = ">=1.0.0"
 pandas = ">=2.0.0"
 numpy = ">=1.26.0"
-ai-evaluation = ">=0.2.0"
+ai-evaluation = ">=0.2.1"
 openai = ">=1.109.0"
 
 [tool.poetry.group.dev.dependencies]
