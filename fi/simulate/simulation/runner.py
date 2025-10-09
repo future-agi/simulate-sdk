@@ -56,9 +56,29 @@ class _TestRunnerAgent(Agent):
         await session.start(
             self,
             room=room,
-            room_input_options=RoomInputOptions(delete_room_on_close=False),
+            room_input_options=RoomInputOptions(
+                delete_room_on_close=False,
+                participant_kinds=[
+                    rtc.ParticipantKind.PARTICIPANT_KIND_STANDARD,
+                    getattr(rtc.ParticipantKind, "PARTICIPANT_KIND_AGENT", rtc.ParticipantKind.PARTICIPANT_KIND_STANDARD),
+                ],
+                pre_connect_audio=True,
+                pre_connect_audio_timeout=3.0,
+            ),
             room_output_options=RoomOutputOptions(transcription_enabled=False),
         )
+        try:
+            # Give I/O a brief moment to publish tracks before first TTS
+            import asyncio as _asyncio
+            await _asyncio.sleep(0.6)
+            name = str(self._persona.persona.get("name", "customer"))
+        except Exception:
+            name = "customer"
+        situation = self._persona.situation or ""
+        opener = f"Hi, I'm {name}. {situation}".strip()
+        print(f"Opener: {opener}")
+        if opener:
+            session.say(opener)
         # Reinforce numeric endpointing on the live session
         try:
             session.update_options(
@@ -168,7 +188,16 @@ class TestRunner:
                 .to_jwt()
             )
 
-            await customer_room.connect(url=str(agent_definition.url), token=token)
+            # Join the simulator as an Agent participant so it shows as Agent
+            # in LiveKit and benefits from agent-specific behavior. Fall back if unsupported.
+            try:
+                opts = rtc.ConnectOptions()
+                # ParticipantKind may not exist on older SDKs
+                if hasattr(rtc, "ParticipantKind"):
+                    opts.participant_kind = rtc.ParticipantKind.PARTICIPANT_KIND_AGENT
+                await customer_room.connect(str(agent_definition.url), token, opts)
+            except Exception:
+                await customer_room.connect(str(agent_definition.url), token)
             print(f"✓ Customer '{persona.persona.get('name')}' connected to room")
             
             customer_agent = self._create_customer_agent(persona, simulator)
@@ -295,17 +324,62 @@ class TestRunner:
 
         persona_name = str(persona.persona.get("name", "customer"))
         in_candidates = _find_paths_for_identity(agent_definition.room_name, persona_name)
-        out_candidates = _find_paths_for_identity(agent_definition.room_name, "support-agent")
+
+        # Auto-pick a likely agent identity (prefer cloud/local agent-looking ids)
+        def _list_identities(room_name: str) -> list[str]:
+            try:
+                ids: set[str] = set()
+                for f in os.listdir("recordings"):
+                    if not f.endswith(".wav"):
+                        continue
+                    if not f.startswith(f"{room_name}-"):
+                        continue
+                    rest = f[len(room_name)+1:]
+                    parts = rest.split("-track-")
+                    if len(parts) != 2:
+                        continue
+                    identity = parts[0]
+                    ids.add(identity)
+                return sorted(ids)
+            except Exception:
+                return []
+
+        identities = _list_identities(agent_definition.room_name)
+        candidate_agent_ids = [i for i in identities if i not in {persona_name, "recorder"}]
+
+        def _agent_rank(i: str) -> tuple[int, float]:
+            score = 0
+            if i.startswith("agent-"):
+                score += 2
+            if i == "support-agent":
+                score += 3
+            best = _pick_best(_find_paths_for_identity(agent_definition.room_name, i))
+            size = os.path.getsize(best) if best and os.path.exists(best) else 0
+            return (score, float(size))
+
+        chosen_agent_id: str | None = None
+        if candidate_agent_ids:
+            chosen_agent_id = max(candidate_agent_ids, key=_agent_rank)
+        out_candidates = _find_paths_for_identity(agent_definition.room_name, chosen_agent_id) if chosen_agent_id else []
         audio_in = _pick_best(in_candidates)
         audio_out = _pick_best(out_candidates)
 
         audio_combined: str | None = None
         try:
-            mix_inputs = [p for p in [audio_in, audio_out] if p]
+            # Overlay all recorder tracks for this room (covers any agent identity)
+            def _find_all_room_tracks(room_name: str) -> list[str]:
+                try:
+                    files = [os.path.join("recordings", f) for f in os.listdir("recordings")
+                             if f.startswith(f"{room_name}-") and f.endswith(".wav") and "-combined" not in f]
+                    return sorted(files, key=lambda p: os.path.getmtime(p))
+                except Exception:
+                    return []
+
+            mix_inputs = _find_all_room_tracks(agent_definition.room_name)
             if mix_inputs:
                 os.makedirs("recordings", exist_ok=True)
                 audio_combined = os.path.join("recordings", f"{agent_definition.room_name}-{persona_name}-combined.wav")
-                arrays = []
+                arrays: list[np.ndarray] = []
                 max_len = 0
                 for p in mix_inputs:
                     with wave.open(p, "rb") as wf:
