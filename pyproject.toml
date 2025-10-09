@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "agent-simulate"
-version = "0.1.0"
+version = "0.1.1"
 description = "Voice AI agent simulator and evaluation harness for LiveKit"
 authors = ["Future AGI <no-reply@futureagi.com>"]
 readme = "README.md"
@@ -11,20 +11,17 @@ packages = [
 
 [tool.poetry.dependencies]
 python = ">=3.10,<3.14"
-livekit-agents = { version = "~=1.2", extras = ["openai", "silero"] }
-livekit = "*"
-livekit-api = "*"
-pydantic = ">=2.0.0"
-python-dotenv = "*"
-pandas = "*"
-numpy = "*"
-ai-evaluation = ">=0.1.9"
-openai = "*"
+livekit-agents = { version = ">=1.2", extras = ["openai", "silero"] }
+python-dotenv = ">=1.0.0"
+pandas = ">=2.0.0"
+numpy = ">=1.26.0"
+ai-evaluation = ">=0.2.0"
+openai = ">=1.109.0"
 
 [tool.poetry.group.dev.dependencies]
-pytest = "*"
-black = "*"
-ruff = "*"
+pytest = ">=8.0.0"
+black = ">=24.0.0"
+ruff = ">=0.4.0"
 
 [build-system]
 requires = ["poetry-core"]
