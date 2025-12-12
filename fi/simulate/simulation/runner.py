@@ -3,7 +3,7 @@ import os
 
 from ..agent.definition import AgentDefinition, SimulatorAgentDefinition
 from .models import Scenario, TestReport
-from .engines import LiveKitEngine, BaseEngine
+from .engines import LiveKitEngine, BaseEngine, CloudEngine
 
 class TestRunner:
     """
@@ -80,11 +80,12 @@ class TestRunner:
         """
         # Dispatch to appropriate engine
         if run_id is not None:
-            # Cloud mode - will be implemented in CloudEngine
-            # TODO: Implement CloudEngine
-            raise NotImplementedError(
-                "Cloud mode (Backend API) is not yet implemented. "
-                "Please use local mode with 'agent_definition' for now."
+            # Cloud mode - Use CloudEngine
+            engine = CloudEngine(self.api_key, self.api_url)
+            return await engine.run(
+                run_id=run_id,
+                agent_callback=agent_callback,
+                **kwargs
             )
             
         elif agent_definition is not None:
