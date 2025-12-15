@@ -6,7 +6,7 @@ class AnthropicAgentWrapper(AgentWrapper):
     Wrapper for Anthropic (Claude) agents.
     Automatically handles message conversion to Anthropic format.
     """
-    def __init__(self, client: Any, model: str = "claude-3-opus-20240229"):
+    def __init__(self, client: Any, model: str = "claude-4-sonnet-20250219"):
         """
         Args:
             client: The Anthropic client instance (AsyncAnthropic or Anthropic).

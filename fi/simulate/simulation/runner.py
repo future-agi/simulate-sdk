@@ -19,6 +19,7 @@ class TestRunner:
     def __init__(
         self,
         api_key: Optional[str] = None,
+        secret_key: Optional[str] = None,
         api_url: Optional[str] = None,
     ):
         """
@@ -26,9 +27,11 @@ class TestRunner:
         
         Args:
             api_key: Optional API key for cloud mode. If not provided, will check FI_API_KEY env var.
+            secret_key: Optional Secret key for cloud mode. If not provided, will check FI_SECRET_KEY env var.
             api_url: Optional API URL for cloud mode. If not provided, will check FI_API_URL env var.
         """
         self.api_key = api_key or os.environ.get("FI_API_KEY")
+        self.secret_key = secret_key or os.environ.get("FI_SECRET_KEY")
         self.api_url = api_url or os.environ.get("FI_API_URL")
         self._engine: Optional[BaseEngine] = None
 
@@ -81,7 +84,7 @@ class TestRunner:
         # Dispatch to appropriate engine
         if run_id is not None:
             # Cloud mode - Use CloudEngine
-            engine = CloudEngine(self.api_key, self.api_url)
+            engine = CloudEngine(self.api_key, self.secret_key, self.api_url)
             return await engine.run(
                 run_id=run_id,
                 agent_callback=agent_callback,
