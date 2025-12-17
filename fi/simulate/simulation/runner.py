@@ -28,11 +28,11 @@ class TestRunner:
         Args:
             api_key: Optional API key for cloud mode. If not provided, will check FI_API_KEY env var.
             secret_key: Optional Secret key for cloud mode. If not provided, will check FI_SECRET_KEY env var.
-            api_url: Optional API URL for cloud mode. If not provided, will check FI_API_URL env var.
+            api_url: Optional API URL for cloud mode. If not provided, will check FI_BASE_URL env var.
         """
         self.api_key = api_key or os.environ.get("FI_API_KEY")
         self.secret_key = secret_key or os.environ.get("FI_SECRET_KEY")
-        self.api_url = api_url or os.environ.get("FI_API_URL")
+        self.api_url = api_url or os.environ.get("FI_BASE_URL")
         self._engine: Optional[BaseEngine] = None
 
     async def run_test(

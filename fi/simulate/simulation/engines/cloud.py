@@ -2,12 +2,12 @@ import asyncio
 import os
 import contextvars
 import logging
-from typing import Optional, Callable, Dict, Any
+from typing import Optional, Callable, Dict, Any, List
 
-from ...agent.definition import AgentDefinition, SimulatorAgentDefinition
 from ...agent.wrapper import AgentWrapper, AgentInput, AgentResponse
-from ..models import Scenario, TestReport, TestCaseResult, Persona
+from ..models import TestReport
 from .base import BaseEngine
+from ...utils.routes import APIRoutes
 
 # Context variable to track the current execution ID for future tool mocking
 current_execution_id = contextvars.ContextVar("current_execution_id", default=None)
@@ -20,18 +20,21 @@ class CloudEngine(BaseEngine):
     It acts as a bridge between the cloud-hosted simulator and the user's local agent.
     """
     
-    def __init__(self, api_key: Optional[str] = None, api_url: Optional[str] = None):
+    def __init__(self, api_key: Optional[str] = None, secret_key: Optional[str] = None, api_url: Optional[str] = None):
         self.api_key = api_key or os.environ.get("FI_API_KEY")
-        self.api_url = api_url or os.environ.get("FI_API_URL") or "https://api.futureagi.com"
+        self.secret_key = secret_key or os.environ.get("FI_SECRET_KEY")
+        self.api_url = api_url or os.environ.get("FI_BASE_URL") or "https://api.futureagi.com"
         
-        if not self.api_key:
-            # We don't raise immediately to allow instantiation, but run() will fail
-            logger.warning("FI_API_KEY not provided. CloudEngine will not function correctly.")
+        if not self.api_key or not self.secret_key:
+            logger.warning("FI_API_KEY or FI_SECRET_KEY not provided. CloudEngine will not function correctly.")
+            
+        self.api = None
 
     async def run(
         self,
         run_id: Optional[str] = None,
         agent_callback: Optional[Callable | AgentWrapper] = None,
+        concurrency: int = 5,
         **kwargs
     ) -> TestReport:
         """
@@ -39,26 +42,273 @@ class CloudEngine(BaseEngine):
         and sends responses back.
         """
         if not run_id:
-            raise ValueError("CloudEngine requires a 'run_id'.")
+            raise ValueError("CloudEngine requires a 'run_id' (run_test_id).")
         
         if not agent_callback:
             raise ValueError("CloudEngine requires an 'agent_callback' (function or AgentWrapper).")
 
-        # Normalize the callback to a callable that accepts AgentInput
+        self.api = APIRoutes(self.api_key, self.secret_key, self.api_url)
         wrapper = self._normalize_callback(agent_callback)
+        queue = asyncio.Queue()
 
-        print(f"🚀 Starting Cloud Simulation for Run ID: {run_id}")
+        print(f"Starting Simulation for Run ID: {run_id}")
         
-        # TODO: Real implementation will:
-        # 1. Connect to WebSocket/Stream at self.api_url/runs/{run_id}/connect
-        # 2. Listen for "turn" events
-        # 3. Invoke wrapper.call() in a context-aware task
-        # 4. Send results back
+        try:
+            # 1. Start the Run (Create TestExecution)
+            start_resp = await self.api.start_test_execution(run_test_id=run_id)
+            result = start_resp.get("result", {})
+            # Handle both camelCase and snake_case response formats
+            test_execution_id = result.get("executionId") or result.get("execution_id")
+            
+            if not test_execution_id:
+                raise ValueError(f"Failed to start test execution. Response: {start_resp}")
+                
+            print(f"✓ Test Execution Started: {test_execution_id}")
+
+            # 2. Start Producer and Consumers
+            producer_task = asyncio.create_task(
+                self._producer_loop(run_id, test_execution_id, queue)
+            )
+            
+            consumers = [
+                asyncio.create_task(self._consumer_loop(queue, wrapper))
+                for _ in range(concurrency)
+            ]
+            
+            # Wait for producer to finish fetching all batches
+            await producer_task
+            
+            # Wait for queue to drain (all consumers process remaining items)
+            await queue.join()
+            
+            # Cancel consumers
+            for c in consumers:
+                c.cancel()
+                
+            print("✅ Cloud Simulation Completed.")
+            
+        except Exception as e:
+            logger.exception(f"Cloud simulation failed: {e}")
+            raise
+        finally:
+            if self.api:
+                await self.api.close()
         
-        # Mocking the loop for now to demonstrate structure
-        report = await self._mock_cloud_loop(run_id, wrapper)
+        # Return empty report for now as backend handles metrics
+        return TestReport(results=[])
+
+    async def _producer_loop(self, run_test_id: str, test_execution_id: str, queue: asyncio.Queue):
+        """
+        Polls the backend for batches of call execution IDs and puts them in the queue.
+        """
+        has_more = True
         
-        return report
+        while has_more:
+            try:
+                print("🔄 Fetching batch of scenarios...")
+                resp = await self.api.fetch_execution_batch(run_test_id, test_execution_id)
+                
+                result = resp.get("result", {})
+                # Handle both camelCase and snake_case response formats
+                call_ids = result.get("callExecutionIds") or result.get("call_execution_ids", [])
+                has_more = result.get("hasMore") if "hasMore" in result else result.get("has_more", False)
+                
+                if not call_ids:
+                    if has_more:
+                        print("⚠️ Received empty batch but hasMore is true. Waiting...")
+                        await asyncio.sleep(2)
+                        continue
+                    else:
+                        break
+                
+                print(f"📥 Received batch: {len(call_ids)} calls")
+                for cid in call_ids:
+                    await queue.put(cid)
+                    
+            except Exception as e:
+                logger.error(f"Error fetching batch: {e}")
+                # Simple retry logic or break? For now, break to avoid infinite loop
+                break
+
+    async def _consumer_loop(self, queue: asyncio.Queue, wrapper: AgentWrapper):
+        """
+        Worker that pulls execution IDs from the queue and runs the conversation.
+        """
+        while True:
+            try:
+                execution_id = await queue.get()
+                await self._handle_single_execution(execution_id, wrapper)
+                queue.task_done()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error in consumer: {e}")
+                queue.task_done() # Mark done even if failed so join() works
+
+    async def _handle_single_execution(self, call_execution_id: str, wrapper: AgentWrapper):
+        """
+        Runs the conversation loop for a single call execution.
+        """
+        token = current_execution_id.set(call_execution_id)
+        try:
+            print(f"▶️ Processing Call: {call_execution_id}")
+            
+            # Step 1: Initiate chat (POST with initiate_chat=True)
+            init_resp = await self.api.send_chat_message(
+                call_execution_id=call_execution_id,
+                initiate_chat=True
+            )
+            result = init_resp.get("result", {})
+            
+            if not result:
+                logger.error(f"Failed to initiate chat for {call_execution_id}")
+                return
+            
+            # Extract first message(s) from response
+            # Note: message_history is a list of ChatMessage objects (dicts)
+            message_history = result.get("message_history") or result.get("messageHistory", [])
+            
+            if not message_history:
+                # Fallback to output_message if history is empty
+                output_msg = result.get("output_message") or result.get("outputMessage")
+                if output_msg:
+                    # Ensure it's a list
+                    if isinstance(output_msg, list):
+                        message_history = output_msg
+                    else:
+                        message_history = [output_msg]
+            
+            if not message_history:
+                logger.warning(f"No initial message received for {call_execution_id}")
+                return
+            
+            # Build conversation history for SDK format
+            # Convert backend "assistant" → SDK "user" (simulator messages)
+            conversation_history = []
+            for msg in message_history:
+                backend_role = msg.get("role", "user")
+                # Backend sends simulator messages as "assistant", convert to "user" for SDK
+                sdk_role = "user" if backend_role == "assistant" else backend_role
+                conversation_history.append({
+                    "role": sdk_role,
+                    "content": msg.get("content", "")
+                })
+            
+            # Step 2: Conversation loop
+            max_turns = 50  # Safety limit
+            turn_count = 0
+            
+            while turn_count < max_turns:
+                # Check if chat ended based on last response
+                chat_ended = result.get("chat_ended") or result.get("chatEnded", False)
+                if chat_ended:
+                    break
+
+                # Get the last message (should be from simulator/user to reply to)
+                if not conversation_history:
+                    break
+                    
+                last_msg = conversation_history[-1]
+                
+                # Prepare AgentInput for user's wrapper
+                agent_input = AgentInput(
+                    thread_id=call_execution_id,
+                    messages=conversation_history,
+                    new_message=last_msg,
+                    execution_id=call_execution_id
+                )
+                
+                # Call user's agent and measure latency
+                import time
+                start_time = time.time()
+                try:
+                    agent_response = await wrapper.call(agent_input)
+                except Exception as e:
+                    logger.error(f"Agent call failed for {call_execution_id}: {e}")
+                    break
+                latency_ms = int((time.time() - start_time) * 1000)
+                
+                # Normalize response
+                if isinstance(agent_response, AgentResponse):
+                    response_content = agent_response.content
+                else:
+                    response_content = str(agent_response)
+                
+                # Add agent response to history
+                conversation_history.append({
+                    "role": "assistant",
+                    "content": response_content
+                })
+                
+                # Step 3: Send agent response to backend and get next message
+                # Convert SDK roles to backend roles: SDK "assistant" → backend "user" (agent responses)
+                api_messages = []
+                for msg in conversation_history:
+                    sdk_role = msg["role"]
+                    # SDK "assistant" (agent) → backend "user", SDK "user" (simulator) → backend "assistant"
+                    backend_role = "user" if sdk_role == "assistant" else "assistant"
+                    api_messages.append({
+                        "role": backend_role,
+                        "content": msg["content"]
+                    })
+                
+                metrics = {"latency": latency_ms}
+                
+                # Send
+                turn_resp = await self.api.send_chat_message(
+                    call_execution_id=call_execution_id,
+                    messages=api_messages,
+                    metrics=metrics,
+                    initiate_chat=False
+                )
+                
+                result = turn_resp.get("result", {})
+                if not result:
+                    logger.warning(f"No response from backend for {call_execution_id}")
+                    break
+                
+                # Update conversation history from backend response
+
+                new_history_data = result.get("message_history") or result.get("messageHistory", [])
+                
+                if new_history_data:
+                    # Convert backend "assistant" → SDK "user" (simulator messages)
+                    conversation_history = []
+                    for msg in new_history_data:
+                        backend_role = msg.get("role", "user")
+                        sdk_role = "user" if backend_role == "assistant" else backend_role
+                        conversation_history.append({
+                            "role": sdk_role,
+                            "content": msg.get("content", "")
+                        })
+                else:
+                    # Fallback: append output_message if history missing
+                    output_msgs = result.get("output_message") or result.get("outputMessage")
+                    if output_msgs:
+                        if isinstance(output_msgs, list):
+                            for om in output_msgs:
+                                backend_role = om.get("role", "user")
+                                sdk_role = "user" if backend_role == "assistant" else backend_role
+                                conversation_history.append({
+                                    "role": sdk_role,
+                                    "content": om.get("content", "")
+                                })
+                        else:
+                            backend_role = output_msgs.get("role", "user")
+                            sdk_role = "user" if backend_role == "assistant" else backend_role
+                            conversation_history.append({
+                                "role": sdk_role,
+                                "content": output_msgs.get("content", "")
+                            })
+                
+                turn_count += 1
+            
+            print(f"✓ Call Finished: {call_execution_id} ({turn_count} turns)")
+            
+        except Exception as e:
+            logger.error(f"Call execution {call_execution_id} failed: {e}")
+        finally:
+            current_execution_id.reset(token)
 
     def _normalize_callback(self, callback: Callable | AgentWrapper) -> AgentWrapper:
         """Ensures we have a AgentWrapper instance."""
@@ -77,63 +327,3 @@ class CloudEngine(BaseEngine):
                 return self.func(input)
                 
         return FunctionalWrapper(callback)
-
-    async def _mock_cloud_loop(self, run_id: str, wrapper: AgentWrapper) -> TestReport:
-        """
-        Temporary mock loop to simulate backend interaction until API is ready.
-        """
-        # Simulate receiving a few turns from the cloud
-        print("(Simulating connection to cloud...)")
-        await asyncio.sleep(1)
-        
-        # Fake a test case
-        execution_id = f"exec-{run_id}-1"
-        thread_id = "thread-1"
-        
-        # Set context for this execution
-        token = current_execution_id.set(execution_id)
-        
-        try:
-            # Turn 1: Cloud sends user message
-            user_msg = "Hello, I need help with my order."
-            print(f"\n[Cloud -> SDK] User: {user_msg}")
-            
-            inp = AgentInput(
-                thread_id=thread_id,
-                messages=[{"role": "user", "content": user_msg}],
-                new_message={"role": "user", "content": user_msg},
-                execution_id=execution_id
-            )
-            
-            # SDK calls user agent
-            response = await wrapper.call(inp)
-            
-            # Normalize response
-            content = response.content if isinstance(response, AgentResponse) else str(response)
-            print(f"[SDK -> Cloud] Agent: {content}")
-            
-            # Turn 2
-            user_msg_2 = "It's order #12345."
-            print(f"\n[Cloud -> SDK] User: {user_msg_2}")
-             
-            inp_2 = AgentInput(
-                thread_id=thread_id,
-                messages=[
-                    {"role": "user", "content": user_msg},
-                    {"role": "assistant", "content": content},
-                    {"role": "user", "content": user_msg_2}
-                ],
-                new_message={"role": "user", "content": user_msg_2},
-                execution_id=execution_id
-            )
-            
-            response_2 = await wrapper.call(inp_2)
-            content_2 = response_2.content if isinstance(response_2, AgentResponse) else str(response_2)
-            print(f"[SDK -> Cloud] Agent: {content_2}")
-
-        finally:
-            current_execution_id.reset(token)
-
-        # Return an empty report for now as the cloud calculates metrics
-        return TestReport(results=[])
-
