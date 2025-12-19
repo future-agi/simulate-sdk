@@ -6,7 +6,14 @@ class APIRoutes:
     """
     Handles API interactions with the Future AGI backend.
     """
-    def __init__(self, api_key: str, secret_key: str, base_url: str):
+    def __init__(self, api_key: str, secret_key: str, base_url: str, timeout: float = 120.0):
+        """
+        Args:
+            api_key: API key for authentication
+            secret_key: Secret key for authentication
+            base_url: Base URL of the backend API
+            timeout: Request timeout in seconds (default: 120s for LLM operations)
+        """
         self.api_key = api_key
         self.secret_key = secret_key
         self.base_url = base_url.rstrip("/")
@@ -16,14 +23,53 @@ class APIRoutes:
             "Content-Type": "application/json"
         }
         # Using a single client for connection pooling
+        # Increased timeout for chat operations which may involve LLM calls
         self.client = httpx.AsyncClient(
             base_url=self.base_url,
             headers=self.headers,
-            timeout=30.0
+            timeout=timeout
         )
 
     async def close(self):
         await self.client.aclose()
+    
+    def _handle_error(self, response: httpx.Response, operation: str) -> None:
+        """
+        Raises a more informative error with backend response details.
+        """
+        try:
+            error_body = response.json()
+            # Extract common error message patterns from backend
+            if isinstance(error_body, dict):
+                # Try to extract the most relevant error message
+                error_msg_parts = []
+                if "result" in error_body:
+                    error_msg_parts.append(str(error_body["result"]))
+                if "error" in error_body:
+                    error_msg_parts.append(str(error_body["error"]))
+                if "message" in error_body:
+                    error_msg_parts.append(str(error_body["message"]))
+                if "detail" in error_body:
+                    error_msg_parts.append(str(error_body["detail"]))
+                
+                if error_msg_parts:
+                    backend_error = " | ".join(error_msg_parts)
+                else:
+                    backend_error = str(error_body)
+            else:
+                backend_error = str(error_body)
+        except Exception:
+            error_body = response.text or f"<No response body (status {response.status_code})>"
+            backend_error = error_body
+        
+        # Simple error message with just status code and backend error
+        error_msg = f"{response.status_code}: {backend_error}"
+        
+        raise httpx.HTTPStatusError(
+            error_msg,
+            request=response.request,
+            response=response
+        )
 
     async def start_test_execution(self, run_test_id: str) -> Dict[str, Any]:
         """
@@ -34,7 +80,8 @@ class APIRoutes:
         url = f"/simulate/run-tests/{run_test_id}/chat-execute/"
         # Empty body - backend uses scenarios from run_test
         response = await self.client.post(url, json={})
-        response.raise_for_status()
+        if response.is_error:
+            self._handle_error(response, f"Failed to start test execution for run_id '{run_test_id}'")
         return response.json()
 
     async def fetch_execution_batch(
@@ -50,7 +97,8 @@ class APIRoutes:
         params = {"test_execution_id": test_execution_id}
         
         response = await self.client.get(url, params=params)
-        response.raise_for_status()
+        if response.is_error:
+            self._handle_error(response, f"Failed to fetch execution batch for test_execution_id '{test_execution_id}'")
         return response.json()
 
     async def send_chat_message(
@@ -76,6 +124,7 @@ class APIRoutes:
         payload = {k: v for k, v in payload.items() if v is not None}
         
         response = await self.client.post(url, json=payload)
-        response.raise_for_status()
+        if response.is_error:
+            self._handle_error(response, f"Failed to send chat message for call_execution_id '{call_execution_id}'")
         return response.json()
 

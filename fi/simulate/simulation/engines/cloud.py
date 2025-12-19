@@ -20,10 +20,18 @@ class CloudEngine(BaseEngine):
     It acts as a bridge between the cloud-hosted simulator and the user's local agent.
     """
     
-    def __init__(self, api_key: Optional[str] = None, secret_key: Optional[str] = None, api_url: Optional[str] = None):
+    def __init__(self, api_key: Optional[str] = None, secret_key: Optional[str] = None, api_url: Optional[str] = None, timeout: float = 120.0):
+        """
+        Args:
+            api_key: API key for authentication
+            secret_key: Secret key for authentication
+            api_url: Base URL of the backend API
+            timeout: Request timeout in seconds (default: 120s for LLM operations)
+        """
         self.api_key = api_key or os.environ.get("FI_API_KEY")
         self.secret_key = secret_key or os.environ.get("FI_SECRET_KEY")
         self.api_url = api_url or os.environ.get("FI_BASE_URL") or "https://api.futureagi.com"
+        self.timeout = timeout
         
         if not self.api_key or not self.secret_key:
             logger.warning("FI_API_KEY or FI_SECRET_KEY not provided. CloudEngine will not function correctly.")
@@ -47,7 +55,7 @@ class CloudEngine(BaseEngine):
         if not agent_callback:
             raise ValueError("CloudEngine requires an 'agent_callback' (function or AgentWrapper).")
 
-        self.api = APIRoutes(self.api_key, self.secret_key, self.api_url)
+        self.api = APIRoutes(self.api_key, self.secret_key, self.api_url, timeout=self.timeout)
         wrapper = self._normalize_callback(agent_callback)
         queue = asyncio.Queue()
 
@@ -142,7 +150,9 @@ class CloudEngine(BaseEngine):
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"Error in consumer: {e}")
+                error_msg = str(e) or f"{type(e).__name__}: {repr(e)}"
+                logger.error(f"Error in consumer: {error_msg}", exc_info=True)
+                print(f"❌ Consumer error: {error_msg}")
                 queue.task_done() # Mark done even if failed so join() works
 
     async def _handle_single_execution(self, call_execution_id: str, wrapper: AgentWrapper):
@@ -234,7 +244,12 @@ class CloudEngine(BaseEngine):
                 try:
                     agent_response = await wrapper.call(agent_input)
                 except Exception as e:
-                    logger.error(f"Agent call failed for {call_execution_id}: {e} {agent_input.new_message.get('content')}")
+                    error_msg = str(e) or f"{type(e).__name__}: {repr(e)}"
+                    last_msg_content = agent_input.new_message.get('content', '') if agent_input.new_message else 'N/A'
+                    logger.error(f"Agent call failed for {call_execution_id}: {error_msg}", exc_info=True)
+                    print(f"❌ Agent call failed for {call_execution_id}: {error_msg}")
+                    if last_msg_content != 'N/A':
+                        print(f"   Last message: {last_msg_content[:100]}...")
                     break
                 latency_ms = int((time.time() - start_time) * 1000)
                 
@@ -334,7 +349,14 @@ class CloudEngine(BaseEngine):
             print(f"✓ Call Finished: {call_execution_id} ({turn_count} turns)")
             
         except Exception as e:
-            logger.error(f"Call execution {call_execution_id} failed: {e}")
+            # Get detailed error message
+            error_msg = str(e)
+            if not error_msg:
+                error_msg = f"{type(e).__name__}: {repr(e)}"
+            
+            # Log to both logger and console
+            logger.error(f"Call execution {call_execution_id} failed: {error_msg}", exc_info=True)
+            print(f"❌ Call execution {call_execution_id} failed: {error_msg}")
         finally:
             current_execution_id.reset(token)
 

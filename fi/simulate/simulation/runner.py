@@ -84,7 +84,8 @@ class TestRunner:
         # Dispatch to appropriate engine
         if run_id is not None:
             # Cloud mode - Use CloudEngine
-            engine = CloudEngine(self.api_key, self.secret_key, self.api_url)
+            timeout = kwargs.pop('timeout', 120.0)  # Default 120s for LLM operations
+            engine = CloudEngine(self.api_key, self.secret_key, self.api_url, timeout=timeout)
             return await engine.run(
                 run_id=run_id,
                 agent_callback=agent_callback,
