@@ -187,11 +187,21 @@ class CloudEngine(BaseEngine):
             conversation_history = []
             for msg in message_history:
                 backend_role = msg.get("role", "user")
+                
+                # Filter out system and tool messages from backend (simulator artifacts)
+                if backend_role in ["system", "tool"]:
+                    continue
+                
+                # Filter out empty messages (often tool calls without output text yet)
+                content = msg.get("content", "")
+                if not content and backend_role == "assistant":
+                    continue
+
                 # Backend sends simulator messages as "assistant", convert to "user" for SDK
                 sdk_role = "user" if backend_role == "assistant" else backend_role
                 conversation_history.append({
                     "role": sdk_role,
-                    "content": msg.get("content", "")
+                    "content": content
                 })
             
             # Step 2: Conversation loop
@@ -224,7 +234,7 @@ class CloudEngine(BaseEngine):
                 try:
                     agent_response = await wrapper.call(agent_input)
                 except Exception as e:
-                    logger.error(f"Agent call failed for {call_execution_id}: {e}")
+                    logger.error(f"Agent call failed for {call_execution_id}: {e} {agent_input.new_message.get('content')}")
                     break
                 latency_ms = int((time.time() - start_time) * 1000)
                 
@@ -241,16 +251,14 @@ class CloudEngine(BaseEngine):
                 })
                 
                 # Step 3: Send agent response to backend and get next message
-                # Convert SDK roles to backend roles: SDK "assistant" → backend "user" (agent responses)
-                api_messages = []
-                for msg in conversation_history:
-                    sdk_role = msg["role"]
-                    # SDK "assistant" (agent) → backend "user", SDK "user" (simulator) → backend "assistant"
-                    backend_role = "user" if sdk_role == "assistant" else "assistant"
-                    api_messages.append({
-                        "role": backend_role,
-                        "content": msg["content"]
-                    })
+                # Only send the new message (Agent response) to avoid duplication as backend appends
+                # SDK "assistant" (agent) → backend "user"
+                last_msg_content = conversation_history[-1]["content"]
+                
+                api_messages = [{
+                    "role": "user",
+                    "content": last_msg_content
+                }]
                 
                 metrics = {"latency": latency_ms}
                 
@@ -276,10 +284,20 @@ class CloudEngine(BaseEngine):
                     conversation_history = []
                     for msg in new_history_data:
                         backend_role = msg.get("role", "user")
+                        
+                        # Filter out system and tool messages
+                        if backend_role in ["system", "tool"]:
+                            continue
+
+                        # Filter out empty messages
+                        content = msg.get("content", "")
+                        if not content and backend_role == "assistant":
+                            continue
+
                         sdk_role = "user" if backend_role == "assistant" else backend_role
                         conversation_history.append({
                             "role": sdk_role,
-                            "content": msg.get("content", "")
+                            "content": content
                         })
                 else:
                     # Fallback: append output_message if history missing
@@ -288,18 +306,28 @@ class CloudEngine(BaseEngine):
                         if isinstance(output_msgs, list):
                             for om in output_msgs:
                                 backend_role = om.get("role", "user")
+                                if backend_role in ["system", "tool"]:
+                                    continue
+                                
+                                content = om.get("content", "")
+                                if not content and backend_role == "assistant":
+                                    continue
+
                                 sdk_role = "user" if backend_role == "assistant" else backend_role
                                 conversation_history.append({
                                     "role": sdk_role,
-                                    "content": om.get("content", "")
+                                    "content": content
                                 })
                         else:
                             backend_role = output_msgs.get("role", "user")
-                            sdk_role = "user" if backend_role == "assistant" else backend_role
-                            conversation_history.append({
-                                "role": sdk_role,
-                                "content": output_msgs.get("content", "")
-                            })
+                            if backend_role not in ["system", "tool"]:
+                                content = output_msgs.get("content", "")
+                                if content or backend_role != "assistant":
+                                    sdk_role = "user" if backend_role == "assistant" else backend_role
+                                    conversation_history.append({
+                                        "role": sdk_role,
+                                        "content": content
+                                    })
                 
                 turn_count += 1
             
