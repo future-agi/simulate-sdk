@@ -6,12 +6,16 @@ class GeminiAgentWrapper(AgentWrapper):
     Wrapper for Google Gemini (Generative AI) agents.
     Supports google-generativeai SDK.
     """
-    def __init__(self, model: Any):
+    def __init__(self, model: Any, system_prompt: str = None):
         """
         Args:
             model: An instance of google.generativeai.GenerativeModel
+            system_prompt: Optional system instructions. 
+                           Note: Ideally configure system_instruction on the model itself.
+                           If provided here, it will be prepended as a user message.
         """
         self.model = model
+        self.system_prompt = system_prompt
 
     async def call(self, input: AgentInput) -> Union[str, AgentResponse]:
         # Convert internal messages to Gemini format (Content objects)
@@ -21,6 +25,13 @@ class GeminiAgentWrapper(AgentWrapper):
         
         # Simple reconstruction of history for a chat session
         history = []
+        
+        if self.system_prompt:
+            # Prepend system prompt as a user message for context
+            history.append({"role": "user", "parts": [f"System Instruction: {self.system_prompt}"]})
+            # Add a dummy model acknowledgement to keep turns valid (User -> Model -> User)
+            history.append({"role": "model", "parts": ["Understood."]})
+            
         last_message = None
         
         for msg in input.messages:

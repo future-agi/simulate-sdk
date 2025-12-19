@@ -6,19 +6,25 @@ class OpenAIAgentWrapper(AgentWrapper):
     Wrapper for OpenAI-based agents.
     Automatically handles message conversion to OpenAI format.
     """
-    def __init__(self, client: Any, model: str = "gpt-4-turbo"):
+    def __init__(self, client: Any, model: str = "gpt-4-turbo", system_prompt: str = None):
         """
         Args:
             client: The OpenAI client instance (AsyncOpenAI or OpenAI).
             model: The model name to use (e.g., "gpt-4-turbo").
+            system_prompt: Optional system instructions for the agent.
         """
         self.client = client
         self.model = model
+        self.system_prompt = system_prompt
 
     async def call(self, input: AgentInput) -> Union[str, AgentResponse]:
         # Convert internal message format to OpenAI format
         # Input messages are already in [{"role": "...", "content": "..."}] format which OpenAI accepts
-        messages = input.messages
+        messages = []
+        if self.system_prompt:
+            messages.append({"role": "system", "content": self.system_prompt})
+            
+        messages.extend(input.messages)
         
         # Check if client is async or sync
         if hasattr(self.client, "chat") and hasattr(self.client.chat, "completions"):

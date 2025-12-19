@@ -5,19 +5,25 @@ class LangChainAgentWrapper(AgentWrapper):
     """
     Wrapper for LangChain Runnable or Chain agents.
     """
-    def __init__(self, agent: Any):
+    def __init__(self, agent: Any, system_prompt: str = None):
         """
         Args:
             agent: A LangChain Runnable (chain, agent executor) that accepts input.
                    It is expected to accept a dictionary with "messages" or "input".
+            system_prompt: Optional system prompt to prepend to message history.
         """
         self.agent = agent
+        self.system_prompt = system_prompt
 
     async def call(self, input: AgentInput) -> Union[str, AgentResponse]:
         from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 
         # Convert history to LangChain messages
         lc_messages = []
+        
+        if self.system_prompt:
+            lc_messages.append(SystemMessage(content=self.system_prompt))
+            
         for msg in input.messages:
             role = msg.get("role")
             content = msg.get("content")
