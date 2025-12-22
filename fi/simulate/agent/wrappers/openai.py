@@ -42,7 +42,29 @@ class OpenAIAgentWrapper(AgentWrapper):
                         messages=messages
                     )
                 
-                return completion.choices[0].message.content
+                message = completion.choices[0].message
+                content = message.content or ""
+                
+                # Extract tool_calls if present
+                tool_calls = None
+                if hasattr(message, 'tool_calls') and message.tool_calls:
+                    # Convert tool_calls to dict format for serialization
+                    tool_calls = []
+                    for tc in message.tool_calls:
+                        tool_call_dict = {
+                            "id": tc.id,
+                            "type": tc.type,
+                            "function": {
+                                "name": tc.function.name,
+                                "arguments": tc.function.arguments
+                            }
+                        }
+                        tool_calls.append(tool_call_dict)
+                
+                # Return AgentResponse if tool_calls exist, otherwise just content string
+                if tool_calls:
+                    return AgentResponse(content=content, tool_calls=tool_calls)
+                return content
         
         raise ValueError("Unsupported OpenAI client. Please provide a valid OpenAI or AsyncOpenAI client.")
 

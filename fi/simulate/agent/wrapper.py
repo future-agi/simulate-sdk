@@ -18,6 +18,7 @@ class AgentResponse(BaseModel):
     Standardized response from the user's agent.
     """
     content: str
+    tool_calls: Optional[List[Dict[str, Any]]] = None
     metadata: Optional[Dict[str, Any]] = None
 
 class AgentWrapper(ABC):

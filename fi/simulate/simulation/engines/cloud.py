@@ -253,27 +253,39 @@ class CloudEngine(BaseEngine):
                     break
                 latency_ms = int((time.time() - start_time) * 1000)
                 
-                # Normalize response
+                # Normalize response and extract tool_calls
+                response_content = ""
+                tool_calls = None
+                
                 if isinstance(agent_response, AgentResponse):
                     response_content = agent_response.content
+                    tool_calls = agent_response.tool_calls
                 else:
                     response_content = str(agent_response)
                 
-                # Add agent response to history
-                conversation_history.append({
+                # Add agent response to history (with tool_calls if present)
+                assistant_msg = {
                     "role": "assistant",
                     "content": response_content
-                })
+                }
+                if tool_calls:
+                    assistant_msg["tool_calls"] = tool_calls
+                conversation_history.append(assistant_msg)
                 
                 # Step 3: Send agent response to backend and get next message
                 # Only send the new message (Agent response) to avoid duplication as backend appends
                 # SDK "assistant" (agent) → backend "user"
-                last_msg_content = conversation_history[-1]["content"]
+                last_msg = conversation_history[-1]
                 
-                api_messages = [{
+                api_message = {
                     "role": "user",
-                    "content": last_msg_content
-                }]
+                    "content": last_msg["content"]
+                }
+                # Include tool_calls if present
+                if "tool_calls" in last_msg:
+                    api_message["tool_calls"] = last_msg["tool_calls"]
+                
+                api_messages = [api_message]
                 
                 metrics = {"latency": latency_ms}
                 
