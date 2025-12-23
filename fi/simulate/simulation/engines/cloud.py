@@ -2,12 +2,21 @@ import asyncio
 import os
 import contextvars
 import logging
+import contextlib
 from typing import Optional, Callable, Dict, Any, List
 
 from ...agent.wrapper import AgentWrapper, AgentInput, AgentResponse
 from ..models import TestReport
 from .base import BaseEngine
 from ...utils.routes import APIRoutes
+from opentelemetry import trace as otel_trace
+
+try:
+    # Optional dependency: adds semantic convention attributes for Observe
+    from fi_instrumentation.fi_types import SpanAttributes, FiSpanKindValues  # type: ignore
+except Exception:  # pragma: no cover
+    SpanAttributes = None  # type: ignore
+    FiSpanKindValues = None  # type: ignore
 
 # Context variable to track the current execution ID for future tool mocking
 current_execution_id = contextvars.ContextVar("current_execution_id", default=None)
@@ -37,6 +46,25 @@ class CloudEngine(BaseEngine):
             logger.warning("FI_API_KEY or FI_SECRET_KEY not provided. CloudEngine will not function correctly.")
             
         self.api = None
+        self.run_test_id = None
+        self.test_execution_id = None
+        # If enabled, every conversation (call_execution_id) will be wrapped in a new root span
+        # (i.e., a separate trace), even when running with concurrency.
+        #
+        # Enable with:
+        #   export FI_SIMULATE_TRACE_PER_CALL=1
+        # Disable with:
+        #   export FI_SIMULATE_TRACE_PER_CALL=0
+        #
+        # Default: enabled (better DX; one trace per conversation).
+        self._trace_per_call = os.environ.get("FI_SIMULATE_TRACE_PER_CALL", "1") == "1"
+        self._using_simulator_attributes = None
+        try:
+            # Optional dependency: enables baggage propagation so user spans inherit simulator IDs
+            from fi_instrumentation import using_simulator_attributes  # type: ignore
+            self._using_simulator_attributes = using_simulator_attributes
+        except Exception:
+            self._using_simulator_attributes = None
 
     async def run(
         self,
@@ -75,9 +103,12 @@ class CloudEngine(BaseEngine):
         
         wrapper = self._normalize_callback(agent_callback)
         queue = asyncio.Queue()
+        
+        # Store IDs for tracing attributes
+        self.run_test_id = run_id
 
         print(f"Starting Simulation for Run ID: {run_id}")
-        
+
         try:
             # 1. Start the Run (Create TestExecution)
             start_resp = await self.api.start_test_execution(run_test_id=run_id)
@@ -89,6 +120,9 @@ class CloudEngine(BaseEngine):
                 raise ValueError(f"Failed to start test execution. Response: {start_resp}")
                 
             print(f"✓ Test Execution Started: {test_execution_id}")
+            
+            # Store test execution ID for tracing
+            self.test_execution_id = test_execution_id
 
             # 2. Start Producer and Consumers
             producer_task = asyncio.create_task(
@@ -155,6 +189,24 @@ class CloudEngine(BaseEngine):
                 # Simple retry logic or break? For now, break to avoid infinite loop
                 break
 
+    def _simulator_baggage_context(self, call_execution_id: str):
+        """
+        Creates a context manager that sets simulator IDs into OTEL baggage (via fi_instrumentation),
+        so any user-agent spans created inside the block inherit these attributes.
+        """
+        simulator_attributes = {
+            "is_simulator_trace": True,
+            "run_test_id": self.run_test_id,
+            "test_execution_id": self.test_execution_id,
+            "call_execution_id": call_execution_id,
+        }
+        # Remove None values to avoid serializing nulls
+        simulator_attributes = {k: v for k, v in simulator_attributes.items() if v is not None}
+
+        if self._using_simulator_attributes is None:
+            return contextlib.nullcontext()
+        return self._using_simulator_attributes(simulator_attributes)
+
     async def _consumer_loop(self, queue: asyncio.Queue, wrapper: AgentWrapper):
         """
         Worker that pulls execution IDs from the queue and runs the conversation.
@@ -179,7 +231,39 @@ class CloudEngine(BaseEngine):
         token = current_execution_id.set(call_execution_id)
         try:
             print(f"▶️ Processing Call: {call_execution_id}")
-            
+
+            # If enabled, wrap the *entire conversation* in one parent span (one trace per call).
+            # This is more reliable than wrapping in the consumer loop because it keeps the span
+            # active across the full async conversation lifecycle.
+            if self._trace_per_call:
+                tracer = otel_trace.get_tracer(__name__)
+                attrs: Dict[str, Any] = {
+                    "fi.simulator.is_simulator_trace": True,
+                    "fi.simulator.run_test_id": self.run_test_id,
+                    "fi.simulator.test_execution_id": self.test_execution_id,
+                    "fi.simulator.call_execution_id": call_execution_id,
+                }
+                # Remove None values
+                attrs = {k: v for k, v in attrs.items() if v is not None}
+
+                # Add FI span kind if available
+                if SpanAttributes is not None and FiSpanKindValues is not None:
+                    attrs[SpanAttributes.FI_SPAN_KIND] = FiSpanKindValues.CHAIN.value
+
+                with tracer.start_as_current_span("fi.simulator.conversation", attributes=attrs):
+                    return await self._handle_single_execution_inner(call_execution_id, wrapper)
+
+            return await self._handle_single_execution_inner(call_execution_id, wrapper)
+        finally:
+            current_execution_id.reset(token)
+
+    async def _handle_single_execution_inner(self, call_execution_id: str, wrapper: AgentWrapper):
+        """
+        Inner implementation of a single call execution. Separated so we can optionally wrap
+        the entire conversation in a parent tracing span.
+        """
+        try:
+
             # Step 1: Initiate chat (POST with initiate_chat=True)
             init_resp = await self.api.send_chat_message(
                 call_execution_id=call_execution_id,
@@ -259,7 +343,9 @@ class CloudEngine(BaseEngine):
                 import time
                 start_time = time.time()
                 try:
-                    agent_response = await wrapper.call(agent_input)
+                    # Propagate simulator IDs to any spans created by the user's agent instrumentation
+                    with self._simulator_baggage_context(call_execution_id):
+                        agent_response = await wrapper.call(agent_input)
                 except Exception as e:
                     error_msg = str(e) or f"{type(e).__name__}: {repr(e)}"
                     last_msg_content = agent_input.new_message.get('content', '') if agent_input.new_message else 'N/A'
@@ -401,8 +487,7 @@ class CloudEngine(BaseEngine):
             # Log to both logger and console
             logger.error(f"Call execution {call_execution_id} failed: {error_msg}", exc_info=True)
             print(f"❌ Call execution {call_execution_id} failed: {error_msg}")
-        finally:
-            current_execution_id.reset(token)
+        return None
 
     def _normalize_callback(self, callback: Callable | AgentWrapper) -> AgentWrapper:
         """Ensures we have a AgentWrapper instance."""

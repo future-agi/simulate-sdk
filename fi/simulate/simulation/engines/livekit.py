@@ -14,6 +14,7 @@ from livekit.api import AccessToken, VideoGrants
 from livekit.agents.voice import ModelSettings
 from livekit.agents.voice.io import TimedString
 
+# NOTE remove relative imports
 from ...agent.definition import AgentDefinition, SimulatorAgentDefinition
 from ..models import Scenario, Persona, TestReport, TestCaseResult
 from ..generator import ScenarioGenerator
