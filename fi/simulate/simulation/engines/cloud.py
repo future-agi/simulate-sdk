@@ -41,6 +41,7 @@ class CloudEngine(BaseEngine):
     async def run(
         self,
         run_id: Optional[str] = None,
+        run_test_name: Optional[str] = None,
         agent_callback: Optional[Callable | AgentWrapper] = None,
         concurrency: int = 5,
         **kwargs
@@ -49,13 +50,29 @@ class CloudEngine(BaseEngine):
         Connects to the cloud run, receives user inputs, calls the agent_callback,
         and sends responses back.
         """
-        if not run_id:
-            raise ValueError("CloudEngine requires a 'run_id' (run_test_id).")
+        if not run_id and not run_test_name:
+            raise ValueError("CloudEngine requires either 'run_id' or 'run_test_name'.")
         
         if not agent_callback:
             raise ValueError("CloudEngine requires an 'agent_callback' (function or AgentWrapper).")
 
         self.api = APIRoutes(self.api_key, self.secret_key, self.api_url, timeout=self.timeout)
+        
+        # If run_test_name is provided, fetch the run_id first
+        if run_test_name and not run_id:
+            print(f"🔍 Fetching Run Test ID for name: {run_test_name}")
+            try:
+                name_resp = await self.api.get_run_test_id_by_name(run_test_name)
+                result = name_resp.get("result", {})
+                # Handle both camelCase and snake_case response formats
+                run_id = result.get("run_test_id") or result.get("runTestId")
+                if not run_id:
+                    raise ValueError(f"Failed to get run_test_id for name '{run_test_name}'. Response: {name_resp}")
+                print(f"✓ Found Run Test ID: {run_id}")
+            except Exception as e:
+                logger.error(f"Failed to get run_test_id by name: {e}")
+                raise ValueError(f"Failed to get run_test_id for name '{run_test_name}': {e}")
+        
         wrapper = self._normalize_callback(agent_callback)
         queue = asyncio.Queue()
 
@@ -253,13 +270,15 @@ class CloudEngine(BaseEngine):
                     break
                 latency_ms = int((time.time() - start_time) * 1000)
                 
-                # Normalize response and extract tool_calls
+                # Normalize response and extract tool_calls and tool_responses
                 response_content = ""
                 tool_calls = None
+                tool_responses = None
                 
                 if isinstance(agent_response, AgentResponse):
                     response_content = agent_response.content
                     tool_calls = agent_response.tool_calls
+                    tool_responses = agent_response.tool_responses
                 else:
                     response_content = str(agent_response)
                 
@@ -272,20 +291,33 @@ class CloudEngine(BaseEngine):
                     assistant_msg["tool_calls"] = tool_calls
                 conversation_history.append(assistant_msg)
                 
+                # Add tool role messages (tool responses) after assistant message with tool_calls
+                if tool_responses:
+                    for tool_response in tool_responses:
+                        conversation_history.append(tool_response)
+                
                 # Step 3: Send agent response to backend and get next message
-                # Only send the new message (Agent response) to avoid duplication as backend appends
-                # SDK "assistant" (agent) → backend "user"
-                last_msg = conversation_history[-1]
+                # Send the assistant message with tool_calls and any tool responses
+                # SDK "assistant" (agent) → backend "user", SDK "tool" → backend "tool"
+                api_messages = []
                 
-                api_message = {
-                    "role": "user",
-                    "content": last_msg["content"]
+                # Add assistant message with tool_calls
+                assistant_api_msg = {
+                    "role": "user",  # Convert SDK "assistant" → backend "user"
+                    "content": assistant_msg["content"]
                 }
-                # Include tool_calls if present
-                if "tool_calls" in last_msg:
-                    api_message["tool_calls"] = last_msg["tool_calls"]
+                if "tool_calls" in assistant_msg:
+                    assistant_api_msg["tool_calls"] = assistant_msg["tool_calls"]
+                api_messages.append(assistant_api_msg)
                 
-                api_messages = [api_message]
+                # Add tool role messages if present
+                if tool_responses:
+                    for tool_response in tool_responses:
+                        api_messages.append({
+                            "role": "tool",  # Keep as "tool" for backend
+                            "tool_call_id": tool_response.get("tool_call_id"),
+                            "content": tool_response.get("content", "")
+                        })
                 
                 metrics = {"latency": latency_ms}
                 

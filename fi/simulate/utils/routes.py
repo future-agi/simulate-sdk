@@ -33,6 +33,17 @@ class APIRoutes:
     async def close(self):
         await self.client.aclose()
     
+    async def get_run_test_id_by_name(self, run_test_name: str) -> Dict[str, Any]:
+        """
+        GET /simulate/run-tests/get-id-by-name/{run_test_name}/
+        Gets the run_test_id by run_test_name.
+        """
+        url = f"/simulate/run-tests/get-id-by-name/{run_test_name}/"
+        response = await self.client.get(url)
+        if response.is_error:
+            self._handle_error(response, f"Failed to get run_test_id for name '{run_test_name}'")
+        return response.json()
+    
     def _handle_error(self, response: httpx.Response, operation: str) -> None:
         """
         Raises a more informative error with backend response details.

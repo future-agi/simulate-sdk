@@ -44,6 +44,7 @@ class TestRunner:
         
         # --- Cloud Mode Arguments (Backend API) ---
         run_id: Optional[str] = None,
+        run_test_name: Optional[str] = None,
         agent_callback: Optional[Callable] = None,
         
         # --- Shared Arguments ---
@@ -60,7 +61,7 @@ class TestRunner:
         Run a test simulation.
         
         Mode is determined by arguments:
-        - If `run_id` is provided → Cloud mode (Backend API)
+        - If `run_id` or `run_test_name` is provided → Cloud mode (Backend API)
         - If `agent_definition` is provided → Local mode (LiveKit)
         
         Args:
@@ -68,6 +69,7 @@ class TestRunner:
             scenario: Test scenario for local mode
             simulator: Simulator configuration for local mode
             run_id: Run ID from platform for cloud mode
+            run_test_name: Run test name (alternative to run_id) - will fetch ID from backend
             agent_callback: User's agent function to wrap for cloud mode
             num_scenarios: Number of scenarios to generate (local mode only)
             topic: Topic for scenario generation (local mode only)
@@ -82,12 +84,13 @@ class TestRunner:
             TestReport with results from all test cases
         """
         # Dispatch to appropriate engine
-        if run_id is not None:
+        if run_id is not None or run_test_name is not None:
             # Cloud mode - Use CloudEngine
             timeout = kwargs.pop('timeout', 120.0)  # Default 120s for LLM operations
             engine = CloudEngine(self.api_key, self.secret_key, self.api_url, timeout=timeout)
             return await engine.run(
                 run_id=run_id,
+                run_test_name=run_test_name,
                 agent_callback=agent_callback,
                 **kwargs
             )
@@ -111,5 +114,5 @@ class TestRunner:
         else:
             raise ValueError(
                 "Must provide either 'agent_definition' (Local/LiveKit mode) "
-                "or 'run_id' (Cloud/Backend API mode)."
+                "or 'run_id'/'run_test_name' (Cloud/Backend API mode)."
             )

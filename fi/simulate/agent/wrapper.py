@@ -19,6 +19,7 @@ class AgentResponse(BaseModel):
     """
     content: str
     tool_calls: Optional[List[Dict[str, Any]]] = None
+    tool_responses: Optional[List[Dict[str, Any]]] = None  # Tool role messages with results
     metadata: Optional[Dict[str, Any]] = None
 
 class AgentWrapper(ABC):
