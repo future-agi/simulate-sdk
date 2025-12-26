@@ -5,21 +5,25 @@ import os
 import contextlib
 import wave
 import numpy as np
+try:
+    from livekit.agents import stt, tts, llm, vad, Agent, AgentSession, function_tool
+    from livekit.agents.voice.room_io import RoomInputOptions, RoomOutputOptions
+    from livekit.plugins import openai, silero
+    from livekit import rtc
+    from livekit.api import AccessToken, VideoGrants
+    from livekit.agents.voice import ModelSettings
+    from livekit.agents.voice.io import TimedString
+except ImportError as e:
+    raise ImportError(
+        "LiveKit SDK is not installed (or incompatible version). "
+        "Install it to use LiveKit/local mode."
+    ) from e
 
-from livekit.agents import stt, tts, llm, vad, Agent, AgentSession, function_tool
-from livekit.agents.voice.room_io import RoomInputOptions, RoomOutputOptions
-from livekit.plugins import openai, silero
-from livekit import rtc
-from livekit.api import AccessToken, VideoGrants
-from livekit.agents.voice import ModelSettings
-from livekit.agents.voice.io import TimedString
-
-# NOTE remove relative imports
-from ...agent.definition import AgentDefinition, SimulatorAgentDefinition
-from ..models import Scenario, Persona, TestReport, TestCaseResult
-from ..generator import ScenarioGenerator
-from ...recording import RoomRecorder
-from .base import BaseEngine
+from fi.simulate.agent.definition import AgentDefinition, SimulatorAgentDefinition
+from fi.simulate.simulation.models import Scenario, Persona, TestReport, TestCaseResult
+from fi.simulate.simulation.generator import ScenarioGenerator
+from fi.simulate.recording.room_recorder import RoomRecorder
+from fi.simulate.simulation.engines.base import BaseEngine
 
 class _TestRunnerAgent(Agent):
     """

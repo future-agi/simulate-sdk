@@ -1,8 +1,8 @@
 
 from abc import ABC, abstractmethod
 from typing import Any, Optional, Callable
-from ...agent.definition import AgentDefinition, SimulatorAgentDefinition
-from ..models import Scenario, TestReport
+from fi.simulate.agent.definition import AgentDefinition, SimulatorAgentDefinition
+from fi.simulate.simulation.models import Scenario, TestReport
 
 class BaseEngine(ABC):
     """

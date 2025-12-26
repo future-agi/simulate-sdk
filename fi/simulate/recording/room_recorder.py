@@ -6,8 +6,14 @@ import os
 import wave
 from typing import Optional
 
-from livekit import rtc
-from livekit.api import AccessToken, VideoGrants
+try:
+    from livekit import rtc
+    from livekit.api import AccessToken, VideoGrants
+except ImportError:
+    # LiveKit is an optional dependency. In cloud-only usage, we silently skip it.
+    rtc = None
+    AccessToken = None
+    VideoGrants = None
 
 
 class RoomRecorder:

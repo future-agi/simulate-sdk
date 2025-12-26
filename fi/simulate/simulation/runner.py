@@ -1,9 +1,9 @@
 from typing import Optional, Callable
 import os
 
-from ..agent.definition import AgentDefinition, SimulatorAgentDefinition
-from .models import Scenario, TestReport
-from .engines import LiveKitEngine, BaseEngine, CloudEngine
+from fi.simulate.agent.definition import AgentDefinition, SimulatorAgentDefinition
+from fi.simulate.simulation.models import Scenario, TestReport
+from fi.simulate.simulation.engines import LiveKitEngine, BaseEngine, CloudEngine
 
 class TestRunner:
     """
@@ -97,6 +97,12 @@ class TestRunner:
             
         elif agent_definition is not None:
             # Local mode - use LiveKit engine
+            if LiveKitEngine is None:
+                raise ImportError(
+                    "LiveKit mode requires the LiveKit dependency, but it is not available in this environment. "
+                    "Install it (and compatible plugins) then retry. Cloud mode (run_id/run_test_name) does not "
+                    "require LiveKit."
+                )
             engine = LiveKitEngine()
             return await engine.run(
                 agent_definition=agent_definition,

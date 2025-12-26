@@ -1,9 +1,15 @@
 from typing import List
 from pydantic import BaseModel, Field
-from ..agent.definition import AgentDefinition
-from .models import Persona
-from livekit.plugins import openai
-from livekit.agents.llm.chat_context import ChatContext
+from fi.simulate.agent.definition import AgentDefinition
+from fi.simulate.simulation.models import Persona
+
+try:
+    from livekit.plugins import openai
+    from livekit.agents.llm.chat_context import ChatContext
+except ImportError:
+    # LiveKit is an optional dependency. In cloud-only usage, we silently skip it.
+    openai = None
+    ChatContext = None
 import json
 
 class ScenarioGenerator:

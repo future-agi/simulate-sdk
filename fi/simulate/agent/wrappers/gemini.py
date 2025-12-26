@@ -1,5 +1,5 @@
 from typing import Any, Union, List, Dict
-from ..wrapper import AgentWrapper, AgentInput, AgentResponse
+from fi.simulate.agent.wrapper import AgentWrapper, AgentInput, AgentResponse
 
 class GeminiAgentWrapper(AgentWrapper):
     """

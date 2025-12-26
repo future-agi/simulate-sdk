@@ -5,18 +5,10 @@ import logging
 import contextlib
 from typing import Optional, Callable, Dict, Any, List
 
-from ...agent.wrapper import AgentWrapper, AgentInput, AgentResponse
-from ..models import TestReport
-from .base import BaseEngine
-from ...utils.routes import APIRoutes
-from opentelemetry import trace as otel_trace
-
-try:
-    # Optional dependency: adds semantic convention attributes for Observe
-    from fi_instrumentation.fi_types import SpanAttributes, FiSpanKindValues  # type: ignore
-except Exception:  # pragma: no cover
-    SpanAttributes = None  # type: ignore
-    FiSpanKindValues = None  # type: ignore
+from fi.simulate.agent.wrapper import AgentWrapper, AgentInput, AgentResponse
+from fi.simulate.simulation.models import TestReport
+from fi.simulate.simulation.engines.base import BaseEngine
+from fi.simulate.utils.routes import APIRoutes
 
 # Context variable to track the current execution ID for future tool mocking
 current_execution_id = contextvars.ContextVar("current_execution_id", default=None)
@@ -48,16 +40,6 @@ class CloudEngine(BaseEngine):
         self.api = None
         self.run_test_id = None
         self.test_execution_id = None
-        # If enabled, every conversation (call_execution_id) will be wrapped in a new root span
-        # (i.e., a separate trace), even when running with concurrency.
-        #
-        # Enable with:
-        #   export FI_SIMULATE_TRACE_PER_CALL=1
-        # Disable with:
-        #   export FI_SIMULATE_TRACE_PER_CALL=0
-        #
-        # Default: enabled (better DX; one trace per conversation).
-        self._trace_per_call = os.environ.get("FI_SIMULATE_TRACE_PER_CALL", "1") == "1"
         self._using_simulator_attributes = None
         try:
             # Optional dependency: enables baggage propagation so user spans inherit simulator IDs
@@ -231,28 +213,6 @@ class CloudEngine(BaseEngine):
         token = current_execution_id.set(call_execution_id)
         try:
             print(f"▶️ Processing Call: {call_execution_id}")
-
-            # If enabled, wrap the *entire conversation* in one parent span (one trace per call).
-            # This is more reliable than wrapping in the consumer loop because it keeps the span
-            # active across the full async conversation lifecycle.
-            if self._trace_per_call:
-                tracer = otel_trace.get_tracer(__name__)
-                attrs: Dict[str, Any] = {
-                    "fi.simulator.is_simulator_trace": True,
-                    "fi.simulator.run_test_id": self.run_test_id,
-                    "fi.simulator.test_execution_id": self.test_execution_id,
-                    "fi.simulator.call_execution_id": call_execution_id,
-                }
-                # Remove None values
-                attrs = {k: v for k, v in attrs.items() if v is not None}
-
-                # Add FI span kind if available
-                if SpanAttributes is not None and FiSpanKindValues is not None:
-                    attrs[SpanAttributes.FI_SPAN_KIND] = FiSpanKindValues.CHAIN.value
-
-                with tracer.start_as_current_span("fi.simulator.conversation", attributes=attrs):
-                    return await self._handle_single_execution_inner(call_execution_id, wrapper)
-
             return await self._handle_single_execution_inner(call_execution_id, wrapper)
         finally:
             current_execution_id.reset(token)
@@ -260,7 +220,7 @@ class CloudEngine(BaseEngine):
     async def _handle_single_execution_inner(self, call_execution_id: str, wrapper: AgentWrapper):
         """
         Inner implementation of a single call execution. Separated so we can optionally wrap
-        the entire conversation in a parent tracing span.
+        the entire conversation in a parent tracing span and other instrumentation.
         """
         try:
 
