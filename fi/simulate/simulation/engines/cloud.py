@@ -325,6 +325,30 @@ class CloudEngine(BaseEngine):
                     response_content = agent_response.content
                     tool_calls = agent_response.tool_calls
                     tool_responses = agent_response.tool_responses
+                    # Back-compat: allow tool outputs to be passed via metadata["tool_outputs"]
+                    # Expected shape: [{"call_id": "...", "output": ...}, ...]
+                    if not tool_responses and agent_response.metadata:
+                        tool_outputs = agent_response.metadata.get("tool_outputs")
+                        if isinstance(tool_outputs, list) and tool_outputs:
+                            import json
+                            converted: list[dict] = []
+                            for item in tool_outputs:
+                                if not isinstance(item, dict):
+                                    continue
+                                call_id = item.get("call_id") or item.get("tool_call_id")
+                                output = item.get("output")
+                                if call_id is None and output is None:
+                                    continue
+                                converted.append(
+                                    {
+                                        "role": "tool",
+                                        "tool_call_id": call_id,
+                                        "content": output
+                                        if isinstance(output, str)
+                                        else json.dumps(output),
+                                    }
+                                )
+                            tool_responses = converted or None
                 else:
                     response_content = str(agent_response)
                 
