@@ -1,7 +1,7 @@
 [tool.poetry]
 name = "agent-simulate"
 version = "0.1.2"
-description = "Voice AI agent simulator and evaluation harness for LiveKit"
+description = "Voice AI agent simulator and evaluation harness"
 authors = ["Future AGI <no-reply@futureagi.com>"]
 readme = "README.md"
 # Keep current package path; update this if/when you rename the folder
