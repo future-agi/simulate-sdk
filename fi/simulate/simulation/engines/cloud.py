@@ -302,10 +302,11 @@ class CloudEngine(BaseEngine):
                 
                 # Call user's agent and measure latency
                 import time
-                start_time = time.time()
+                start_time = time.time() # Fallback for latency calculation approximation
                 try:
                     # Propagate simulator IDs to any spans created by the user's agent instrumentation
                     with self._simulator_baggage_context(call_execution_id):
+                        start_time = time.time() # Accurate start time for latency calculation
                         agent_response = await wrapper.call(agent_input)
                 except Exception as e:
                     error_msg = str(e) or f"{type(e).__name__}: {repr(e)}"
@@ -315,7 +316,7 @@ class CloudEngine(BaseEngine):
                     if last_msg_content != 'N/A':
                         print(f"   Last message: {last_msg_content[:100]}...")
                     break
-                latency_ms = int((time.time() - start_time) * 1000)
+                latency_ms = int((time.time() - start_time) * 1000) if start_time is not None else 0
                 
                 # Normalize response and extract tool_calls and tool_responses
                 response_content = ""
