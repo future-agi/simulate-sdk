@@ -8,7 +8,6 @@ from fi.simulate import TestRunner, AgentWrapper, AgentInput, AgentResponse
 # Ensure you have set these environment variables:
 # export FI_API_KEY="your-api-key"
 # export FI_SECRET_KEY="your-secret-key"
-# export FI_BASE_URL="http://localhost:8000"  # Or your dev/prod URL
 # export OPENAI_API_KEY="your-openai-key"
 
 # Install OpenAI Agents library:

@@ -1,7 +1,7 @@
-from .openai import OpenAIAgentWrapper
-from .langchain import LangChainAgentWrapper
-from .gemini import GeminiAgentWrapper
-from .anthropic import AnthropicAgentWrapper
+from fi.simulate.agent.wrappers.openai import OpenAIAgentWrapper
+from fi.simulate.agent.wrappers.langchain import LangChainAgentWrapper
+from fi.simulate.agent.wrappers.gemini import GeminiAgentWrapper
+from fi.simulate.agent.wrappers.anthropic import AnthropicAgentWrapper
 
 __all__ = [
     "OpenAIAgentWrapper",
