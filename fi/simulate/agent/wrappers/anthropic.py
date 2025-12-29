@@ -6,16 +6,18 @@ class AnthropicAgentWrapper(AgentWrapper):
     Wrapper for Anthropic (Claude) agents.
     Automatically handles message conversion to Anthropic format.
     """
-    def __init__(self, client: Any, model: str = "claude-sonnet-4-5-20250929", system_prompt: str = None):
+    def __init__(self, client: Any, model: str = "claude-sonnet-4-5-20250929", system_prompt: str = None, max_tokens: int = 1024):
         """
         Args:
             client: The Anthropic client instance (AsyncAnthropic or Anthropic).
             model: The model name to use.
             system_prompt: Optional system instructions for the agent.
+            max_tokens: Maximum number of tokens to generate (default: 1024).
         """
         self.client = client
         self.model = model
         self.system_prompt = system_prompt
+        self.max_tokens = max_tokens
 
     async def call(self, input: AgentInput) -> Union[str, AgentResponse]:
         # Convert internal message format to Anthropic format
@@ -45,7 +47,7 @@ class AnthropicAgentWrapper(AgentWrapper):
         
         kwargs = {
             "model": self.model,
-            "max_tokens": 1024,
+            "max_tokens": self.max_tokens,
             "messages": messages
         }
         if system_prompt:
