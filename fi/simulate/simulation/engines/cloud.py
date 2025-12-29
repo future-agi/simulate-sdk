@@ -176,6 +176,9 @@ class CloudEngine(BaseEngine):
         Creates a context manager that sets simulator IDs into OTEL baggage (via fi_instrumentation),
         so any user-agent spans created inside the block inherit these attributes.
         """
+        if self._using_simulator_attributes is None:
+            return contextlib.nullcontext()
+        
         simulator_attributes = {
             "is_simulator_trace": True,
             "run_test_id": self.run_test_id,
@@ -184,9 +187,7 @@ class CloudEngine(BaseEngine):
         }
         # Remove None values to avoid serializing nulls
         simulator_attributes = {k: v for k, v in simulator_attributes.items() if v is not None}
-
-        if self._using_simulator_attributes is None:
-            return contextlib.nullcontext()
+        
         return self._using_simulator_attributes(simulator_attributes)
 
     async def _consumer_loop(self, queue: asyncio.Queue, wrapper: AgentWrapper):
