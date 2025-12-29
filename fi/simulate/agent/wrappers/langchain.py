@@ -1,6 +1,14 @@
 from typing import Any, Union, Dict, List
 from fi.simulate.agent.wrapper import AgentWrapper, AgentInput, AgentResponse
 
+try:
+    from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+except ImportError:
+    # LangChain is an optional dependency. Silently set to None if not installed.
+    HumanMessage = None
+    AIMessage = None
+    SystemMessage = None
+
 class LangChainAgentWrapper(AgentWrapper):
     """
     Wrapper for LangChain Runnable or Chain agents.
@@ -16,7 +24,6 @@ class LangChainAgentWrapper(AgentWrapper):
         self.system_prompt = system_prompt
 
     async def call(self, input: AgentInput) -> Union[str, AgentResponse]:
-        from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 
         # Convert history to LangChain messages
         lc_messages = []
