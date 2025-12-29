@@ -20,6 +20,11 @@ class LangChainAgentWrapper(AgentWrapper):
                    It is expected to accept a dictionary with "messages" or "input".
             system_prompt: Optional system prompt to prepend to message history.
         """
+        if HumanMessage is None or AIMessage is None or SystemMessage is None:
+            raise ImportError(
+                "LangChain is not installed. Please install it with 'pip install langchain-core' "
+                "to use LangChainAgentWrapper."
+            )
         self.agent = agent
         self.system_prompt = system_prompt
 
