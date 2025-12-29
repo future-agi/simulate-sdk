@@ -8,6 +8,9 @@ except ImportError:
     HumanMessage = None
     AIMessage = None
     SystemMessage = None
+    LANGCHAIN_INSTALLED = False
+else:
+    LANGCHAIN_INSTALLED = True
 
 class LangChainAgentWrapper(AgentWrapper):
     """
