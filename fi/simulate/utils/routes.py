@@ -138,3 +138,28 @@ class APIRoutes:
             self._handle_error(response, f"Failed to send chat message for call_execution_id '{call_execution_id}'")
         return response.json()
 
+    async def update_call_execution_status(
+        self,
+        call_execution_id: str,
+        status: str,
+        ended_reason: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        PATCH /simulate/call-executions/{call_execution_id}/
+        Updates the status of a call execution.
+        
+        Args:
+            call_execution_id: The ID of the call execution to update
+            status: The new status (must be a valid CallStatus choice, e.g., "FAILED", "CANCELLED")
+            ended_reason: Optional reason for ending the call execution
+        """
+        url = f"/simulate/call-executions/{call_execution_id}/"
+        payload = {"status": status}
+        if ended_reason is not None:
+            payload["ended_reason"] = ended_reason
+        
+        response = await self.client.patch(url, json=payload)
+        if response.is_error:
+            self._handle_error(response, f"Failed to update call execution status for call_execution_id '{call_execution_id}'")
+        return response.json()
+

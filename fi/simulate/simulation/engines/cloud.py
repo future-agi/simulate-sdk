@@ -473,6 +473,18 @@ class CloudEngine(BaseEngine):
             # Log to both logger and console
             logger.error(f"Call execution {call_execution_id} failed: {error_msg}", exc_info=True)
             print(f"❌ Call execution {call_execution_id} failed: {error_msg}")
+            
+            # Update call execution status to failed
+            try:
+                # Use "FAILED" (uppercase) to match Django model choices, and include error message as ended_reason
+                await self.api.update_call_execution_status(
+                    call_execution_id, 
+                    "FAILED",
+                    ended_reason=error_msg
+                )
+            except Exception as status_error:
+                # Don't let status update failure mask the original error
+                logger.warning(f"Failed to update call execution status for {call_execution_id}: {status_error}")
         return None
 
     def _normalize_callback(self, callback: Callable | AgentWrapper) -> AgentWrapper:
