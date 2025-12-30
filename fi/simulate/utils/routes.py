@@ -97,17 +97,16 @@ class APIRoutes:
 
     async def fetch_execution_batch(
         self, 
-        run_test_id: str, 
         test_execution_id: str
     ) -> Dict[str, Any]:
         """
-        GET /simulate/run-tests/{run_test_id}/chat-execute/?test_execution_id=...
-        Fetches a batch of call execution IDs.
+        POST /simulate/test-executions/{test_execution_id}/chat/call-executions/batch/
+        Creates a batch of call execution IDs (has side effects - creates CallExecution records).
+        Returns: {"call_execution_ids": [...], "has_more": bool, "batched_scenarios": [...]}
         """
-        url = f"/simulate/run-tests/{run_test_id}/chat-execute/"
-        params = {"test_execution_id": test_execution_id}
+        url = f"/simulate/test-executions/{test_execution_id}/chat/call-executions/batch/"
         
-        response = await self.client.get(url, params=params)
+        response = await self.client.post(url, json={})
         if response.is_error:
             self._handle_error(response, f"Failed to fetch execution batch for test_execution_id '{test_execution_id}'")
         return response.json()

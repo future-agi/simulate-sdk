@@ -147,7 +147,7 @@ class CloudEngine(BaseEngine):
         while has_more:
             try:
                 print("🔄 Fetching batch of scenarios...")
-                resp = await self.api.fetch_execution_batch(run_test_id, test_execution_id)
+                resp = await self.api.fetch_execution_batch(test_execution_id)
                 
                 result = resp.get("result", {})
                 # Handle both camelCase and snake_case response formats
