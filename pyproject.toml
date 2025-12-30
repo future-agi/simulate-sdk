@@ -1,7 +1,7 @@
 [tool.poetry]
 name = "agent-simulate"
-version = "0.1.1"
-description = "Voice AI agent simulator and evaluation harness for LiveKit"
+version = "0.1.2"
+description = "Voice AI agent simulator and evaluation harness"
 authors = ["Future AGI <no-reply@futureagi.com>"]
 readme = "README.md"
 # Keep current package path; update this if/when you rename the folder
@@ -11,12 +11,18 @@ packages = [
 
 [tool.poetry.dependencies]
 python = ">=3.10,<3.14"
-livekit-agents = { version = ">=1.2", extras = ["openai", "silero"] }
 python-dotenv = ">=1.0.0"
 pandas = ">=2.0.0"
 numpy = ">=1.26.0"
-ai-evaluation = ">=0.2.1"
-openai = ">=1.109.0"
+fi-instrumentation-otel = ">=0.1.16"
+httpx = ">=0.24.0"
+livekit-agents = {version = ">=1.2", extras = ["openai", "silero"], optional = true}
+ai-evaluation = {version = ">=0.2.1", optional = true}
+
+[tool.poetry.extras]
+livekit = ["livekit-agents"]
+evaluation = ["ai-evaluation"]
+all = ["livekit-agents", "ai-evaluation"]
 
 [tool.poetry.group.dev.dependencies]
 pytest = ">=8.0.0"
