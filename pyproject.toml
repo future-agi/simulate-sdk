@@ -15,6 +15,14 @@ python-dotenv = ">=1.0.0"
 pandas = ">=2.0.0"
 numpy = ">=1.26.0"
 fi-instrumentation-otel = ">=0.1.16"
+httpx = ">=0.24.0"
+livekit-agents = {version = ">=1.2", extras = ["openai", "silero"], optional = true}
+ai-evaluation = {version = ">=0.2.1", optional = true}
+
+[tool.poetry.extras]
+livekit = ["livekit-agents"]
+evaluation = ["ai-evaluation"]
+all = ["livekit-agents", "ai-evaluation"]
 
 [tool.poetry.group.dev.dependencies]
 pytest = ">=8.0.0"
