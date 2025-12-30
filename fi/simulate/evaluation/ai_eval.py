@@ -4,7 +4,7 @@ from typing import Iterable, Mapping, Sequence
 import os
 import base64
 
-from ..simulation.models import TestReport
+from fi.simulate.simulation.models import TestReport
 
 
 def evaluate_report(
