@@ -479,7 +479,7 @@ class CloudEngine(BaseEngine):
                 # Use "FAILED" (uppercase) to match Django model choices, and include error message as ended_reason
                 await self.api.update_call_execution_status(
                     call_execution_id, 
-                    "FAILED",
+                    "failed",
                     ended_reason=error_msg
                 )
             except Exception as status_error:
