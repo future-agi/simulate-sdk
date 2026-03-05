@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.3
+
+### Fixed
+- Cloud Engine: Update call execution status to 'completed' or 'failed' upon agent call failure
+  - Sets status to 'completed' if failure occurs after at least one turn (allows evaluations to run on partial data)
+  - Sets status to 'failed' if failure occurs on the first turn
+  - Suppresses success log message when agent call has failed
+  - Uses generic error message to avoid leaking internal error details
+
 ## 0.1.2
 
 ### Added
