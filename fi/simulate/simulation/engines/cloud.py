@@ -279,7 +279,8 @@ class CloudEngine(BaseEngine):
             # Step 2: Conversation loop
             max_turns = 50  # Safety limit
             turn_count = 0
-            
+            agent_call_failed = False  # Track if agent call failed
+
             while turn_count < max_turns:
                 # Check if chat ended based on last response
                 chat_ended = result.get("chat_ended") or result.get("chatEnded", False)
@@ -315,6 +316,22 @@ class CloudEngine(BaseEngine):
                     print(f"❌ Agent call failed for {call_execution_id}: {error_msg}")
                     if last_msg_content != 'N/A':
                         print(f"   Last message: {last_msg_content[:100]}...")
+                    # Update call execution status in the backend
+                    # If we have already completed some turns, mark as "completed" so evaluations can run
+                    # on the partial data. Only mark as "failed" if we failed on the first turn.
+                    status = "completed" if turn_count > 0 else "failed"
+                    # Use generic error message to avoid leaking internal error details
+                    generic_reason = "Error processing simulation"
+                    try:
+                        await self.api.update_call_execution_status(
+                            call_execution_id,
+                            status,
+                            ended_reason=generic_reason
+                        )
+                        print(f"   Status set to '{status}' (turn_count={turn_count})")
+                    except Exception as status_error:
+                        logger.warning(f"Failed to update call execution status for {call_execution_id}: {status_error}")
+                    agent_call_failed = True
                     break
                 latency_ms = int((time.time() - start_time) * 1000) if start_time is not None else 0
                 
@@ -461,8 +478,10 @@ class CloudEngine(BaseEngine):
                                     })
                 
                 turn_count += 1
-            
-            print(f"✓ Call Finished: {call_execution_id} ({turn_count} turns)")
+
+            # Only print success if the call didn't fail
+            if not agent_call_failed:
+                print(f"✓ Call Finished: {call_execution_id} ({turn_count} turns)")
             
         except Exception as e:
             # Get detailed error message
@@ -479,7 +498,7 @@ class CloudEngine(BaseEngine):
                 # Use "FAILED" (uppercase) to match Django model choices, and include error message as ended_reason
                 await self.api.update_call_execution_status(
                     call_execution_id, 
-                    "FAILED",
+                    "failed",
                     ended_reason=error_msg
                 )
             except Exception as status_error:
