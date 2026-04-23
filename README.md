@@ -1,12 +1,5 @@
 <div align="center">
 
-<a href="https://futureagi.com">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/future-agi/future-agi/main/.github/assets/logo-banner-dark.png">
-    <img alt="Future AGI — make AI agents reliable" src="https://raw.githubusercontent.com/future-agi/future-agi/main/.github/assets/logo-banner.png" height="96">
-  </picture>
-</a>
-
 # Simulate — test AI agents before users meet them
 
 **Python SDK for the `Simulate` pillar of [Future AGI](https://github.com/future-agi/future-agi).**
