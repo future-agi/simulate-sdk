@@ -1,0 +1,53 @@
+name: ✨ Feature request
+description: Suggest a new feature or improvement for the simulate-sdk
+labels: ["feature", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to suggest a feature! For larger changes, a design discussion in the issue is usually more productive than a surprise PR.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you trying to solve?
+      description: Describe the user-facing problem, not the implementation. "I can't X because Y" works well.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What would you like to see happen? Mockups, code snippets of the desired API, or sample output all help.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
+      description: Why isn't this solvable with existing features or a workaround?
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      multiple: true
+      options:
+        - Voice mode (LiveKit engine)
+        - Cloud mode (CloudEngine + backend)
+        - Agent wrappers (OpenAI / LangChain / Gemini / Anthropic)
+        - Scenario & persona generation
+        - Audio recording / transcripts
+        - Evaluation integration (`evaluate_report`)
+        - Packaging / extras / install
+        - Documentation
+        - Other
+
+  - type: checkboxes
+    id: contribution
+    attributes:
+      label: Contribution
+      options:
+        - label: I'd be willing to submit a PR to implement this (team can help with design guidance)
