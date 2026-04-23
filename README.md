@@ -30,9 +30,9 @@ Run voice and text agents against persona-driven scenarios, capture transcripts 
 
 ## Why this SDK?
 
-AI agents hallucinate — they fabricate facts, misquote policies, and invent data. You can't unit-test "don't make things up." You need to **run the agent against realistic conversations, at scale, before real users ever meet it.**
+AI agents hallucinate. They fabricate facts and misquote policies, and a bad output in production is already in the world by the time anyone notices. You can't unit-test "don't make things up" — you run the agent against realistic conversations before real users do.
 
-`agent-simulate` is the client SDK for the `Simulate` pillar of Future AGI. It drives voice and text agents through persona-driven multi-turn scenarios, captures every transcript and audio file, and hands the results to the `Evaluate` pillar for scoring.
+`agent-simulate` is the client SDK for the `Simulate` pillar of Future AGI. It drives voice and text agents through persona-driven scenarios and hands the transcripts + audio to the `Evaluate` pillar for scoring.
 
 ---
 
@@ -51,14 +51,14 @@ Connect a simulated customer to an agent sitting in a **LiveKit** room over WebR
 
 ### Text agents (Cloud)
 
-Orchestrate thousands of multi-turn text conversations against any agent framework — **OpenAI**, **Anthropic**, **LangChain**, **Gemini**, or your own — via Future AGI's hosted simulation backend.
+Orchestrate thousands of multi-turn text conversations against any agent framework (**OpenAI**, **Anthropic**, **LangChain**, **Gemini**, or your own), via Future AGI's hosted simulation backend.
 
 </td>
 <td width="33%" valign="top">
 
 ### Evaluation-ready
 
-Results drop straight into [`ai-evaluation`](https://github.com/future-agi/ai-evaluation) via the `evaluate_report` helper. Score with **50+ built-in metrics** or your own rubrics — task completion, tone, audio quality, and more.
+Results drop straight into [`ai-evaluation`](https://github.com/future-agi/ai-evaluation) via the `evaluate_report` helper. Score with **50+ built-in metrics** or your own rubrics — task completion, tone, audio quality, groundedness, and others.
 
 </td>
 </tr>
