@@ -1,3 +1,5 @@
+![Future AGI](Logo.png)
+
 <div align="center">
 
 # Simulate — test AI agents before users meet them
