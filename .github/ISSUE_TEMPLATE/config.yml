@@ -1,0 +1,17 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 💬 Discord
+    url: https://discord.gg/UjZ2gRT5p
+    about: Ask questions, share what you're building, chat with the community and team
+  - name: 📖 Documentation
+    url: https://docs.futureagi.com
+    about: Getting started, API reference, examples
+  - name: 🔐 Security vulnerability
+    url: https://github.com/future-agi/simulate-sdk/security/advisories/new
+    about: Report a security issue privately (do NOT open a public issue)
+  - name: 🌐 Main platform (future-agi/future-agi)
+    url: https://github.com/future-agi/future-agi
+    about: Issues for the Future AGI platform — tracing, evals, gateway, UI
+  - name: ☁️ Cloud account or billing
+    url: mailto:support@futureagi.com
+    about: Questions about your Future AGI Cloud account, billing, or enterprise features
