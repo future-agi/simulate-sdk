@@ -1,4 +1,4 @@
-![Future AGI](Logo.png)
+![Future AGI](banner.png)
 
 <div align="center">
 
@@ -35,6 +35,10 @@ AI agents hallucinate. They fabricate facts and misquote policies, and a bad out
 `agent-simulate` is the client SDK for the `Simulate` pillar of Future AGI. It drives voice and text agents through persona-driven scenarios and hands the transcripts + audio to the `Evaluate` pillar for scoring.
 
 ---
+
+<div align="center">
+  <img src="simulate-repo.gif" alt="agent-simulate Demo" width="70%" />
+</div>
 
 ## What's in the box
 
