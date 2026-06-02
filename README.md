@@ -273,7 +273,9 @@ transient tool/API faults, browser/CUA state, voice turns, image fixtures,
 files, framework traces, or multi-agent handoffs.
 Browser adapters can emit DOM snapshots, screenshots, coordinate-region
 assertions, screenshot/action diff evidence, prompt-injection surfaces, action
-replay, console/network logs, and trace artifacts. Voice adapters can replay VAD/STT/TTS
+replay, console/network logs, HAR/resource-body replay, OpenAI Computer Use and
+Browser Use trace imports, imported actionability timelines, and trace artifacts.
+Voice adapters can replay VAD/STT/TTS
 events, Pipecat-style frames, latency profiles, barge-in/overlap handling, call
 routing, noise metadata, LiveKit/Pipecat-style export JSON, waveform fixtures,
 speaker diarization segments, perceptual audio metrics, WebRTC-style jitter and
@@ -303,7 +305,9 @@ from fi.simulate import (
     ToolMockEnvironment,
     TestRunner,
     VoiceEnvironment,
+    load_browser_trace_export,
     normalize_framework_trace_events,
+    normalize_browser_trace_export,
 )
 
 report = await TestRunner().run_test(
@@ -424,6 +428,7 @@ environment = FrameworkTraceEnvironment.from_export(framework="traceai", export=
 See [`examples/local_environment_adapters.py`](examples/local_environment_adapters.py) for a full local world simulation with ai-evaluation scoring, and [`examples/local_voice_image_environments.py`](examples/local_voice_image_environments.py) for a voice + image artifact cookbook.
 See [`examples/local_browser_trace_replay.py`](examples/local_browser_trace_replay.py) for a browser/CUA trace replay cookbook with screenshots, DOM, selector and coordinate-region action fixtures, screenshot/action diff evidence, prompt-injection surfaces, mutable browser state, console/network logs, DOM mutation events, and action replay.
 See [`examples/local_playwright_trace_replay.py`](examples/local_playwright_trace_replay.py) for a Playwright trace.zip replay cookbook with imported DOM snapshots, screenshots, video artifacts, stale-screenshot refresh, and layout-shift perturbations.
+See [`examples/local_browser_cua_trace_replay.py`](examples/local_browser_cua_trace_replay.py) for a HAR + OpenAI Computer Use + Browser Use trace replay cookbook with resource bodies, batched `computer_call.actions[]`, screenshots, safety checks, and imported actionability timeline evidence.
 See [`examples/local_voice_replay_routing.py`](examples/local_voice_replay_routing.py) for a voice replay cookbook with VAD/STT/TTS events, Pipecat-style frame replay, noise/overlap evidence, interruption handling, and call routing.
 See [`examples/local_voice_export_replay.py`](examples/local_voice_export_replay.py) for a voice export replay cookbook with LiveKit-style events, Pipecat-style frames, waveform fixtures, diarization, MOS/SNR/clipping/jitter/packet-loss checks, and `load_voice_export`.
 See [`examples/local_framework_trace_replay.py`](examples/local_framework_trace_replay.py) for a framework trace replay cookbook with native spans/events and TraceAI/OpenTelemetry export payloads from orchestration frameworks.
@@ -628,7 +633,7 @@ Traces from simulations flow into `Monitor`, scores flow into `Evaluate`, and fa
 - [x] OpenAI / Anthropic / Gemini / LangChain wrappers
 - [x] Generic framework adapter presets
 - [x] Multimodal artifacts + event trajectories
-- [x] Local environment adapters for mocked tools/APIs, framework trace replay with TraceAI/OpenTelemetry export ingestion, retrieval/memory attribution, autonomy-loop traces, multi-agent handoff traces, browser/CUA trace replay with Playwright trace/video import, coordinate regions, screenshot diffs, stale-screenshot and layout-shift perturbations, voice frame replay/routing/noise/overlap/export replay/waveform/diarization/perceptual metrics, images, files, adversarial packs, and multi-agent rooms
+- [x] Local environment adapters for mocked tools/APIs, framework trace replay with TraceAI/OpenTelemetry export ingestion, retrieval/memory attribution, autonomy-loop traces, multi-agent handoff traces, browser/CUA trace replay with Playwright trace/video import, HAR/resource bodies, OpenAI Computer Use and Browser Use trace import, actionability timelines, coordinate regions, screenshot diffs, stale-screenshot and layout-shift perturbations, voice frame replay/routing/noise/overlap/export replay/waveform/diarization/perceptual metrics, images, files, adversarial packs, and multi-agent rooms
 - [x] Deterministic synthetic data generator
 - [x] Self-contained synthetic tool-world generator with schemas, mocks, state expectations, and evaluator config
 - [x] Deterministic pentest scenario generator

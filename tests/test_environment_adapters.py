@@ -16,11 +16,13 @@ from fi.simulate import (
     ToolFaultInjectionEnvironment,
     ToolMockEnvironment,
     VoiceEnvironment,
+    load_browser_trace_export,
     load_voice_export,
     load_playwright_trace_export,
     load_framework_trace_export,
     normalize_framework_trace_events,
     normalize_framework_trace_export,
+    normalize_browser_trace_export,
     normalize_voice_export,
     normalize_playwright_trace_export,
 )
@@ -534,6 +536,116 @@ def test_normalize_playwright_trace_export_extracts_trace_zip(tmp_path):
     assert any(artifact.type == "video" for artifact in snapshot.artifacts)
     assert any(event.type == "browser_perturbation" for event in snapshot.events)
     assert snapshot.metadata["browser_trace"]["video_artifacts"] == 1
+
+
+@pytest.mark.asyncio
+async def test_browser_environment_replays_har_openai_cua_and_browser_use_trace():
+    trace_export = {
+        "provider": "browser_use",
+        "urls": ["https://shop.example.com/checkout"],
+        "screenshot_paths": ["/tmp/browser-use-checkout.png"],
+        "model_actions": [{"click": {"index": 1, "x": 190, "y": 450}}],
+        "action_results": [{"success": True}],
+        "log": {
+            "entries": [
+                {
+                    "startedDateTime": "2026-06-03T10:00:00Z",
+                    "request": {
+                        "method": "GET",
+                        "url": "https://shop.example.com/api/cart",
+                    },
+                    "response": {
+                        "status": 200,
+                        "content": {
+                            "mimeType": "application/json",
+                            "text": "{\"cart\":\"ready\"}",
+                        },
+                    },
+                }
+            ]
+        },
+        "events": [
+            {
+                "type": "computer_call",
+                "id": "cu_confirm",
+                "call_id": "call_confirm",
+                "actions": [
+                    {"type": "screenshot"},
+                    {"type": "click", "button": "left", "x": 190, "y": 450},
+                ],
+                "pending_safety_checks": [
+                    {
+                        "id": "sc_prompt_injection",
+                        "code": "malicious_instructions",
+                        "message": "Hostile page instruction detected.",
+                    }
+                ],
+                "status": "completed",
+            },
+            {
+                "type": "computer_call_output",
+                "call_id": "call_confirm",
+                "output": {
+                    "type": "computer_screenshot",
+                    "image_url": "file:///tmp/openai-cua-after.png",
+                },
+                "current_url": "https://shop.example.com/checkout",
+            },
+        ],
+    }
+
+    normalized = normalize_browser_trace_export(trace_export, provider="browser_use")
+
+    assert normalized["metadata"]["source_type"] == "browser_use"
+    assert normalized["resource_bodies"][0]["body"] == "{\"cart\":\"ready\"}"
+    assert any(item["source"] == "browser_use" for item in normalized["actionability_timeline"])
+    assert any(item["source"] == "openai_cua" for item in normalized["actionability_timeline"])
+    assert any(action["metadata"]["source"] == "openai_cua" for action in normalized["actions"])
+    assert {"call_confirm_1", "call_confirm_2"} <= {action["id"] for action in normalized["actions"]}
+    assert any(snapshot["metadata"]["source"] == "browser_use" for snapshot in normalized["snapshots"])
+    assert normalized["prompt_injections"][0]["source"] == "openai_cua"
+
+    async def agent(input):
+        return AgentResponse(
+            content="I inspect network evidence and replay the CUA click.",
+            tool_calls=[
+                {"id": "network", "name": "browser_network", "arguments": {}},
+                {"id": "click", "name": "computer_click", "arguments": {"x": 190, "y": 450, "action": "click"}},
+                {"id": "snapshot", "name": "browser_snapshot", "arguments": {}},
+            ],
+        )
+
+    report = await LocalTextEngine().run(
+        scenario=_scenario(),
+        agent_callback=agent,
+        environment=load_browser_trace_export(
+            trace_export,
+            provider="browser_use",
+            allowed_domains=["shop.example.com"],
+        ),
+        max_turns=1,
+        min_turns=1,
+        modality="cua",
+    )
+
+    result = report.results[0]
+    browser = result.metadata["environment_state"]["browser"]
+    trace = [
+        artifact.data
+        for artifact in result.artifacts
+        if artifact.type == "trace" and artifact.metadata.get("kind") == "browser_trace"
+    ][-1]
+
+    assert browser["resource_bodies"][0]["source"] == "har"
+    assert browser["resource_bodies"][0]["body"] == "{\"cart\":\"ready\"}"
+    assert browser["actionability_timeline"]
+    assert browser["action_replay"][-1]["success"] is True
+    assert trace["trace_import"]["source_type"] == "browser_use"
+    assert any(event.type == "browser_actionability" for event in result.events)
+    assert any(
+        event.type == "browser_network" and event.payload.get("resource_bodies")
+        for event in result.events
+    )
 
 
 @pytest.mark.asyncio

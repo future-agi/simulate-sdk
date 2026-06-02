@@ -281,14 +281,24 @@ class BrowserEnvironment(EnvironmentAdapter):
         console_logs: Optional[Iterable[str | Mapping[str, Any]]] = None,
         network_log: Optional[Iterable[Mapping[str, Any]]] = None,
         prompt_injections: Optional[Iterable[str | Mapping[str, Any]]] = None,
+        browser_trace: Optional[Any] = None,
+        browser_trace_source: Optional[str | os.PathLike[str]] = None,
+        trace_provider: str = "browser",
         playwright_trace: Optional[Any] = None,
         playwright_trace_source: Optional[str | os.PathLike[str]] = None,
         video_artifacts: Optional[Iterable[str | Mapping[str, Any]]] = None,
         perturbations: Optional[Iterable[str | Mapping[str, Any]]] = None,
     ) -> None:
-        trace_fixture = _normalize_playwright_trace_export(
-            _load_playwright_trace_source(playwright_trace_source) if playwright_trace_source is not None else playwright_trace,
-            source_label=_browser_source_label(playwright_trace_source) if playwright_trace_source is not None else None,
+        trace_fixture = _merge_browser_trace_fixtures(
+            _normalize_browser_trace_export(
+                _load_browser_trace_source(browser_trace_source) if browser_trace_source is not None else browser_trace,
+                provider=trace_provider,
+                source_label=_browser_source_label(browser_trace_source) if browser_trace_source is not None else None,
+            ),
+            _normalize_playwright_trace_export(
+                _load_playwright_trace_source(playwright_trace_source) if playwright_trace_source is not None else playwright_trace,
+                source_label=_browser_source_label(playwright_trace_source) if playwright_trace_source is not None else None,
+            ),
         )
         trace_snapshots = list(trace_fixture.get("snapshots", []))
         if trace_snapshots and url == "https://example.test/":
@@ -338,8 +348,12 @@ class BrowserEnvironment(EnvironmentAdapter):
             dict(item)
             for item in [*list(trace_fixture.get("network_log", [])), *list(network_log or [])]
         ]
+        self.initial_resource_bodies = _dedupe_dicts(trace_fixture.get("resource_bodies", []))
+        self.initial_actionability_timeline = _dedupe_dicts(trace_fixture.get("actionability_timeline", []))
         self.console_logs = copy.deepcopy(self.initial_console_logs)
         self.network_log = copy.deepcopy(self.initial_network_log)
+        self.resource_bodies = copy.deepcopy(self.initial_resource_bodies)
+        self.actionability_timeline = copy.deepcopy(self.initial_actionability_timeline)
         self.initial_prompt_injections = _normalize_browser_prompt_injections(
             [*list(trace_fixture.get("prompt_injections", [])), *list(prompt_injections or [])],
             self.initial_regions,
@@ -365,6 +379,8 @@ class BrowserEnvironment(EnvironmentAdapter):
         self.regions = copy.deepcopy(self.initial_regions)
         self.console_logs = copy.deepcopy(self.initial_console_logs)
         self.network_log = copy.deepcopy(self.initial_network_log)
+        self.resource_bodies = copy.deepcopy(self.initial_resource_bodies)
+        self.actionability_timeline = copy.deepcopy(self.initial_actionability_timeline)
         self.prompt_injections = copy.deepcopy(self.initial_prompt_injections)
         self.video_artifacts = copy.deepcopy(self.initial_video_artifacts)
         self.perturbations = copy.deepcopy(self.initial_perturbations)
@@ -387,6 +403,8 @@ class BrowserEnvironment(EnvironmentAdapter):
                     "regions": sorted(self.regions.keys()),
                     "console_logs": len(self.console_logs),
                     "network_log": len(self.network_log),
+                    "resource_bodies": len(self.resource_bodies),
+                    "actionability_timeline": len(self.actionability_timeline),
                     "video_artifacts": len(self.video_artifacts),
                     "perturbations": len(self.perturbations),
                     "trace_import": copy.deepcopy(self.trace_import_metadata),
@@ -411,7 +429,18 @@ class BrowserEnvironment(EnvironmentAdapter):
                 SimulationEvent(
                     type="browser_network",
                     name="network_log_loaded",
-                    payload={"requests": copy.deepcopy(self.network_log)},
+                    payload={
+                        "requests": copy.deepcopy(self.network_log),
+                        "resource_bodies": copy.deepcopy(self.resource_bodies),
+                    },
+                )
+            )
+        if self.actionability_timeline:
+            events.append(
+                SimulationEvent(
+                    type="browser_actionability",
+                    name="actionability_timeline_loaded",
+                    payload={"checks": copy.deepcopy(self.actionability_timeline)},
                 )
             )
         for injection in self.prompt_injections:
@@ -484,6 +513,8 @@ class BrowserEnvironment(EnvironmentAdapter):
                     "regions": sorted(self.regions.keys()),
                     "console_logs": len(self.console_logs),
                     "network_log": len(self.network_log),
+                    "resource_bodies": len(self.resource_bodies),
+                    "actionability_timeline": len(self.actionability_timeline),
                     "video_artifacts": len(self.video_artifacts),
                     "perturbations": len(self.perturbations),
                 }
@@ -731,7 +762,10 @@ class BrowserEnvironment(EnvironmentAdapter):
             result = {"console_logs": copy.deepcopy(self.console_logs)}
             event_type = "browser_console"
         elif name == "browser_network":
-            result = {"network_log": copy.deepcopy(self.network_log)}
+            result = {
+                "network_log": copy.deepcopy(self.network_log),
+                "resource_bodies": copy.deepcopy(self.resource_bodies),
+            }
             event_type = "browser_network"
         elif name == "browser_refresh_snapshot":
             refreshed = self._refresh_snapshot()
@@ -1004,6 +1038,8 @@ class BrowserEnvironment(EnvironmentAdapter):
             "regions": copy.deepcopy(self.regions),
             "console_logs": copy.deepcopy(self.console_logs),
             "network_log": copy.deepcopy(self.network_log),
+            "resource_bodies": copy.deepcopy(self.resource_bodies),
+            "actionability_timeline": copy.deepcopy(self.actionability_timeline),
             "prompt_injections": copy.deepcopy(self.prompt_injections),
             "video_artifacts": copy.deepcopy(self.video_artifacts),
             "perturbations": copy.deepcopy(self.perturbations),
@@ -1021,6 +1057,8 @@ class BrowserEnvironment(EnvironmentAdapter):
             "regions": copy.deepcopy(self.regions),
             "console_logs": copy.deepcopy(self.console_logs),
             "network_log": copy.deepcopy(self.network_log),
+            "resource_bodies": copy.deepcopy(self.resource_bodies),
+            "actionability_timeline": copy.deepcopy(self.actionability_timeline),
             "video_artifacts": copy.deepcopy(self.video_artifacts),
             "perturbations": copy.deepcopy(self.perturbations),
         }
@@ -1077,6 +1115,57 @@ def load_playwright_trace_export(
         allowed_domains=allowed_domains,
         state=state,
         playwright_trace=source,
+        perturbations=perturbations,
+    )
+
+
+def normalize_browser_trace_export(
+    trace_export: Any,
+    *,
+    provider: str = "browser",
+    source_label: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Normalize browser/CUA trace exports into BrowserEnvironment fixtures."""
+
+    return _normalize_browser_trace_export(
+        trace_export,
+        provider=provider,
+        source_label=source_label,
+    )
+
+
+def load_browser_trace_export(
+    source: str | os.PathLike[str] | Mapping[str, Any] | Iterable[Any],
+    *,
+    provider: str = "browser",
+    url: str = "https://example.test/",
+    dom: str = "<html><body></body></html>",
+    screenshot_uri: Optional[str] = None,
+    allowed_domains: Optional[Iterable[str]] = None,
+    state: Optional[Dict[str, Any]] = None,
+    perturbations: Optional[Iterable[str | Mapping[str, Any]]] = None,
+) -> BrowserEnvironment:
+    """Load OpenAI CUA, Browser Use, HAR, Playwright, or generic browser trace exports."""
+
+    if isinstance(source, (str, os.PathLike)):
+        return BrowserEnvironment(
+            url=url,
+            dom=dom,
+            screenshot_uri=screenshot_uri,
+            allowed_domains=allowed_domains,
+            state=state,
+            browser_trace_source=source,
+            trace_provider=provider,
+            perturbations=perturbations,
+        )
+    return BrowserEnvironment(
+        url=url,
+        dom=dom,
+        screenshot_uri=screenshot_uri,
+        allowed_domains=allowed_domains,
+        state=state,
+        browser_trace=source,
+        trace_provider=provider,
         perturbations=perturbations,
     )
 
@@ -4784,6 +4873,652 @@ def _browser_region_items(
             items.append(item)
         return items
     return [copy.deepcopy(dict(item)) for item in regions]
+
+
+def _empty_browser_trace_fixture(
+    *,
+    source_label: Optional[str] = None,
+    source_type: str = "browser_trace",
+) -> Dict[str, Any]:
+    return {
+        "snapshots": [],
+        "actions": [],
+        "regions": [],
+        "console_logs": [],
+        "network_log": [],
+        "resource_bodies": [],
+        "actionability_timeline": [],
+        "video_artifacts": [],
+        "prompt_injections": [],
+        "perturbations": [],
+        "metadata": {
+            **({"source": source_label} if source_label else {}),
+            "source_type": source_type,
+        },
+    }
+
+
+def _merge_browser_trace_fixtures(*fixtures: Mapping[str, Any]) -> Dict[str, Any]:
+    merged = _empty_browser_trace_fixture(source_type="browser_trace")
+    merged["metadata"] = {}
+    for fixture in fixtures:
+        if not fixture:
+            continue
+        merged["metadata"].update(copy.deepcopy(dict(fixture.get("metadata", {}))))
+        for key in (
+            "snapshots",
+            "actions",
+            "regions",
+            "console_logs",
+            "network_log",
+            "resource_bodies",
+            "actionability_timeline",
+            "video_artifacts",
+            "prompt_injections",
+            "perturbations",
+        ):
+            merged[key].extend(copy.deepcopy(list(fixture.get(key, []))))
+    for key in (
+        "snapshots",
+        "actions",
+        "regions",
+        "console_logs",
+        "network_log",
+        "resource_bodies",
+        "actionability_timeline",
+        "video_artifacts",
+        "prompt_injections",
+        "perturbations",
+    ):
+        merged[key] = _dedupe_dicts(merged[key])
+    return merged
+
+
+def _normalize_browser_trace_provider(provider: Any) -> str:
+    normalized = str(provider or "browser").strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "openai": "openai_cua",
+        "openai_computer": "openai_cua",
+        "computer_use": "openai_cua",
+        "computer_use_preview": "openai_cua",
+        "cua": "openai_cua",
+        "browseruse": "browser_use",
+        "browser_use_cloud": "browser_use",
+        "playwright_har": "har",
+        "http_archive": "har",
+    }
+    return aliases.get(normalized, normalized or "browser")
+
+
+def _load_browser_trace_source(source: str | os.PathLike[str]) -> Dict[str, Any]:
+    source_text = os.fspath(source)
+    metadata = {"source": _browser_source_label(source), "source_type": "browser_trace"}
+    if zipfile.is_zipfile(source_text):
+        records: List[Any] = []
+        resources: Dict[str, str] = {}
+        videos: List[Dict[str, Any]] = []
+        with zipfile.ZipFile(source_text) as archive:
+            for name in archive.namelist():
+                lower = name.lower()
+                uri = f"zip://{source_text}#{name}"
+                if lower.endswith((".png", ".jpg", ".jpeg", ".webp", ".html", ".css", ".js", ".json", ".txt")):
+                    resources[name] = uri
+                    resources[os.path.basename(name)] = uri
+                if lower.endswith((".webm", ".mp4", ".mov")):
+                    videos.append(
+                        {
+                            "uri": uri,
+                            "id": os.path.basename(name),
+                            "source": "browser_trace_zip",
+                            "mime_type": _browser_video_mime_type(name),
+                        }
+                    )
+                    continue
+                if not lower.endswith((".trace", ".har", ".json", ".jsonl")):
+                    continue
+                try:
+                    text = archive.read(name).decode("utf-8")
+                except UnicodeDecodeError:
+                    continue
+                parsed = _parse_framework_trace_export_text(text)
+                records.extend(_as_iterable(parsed))
+                if lower.endswith(".har"):
+                    metadata["source_type"] = "har"
+        return {"records": records, "resources": resources, "video_artifacts": videos, "metadata": metadata}
+
+    parsed = _load_framework_trace_export_source(source_text)
+    if str(source_text).lower().endswith(".har"):
+        metadata["source_type"] = "har"
+    return {"records": _as_iterable(parsed), "metadata": metadata}
+
+
+def _normalize_browser_trace_export(
+    trace_export: Any,
+    *,
+    provider: str = "browser",
+    source_label: Optional[str] = None,
+) -> Dict[str, Any]:
+    metadata_hint = _get_mapping_value(_get_mapping_value(trace_export, "metadata"), "source_type")
+    provider_name = _normalize_browser_trace_provider(
+        _get_mapping_value(trace_export, "provider")
+        or _get_mapping_value(trace_export, "framework")
+        or metadata_hint
+        or provider
+    )
+    fixture = _empty_browser_trace_fixture(source_label=source_label, source_type=provider_name)
+    if trace_export is None:
+        return fixture
+
+    export = trace_export
+    resources: Dict[str, str] = {}
+    if isinstance(export, Mapping) and any(key in export for key in ("records", "resources", "video_artifacts", "metadata")):
+        wrapper = copy.deepcopy(dict(export))
+        resources = {str(key): str(value) for key, value in dict(wrapper.get("resources", {})).items()}
+        fixture["video_artifacts"].extend(_as_iterable(wrapper.get("video_artifacts", [])))
+        fixture["metadata"].update(copy.deepcopy(dict(wrapper.get("metadata", {}))))
+        export = wrapper.get("records", wrapper)
+
+    playwright_fixture = _normalize_playwright_trace_export(export, source_label=source_label)
+    fixture = _merge_browser_trace_fixtures(fixture, playwright_fixture)
+    fixture["metadata"]["source_type"] = provider_name
+    if source_label:
+        fixture["metadata"]["source"] = source_label
+
+    direct = _coerce_plain_dict(export) if isinstance(export, Mapping) else {}
+    fixture["resource_bodies"].extend(_as_iterable(direct.get("resource_bodies", [])))
+    fixture["actionability_timeline"].extend(_as_iterable(direct.get("actionability_timeline", [])))
+
+    har_fixture = _browser_har_fixture(export, resources=resources)
+    if har_fixture["network_log"] or har_fixture["resource_bodies"]:
+        fixture = _merge_browser_trace_fixtures(fixture, har_fixture)
+        fixture["metadata"]["source_type"] = "har" if provider_name == "har" else provider_name
+
+    browser_use_fixture = _browser_use_fixture(export)
+    if any(browser_use_fixture[key] for key in ("snapshots", "actions", "actionability_timeline")):
+        fixture = _merge_browser_trace_fixtures(fixture, browser_use_fixture)
+        fixture["metadata"]["source_type"] = "browser_use" if provider_name in {"browser", "browser_use"} else provider_name
+
+    actions_by_id: Dict[str, Dict[str, Any]] = {}
+    actionability: List[Dict[str, Any]] = []
+    for index, record in enumerate(_browser_trace_records(export)):
+        record_dict = _coerce_plain_dict(record)
+        if not record_dict:
+            continue
+        for snapshot in _browser_snapshots_from_record(record_dict, index=index):
+            fixture["snapshots"].append(snapshot)
+        for action in _browser_actions_from_record(record_dict, index=index):
+            call_id = str(action.get("id"))
+            actions_by_id[call_id] = {**actions_by_id.get(call_id, {}), **action}
+            region = action.get("region")
+            if isinstance(region, Mapping):
+                fixture["regions"].append(region)
+        actionability.extend(_browser_actionability_from_record(record_dict, index=index))
+        network = _browser_network_from_record(record_dict)
+        if network:
+            fixture["network_log"].append(network)
+        resource = _browser_resource_body_from_record(record_dict)
+        if resource:
+            fixture["resource_bodies"].append(resource)
+        fixture["prompt_injections"].extend(_browser_prompt_injections_from_record(record_dict))
+    fixture["actions"].extend(actions_by_id.values())
+    fixture["actionability_timeline"].extend(actionability)
+
+    for key in (
+        "snapshots",
+        "actions",
+        "regions",
+        "console_logs",
+        "network_log",
+        "resource_bodies",
+        "actionability_timeline",
+        "video_artifacts",
+        "prompt_injections",
+        "perturbations",
+    ):
+        fixture[key] = _dedupe_dicts(fixture[key])
+    return fixture
+
+
+def _browser_trace_records(export: Any) -> List[Any]:
+    if export is None:
+        return []
+    if isinstance(export, str):
+        text = export.strip()
+        if text.startswith(("{", "[")) or "\n" in text:
+            return _browser_trace_records(_parse_framework_trace_export_text(text))
+        return []
+    if hasattr(export, "model_dump"):
+        return _browser_trace_records(export.model_dump())
+    if hasattr(export, "dict"):
+        return _browser_trace_records(export.dict())
+    if isinstance(export, Mapping):
+        data = copy.deepcopy(dict(export))
+        if _looks_like_browser_trace_record(data):
+            return [data]
+        records: List[Any] = []
+        for key in (
+            "records",
+            "events",
+            "items",
+            "output",
+            "input",
+            "steps",
+            "history",
+            "action_history",
+            "model_actions",
+            "model_outputs",
+            "action_results",
+            "screenshots",
+            "snapshots",
+            "actions",
+        ):
+            if key in data:
+                records.extend(_browser_trace_records(data[key]))
+        if records:
+            return records
+        for key in ("data", "payload", "result", "response", "body"):
+            if isinstance(data.get(key), (Mapping, list, tuple)):
+                nested = _browser_trace_records(data[key])
+                if nested:
+                    return nested
+        return []
+    if isinstance(export, Iterable):
+        records: List[Any] = []
+        for item in export:
+            records.extend(_browser_trace_records(item))
+        return records
+    return []
+
+
+def _looks_like_browser_trace_record(record: Mapping[str, Any]) -> bool:
+    record_type = str(record.get("type") or record.get("event") or record.get("kind") or "").lower()
+    if record_type in {"computer_call", "computer_call_output", "computer_screenshot", "browser_state", "action_result"}:
+        return True
+    if any(key in record for key in ("action", "actions", "current_url", "screenshot", "screenshot_path", "image_url", "browser_state")):
+        return True
+    return False
+
+
+def _browser_snapshots_from_record(record: Mapping[str, Any], *, index: int) -> List[Dict[str, Any]]:
+    snapshots: List[Dict[str, Any]] = []
+    record_type = str(record.get("type") or record.get("event") or "").lower()
+    output = _coerce_plain_dict(record.get("output"))
+    browser_state = _coerce_plain_dict(record.get("browser_state") or record.get("state"))
+    screenshot_uri = (
+        record.get("screenshot_uri")
+        or record.get("image_url")
+        or output.get("image_url")
+        or browser_state.get("screenshot_uri")
+        or _browser_screenshot_uri_from_value(record.get("screenshot") or browser_state.get("screenshot"))
+    )
+    screenshot_path = record.get("screenshot_path") or browser_state.get("screenshot_path")
+    url = record.get("current_url") or record.get("url") or browser_state.get("url")
+    dom = record.get("dom") or record.get("html") or browser_state.get("dom") or browser_state.get("html")
+    if record_type == "computer_call_output" or screenshot_uri or screenshot_path or dom:
+        snapshots.append(
+            {
+                "id": str(record.get("id") or record.get("call_id") or f"browser_trace_snapshot_{index + 1}"),
+                "url": url,
+                "dom": dom,
+                "screenshot_uri": screenshot_uri,
+                "screenshot_path": screenshot_path,
+                "metadata": {
+                    "source": _browser_record_source(record),
+                    "record_type": record_type or "browser_snapshot",
+                    "call_id": record.get("call_id"),
+                    "status": record.get("status"),
+                },
+            }
+        )
+    return [{key: value for key, value in snapshot.items() if value not in (None, "", {}, [])} for snapshot in snapshots]
+
+
+def _browser_actions_from_record(record: Mapping[str, Any], *, index: int) -> List[Dict[str, Any]]:
+    actions: List[Dict[str, Any]] = []
+    raw_actions = _as_iterable(record.get("actions", record.get("action")))
+    if not raw_actions and _looks_like_browser_action_mapping(record):
+        raw_actions = [record]
+    for action_index, raw in enumerate(raw_actions):
+        action_dict = _coerce_plain_dict(raw)
+        if not action_dict:
+            continue
+        action_type = str(
+            action_dict.get("type")
+            or action_dict.get("name")
+            or action_dict.get("action")
+            or next(iter(action_dict.keys()), "")
+        )
+        if len(action_dict) == 1 and isinstance(action_dict.get(action_type), Mapping):
+            nested = _coerce_plain_dict(action_dict[action_type])
+            nested.setdefault("type", action_type)
+            action_dict = nested
+        action_type = str(action_dict.get("type") or action_dict.get("name") or action_type)
+        if not action_type:
+            continue
+        base_id = str(record.get("call_id") or record.get("id") or f"browser_trace_action_{index + 1}")
+        normalized = {
+            "id": f"{base_id}_{action_index + 1}" if len(raw_actions) > 1 else base_id,
+            "action": action_type,
+            "actions": [action_type],
+            "current_url": record.get("current_url") or record.get("url"),
+            "metadata": {
+                "source": _browser_record_source(record),
+                "record_type": record.get("type") or record.get("event"),
+                "status": record.get("status"),
+            },
+        }
+        selector = action_dict.get("selector") or action_dict.get("locator") or action_dict.get("target") or action_dict.get("element")
+        if selector:
+            normalized["selector"] = str(selector)
+            normalized["selectors"] = [str(selector)]
+        coordinates = _browser_action_coordinates({**action_dict, **record})
+        if coordinates:
+            normalized["coordinates"] = coordinates
+            normalized["x"] = coordinates["x"]
+            normalized["y"] = coordinates["y"]
+        url = action_dict.get("url") or action_dict.get("target_url") or record.get("target_url")
+        if url:
+            normalized["next_url"] = str(url)
+        region = _browser_region_from_action(action_dict, default_name=f"{normalized['id']}_target")
+        if region:
+            normalized["region"] = region
+        tool_names = _browser_tool_names_for_action(action_type)
+        if tool_names:
+            normalized["tool_names"] = tool_names
+        actionability = _browser_actionability_mapping(record, action_dict)
+        if actionability:
+            normalized["actionability"] = actionability
+        if record.get("error") or action_dict.get("error"):
+            normalized["success"] = False
+            normalized["error"] = str(record.get("error") or action_dict.get("error"))
+        actions.append({key: value for key, value in normalized.items() if value not in (None, "", [], {})})
+    return actions
+
+
+def _looks_like_browser_action_mapping(record: Mapping[str, Any]) -> bool:
+    action_type = str(record.get("type") or record.get("action") or record.get("name") or "").lower()
+    return action_type in {"click", "double_click", "scroll", "type", "wait", "keypress", "drag", "move", "screenshot", "navigate", "goto", "done"}
+
+
+def _browser_tool_names_for_action(action_type: str) -> List[str]:
+    lowered = action_type.lower()
+    if any(token in lowered for token in ("click", "double_click", "tap", "drag", "move", "scroll", "hover")):
+        return ["computer_click", "browser_click", "playwright_click"]
+    if any(token in lowered for token in ("navigate", "goto", "open_url")):
+        return ["browser_navigate"]
+    return []
+
+
+def _browser_region_from_action(action: Mapping[str, Any], *, default_name: str) -> Optional[Dict[str, Any]]:
+    box = action.get("boundingBox") or action.get("bounding_box") or action.get("bbox") or action.get("bounds")
+    if not box:
+        return None
+    region = _normalize_browser_region({"bounds": box, "name": default_name}, default_name=default_name)
+    selector = action.get("selector") or action.get("locator")
+    if selector:
+        region["selectors"] = [str(selector)]
+    return region
+
+
+def _browser_actionability_from_record(record: Mapping[str, Any], *, index: int) -> List[Dict[str, Any]]:
+    checks: List[Dict[str, Any]] = []
+    for action_index, action in enumerate(_browser_actions_from_record(record, index=index)):
+        actionability = _coerce_plain_dict(action.get("actionability"))
+        if not actionability:
+            continue
+        checks.append(
+            {
+                "id": f"{action.get('id')}_actionability_{action_index + 1}",
+                "action_id": action.get("id"),
+                "source": action.get("metadata", {}).get("source"),
+                "checks": actionability,
+                "passed": all(value is not False for value in actionability.values()),
+            }
+        )
+    safety_checks = _as_iterable(record.get("pending_safety_checks") or record.get("acknowledged_safety_checks"))
+    for safety_index, safety_check in enumerate(safety_checks):
+        item = _coerce_plain_dict(safety_check)
+        if not item:
+            continue
+        checks.append(
+            {
+                "id": str(item.get("id") or f"safety_check_{index + 1}_{safety_index + 1}"),
+                "action_id": record.get("call_id") or record.get("id"),
+                "source": _browser_record_source(record),
+                "checks": {"safety_check": True, str(item.get("code") or "safety_check"): True},
+                "passed": True,
+                "message": item.get("message"),
+            }
+        )
+    return checks
+
+
+def _browser_actionability_mapping(record: Mapping[str, Any], action: Mapping[str, Any]) -> Dict[str, Any]:
+    result: Dict[str, Any] = {}
+    for source in (record, action):
+        actionability = _coerce_plain_dict(source.get("actionability"))
+        result.update(actionability)
+        for key in ("attached", "visible", "enabled", "stable", "receives_events", "editable", "actionable"):
+            if key in source:
+                result[key] = bool(source[key])
+    if record.get("pending_safety_checks"):
+        result["safety_checks_present"] = True
+    return result
+
+
+def _browser_network_from_record(record: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    if not any(key in record for key in ("request", "response", "url", "method", "status", "resource_type")):
+        return None
+    request = _coerce_plain_dict(record.get("request"))
+    response = _coerce_plain_dict(record.get("response"))
+    url = record.get("url") or request.get("url") or response.get("url")
+    if not url:
+        return None
+    return {
+        "url": str(url),
+        "method": record.get("method") or request.get("method"),
+        "status": record.get("status") or response.get("status"),
+        "resource_type": record.get("resource_type") or record.get("resourceType"),
+        "source": _browser_record_source(record),
+    }
+
+
+def _browser_resource_body_from_record(record: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    content = _coerce_plain_dict(record.get("content") or _coerce_plain_dict(record.get("response")).get("content"))
+    body = record.get("body") or record.get("text") or content.get("text")
+    if body is None:
+        return None
+    return {
+        "id": str(record.get("id") or record.get("url") or "resource_body"),
+        "url": record.get("url") or _coerce_plain_dict(record.get("request")).get("url"),
+        "body": body,
+        "mime_type": record.get("mime_type") or content.get("mimeType") or content.get("mime_type"),
+        "encoding": content.get("encoding"),
+        "source": _browser_record_source(record),
+    }
+
+
+def _browser_prompt_injections_from_record(record: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    checks = _as_iterable(record.get("pending_safety_checks") or record.get("safety_checks"))
+    surfaces: List[Dict[str, Any]] = []
+    for index, check in enumerate(checks):
+        item = _coerce_plain_dict(check)
+        code = str(item.get("code") or "").lower()
+        if "malicious" not in code and "injection" not in code:
+            continue
+        surfaces.append(
+            {
+                "id": str(item.get("id") or f"browser_safety_prompt_injection_{index + 1}"),
+                "surface_type": "prompt_injection",
+                "content": item.get("message") or code,
+                "source": _browser_record_source(record),
+            }
+        )
+    return surfaces
+
+
+def _browser_record_source(record: Mapping[str, Any]) -> str:
+    text = json.dumps(record, default=str).lower()
+    record_type = str(record.get("type") or record.get("event") or "").lower()
+    if "computer_call" in record_type or "computer_screenshot" in text:
+        return "openai_cua"
+    if "browser_use" in text or "actionresult" in text or "agenthistory" in text:
+        return "browser_use"
+    return "browser_trace"
+
+
+def _browser_screenshot_uri_from_value(value: Any) -> Optional[str]:
+    if not value:
+        return None
+    text = str(value)
+    if text.startswith(("http://", "https://", "file://", "data:")):
+        return text
+    if len(text) > 64 and all(ch.isalnum() or ch in "+/=\n\r" for ch in text[:128]):
+        return f"data:image/png;base64,{text}"
+    return None
+
+
+def _browser_har_fixture(export: Any, *, resources: Mapping[str, str]) -> Dict[str, Any]:
+    fixture = _empty_browser_trace_fixture(source_type="har")
+    entries = _browser_har_entries(export)
+    for index, entry in enumerate(entries):
+        request = _coerce_plain_dict(entry.get("request"))
+        response = _coerce_plain_dict(entry.get("response"))
+        content = _coerce_plain_dict(response.get("content"))
+        url = request.get("url") or entry.get("url")
+        if not url:
+            continue
+        method = request.get("method")
+        status = response.get("status")
+        mime_type = content.get("mimeType") or content.get("mime_type")
+        fixture["network_log"].append(
+            {
+                "id": str(entry.get("pageref") or entry.get("id") or f"har_entry_{index + 1}"),
+                "url": str(url),
+                "method": method,
+                "status": status,
+                "resource_type": _browser_resource_type_from_mime(mime_type),
+                "started_at": entry.get("startedDateTime"),
+                "time_ms": entry.get("time"),
+                "source": "har",
+            }
+        )
+        body = content.get("text")
+        attached_file = content.get("_file") or content.get("fileName") or content.get("path")
+        attached_uri = resources.get(str(attached_file)) or resources.get(os.path.basename(str(attached_file))) if attached_file else None
+        if body is not None or attached_uri:
+            fixture["resource_bodies"].append(
+                {
+                    "id": f"har_resource_{index + 1}",
+                    "url": str(url),
+                    "body": body,
+                    "uri": attached_uri,
+                    "mime_type": mime_type,
+                    "encoding": content.get("encoding"),
+                    "size": content.get("size"),
+                    "source": "har",
+                }
+            )
+        if body and "html" in str(mime_type or "").lower():
+            fixture["snapshots"].append(
+                {
+                    "id": f"har_snapshot_{index + 1}",
+                    "url": str(url),
+                    "dom": body,
+                    "metadata": {"source": "har", "status": status, "mime_type": mime_type},
+                }
+            )
+    return fixture
+
+
+def _browser_har_entries(export: Any) -> List[Dict[str, Any]]:
+    entries: List[Dict[str, Any]] = []
+    if isinstance(export, Mapping):
+        data = copy.deepcopy(dict(export))
+        log = _coerce_plain_dict(data.get("log"))
+        raw_entries = log.get("entries") if log else data.get("entries")
+        if raw_entries:
+            return [_coerce_plain_dict(item) for item in _as_iterable(raw_entries) if _coerce_plain_dict(item)]
+        for key in ("records", "events", "items", "data", "payload"):
+            entries.extend(_browser_har_entries(data.get(key)))
+    elif isinstance(export, Iterable) and not isinstance(export, (str, bytes)):
+        for item in export:
+            entries.extend(_browser_har_entries(item))
+    return entries
+
+
+def _browser_resource_type_from_mime(mime_type: Any) -> Optional[str]:
+    text = str(mime_type or "").lower()
+    if "html" in text:
+        return "document"
+    if "json" in text:
+        return "xhr"
+    if "javascript" in text or "ecmascript" in text:
+        return "script"
+    if "css" in text:
+        return "stylesheet"
+    if "image" in text:
+        return "image"
+    return None
+
+
+def _browser_use_fixture(export: Any) -> Dict[str, Any]:
+    fixture = _empty_browser_trace_fixture(source_type="browser_use")
+    if not isinstance(export, Mapping):
+        return fixture
+    data = copy.deepcopy(dict(export))
+    urls = _as_iterable(data.get("urls", []))
+    screenshot_paths = _as_iterable(data.get("screenshot_paths", []))
+    screenshots = _as_iterable(data.get("screenshots", []))
+    steps = max(len(urls), len(screenshot_paths), len(screenshots))
+    for index in range(steps):
+        screenshot_uri = None
+        screenshot_path = screenshot_paths[index] if index < len(screenshot_paths) else None
+        if index < len(screenshots):
+            screenshot_uri = _browser_screenshot_uri_from_value(screenshots[index])
+        fixture["snapshots"].append(
+            {
+                "id": f"browser_use_snapshot_{index + 1}",
+                "url": urls[index] if index < len(urls) else None,
+                "screenshot_uri": screenshot_uri,
+                "screenshot_path": screenshot_path,
+                "metadata": {"source": "browser_use", "step": index + 1},
+            }
+        )
+    action_names = _as_iterable(data.get("action_names", []))
+    model_actions = _as_iterable(data.get("model_actions", data.get("actions", [])))
+    action_results = _as_iterable(data.get("action_results", []))
+    for index, raw_action in enumerate(model_actions):
+        action_dict = _coerce_plain_dict(raw_action)
+        if not action_dict and index < len(action_names):
+            action_dict = {"type": action_names[index]}
+        if not action_dict:
+            continue
+        action_dict.setdefault("type", action_names[index] if index < len(action_names) else action_dict.get("name"))
+        result = _coerce_plain_dict(action_results[index]) if index < len(action_results) else {}
+        record = {
+            "type": action_dict.get("type") or action_dict.get("name") or "browser_use_action",
+            "action": action_dict,
+            "current_url": urls[index] if index < len(urls) else None,
+            "status": "completed",
+            "error": result.get("error"),
+            "browser_use": True,
+        }
+        actions = _browser_actions_from_record(record, index=index)
+        fixture["actions"].extend(actions)
+        action_id = actions[-1].get("id") if actions else f"browser_trace_action_{index + 1}_1"
+        if result:
+            fixture["actionability_timeline"].append(
+                {
+                    "id": f"browser_use_actionability_{index + 1}",
+                    "action_id": action_id,
+                    "source": "browser_use",
+                    "checks": {"tool_result_success": result.get("success", result.get("error") is None)},
+                    "passed": result.get("success", result.get("error") is None) is not False,
+                    "message": result.get("error"),
+                }
+            )
+    return fixture
 
 
 def _load_playwright_trace_source(source: str | os.PathLike[str]) -> Dict[str, Any]:
