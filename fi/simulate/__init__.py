@@ -34,6 +34,8 @@ from .environment import (
     ToolMockEnvironment,
 )
 from .simulation import (
+    AttackDefinition,
+    AttackVector,
     Persona,
     Scenario,
     TestReport,
@@ -77,6 +79,8 @@ __all__ = [
     "MultiAgentRoomEnvironment",
     "ToolExecutionResult",
     "ToolMockEnvironment",
+    "AttackDefinition",
+    "AttackVector",
     "Persona",
     "Scenario",
     "TestReport",

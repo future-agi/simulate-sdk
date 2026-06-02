@@ -306,6 +306,38 @@ report = await TestRunner().run_test(
 
 See [`examples/local_environment_adapters.py`](examples/local_environment_adapters.py) for a full local world simulation with ai-evaluation scoring.
 
+### Local pentest scenarios
+
+Use `generate_pentest` to create deterministic adversarial personas for common
+agent failure modes: prompt injection, secret exfiltration, unsafe actions,
+browser/CUA policy bypass, memory contamination, tool abuse, cross-user data
+exfiltration, and voice turn-taking.
+
+```python
+from fi.simulate import SyntheticDataGenerator, TestRunner, evaluate_agent_report
+
+scenario = SyntheticDataGenerator().generate_pentest(
+    "checkout support",
+    attack_vectors=["prompt_injection", "secret_exfiltration", "browser_cua"],
+    seed=17,
+)
+
+report = await TestRunner().run_test(
+    scenario=scenario,
+    agent_callback=agent,
+    max_turns=3,
+    min_turns=3,
+    modality="cua",
+)
+
+evaluation = evaluate_agent_report(
+    report,
+    config={"allowed_domains": ["shop.example.com"]},
+)
+```
+
+See [`examples/local_pentest_scenarios.py`](examples/local_pentest_scenarios.py) for a full local adversarial simulation and scoring cookbook.
+
 ---
 
 ## Evaluation
@@ -399,6 +431,7 @@ Traces from simulations flow into `Monitor`, scores flow into `Evaluate`, and fa
 - [x] Multimodal artifacts + event trajectories
 - [x] Local environment adapters for mocked tools/APIs, browser/CUA state, files, and multi-agent rooms
 - [x] Deterministic synthetic data generator
+- [x] Deterministic pentest scenario generator
 - [x] Per-speaker + combined audio capture
 - [x] Scenario auto-generation from a topic
 - [x] `evaluate_report` integration with `ai-evaluation`
