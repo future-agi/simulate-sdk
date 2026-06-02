@@ -9,6 +9,7 @@ from fi.simulate import (
     FrameworkTraceEnvironment,
     ImageEnvironment,
     MultiAgentRoomEnvironment,
+    RetrievalMemoryEnvironment,
     ToolMockEnvironment,
     VoiceEnvironment,
 )
@@ -240,6 +241,100 @@ async def test_file_and_multi_agent_environments_update_state():
     assert "policy_specialist" in tool_text
     assert result.metadata["environment_state"]["files"]["paths"] == ["policy.md"]
     assert result.metadata["environment_state"]["multi_agent"]["messages"][0]["to"] == "policy_specialist"
+
+
+@pytest.mark.asyncio
+async def test_retrieval_memory_environment_records_queries_citations_and_memory():
+    seen_tools = []
+
+    async def agent(input):
+        seen_tools.extend(tool["name"] for tool in input.tools)
+        return AgentResponse(
+            content="Refund answer grounded in current policy and remembered order context.",
+            tool_calls=[
+                {
+                    "id": "search",
+                    "name": "search_knowledge_base",
+                    "arguments": {"query": "refund policy order 123", "top_k": 2},
+                },
+                {
+                    "id": "memory_read",
+                    "name": "retrieve_memory",
+                    "arguments": {"key": "order_id"},
+                },
+                {
+                    "id": "read",
+                    "name": "read_document",
+                    "arguments": {"id": "refund_policy_current"},
+                },
+                {
+                    "id": "cite",
+                    "name": "cite_sources",
+                    "arguments": {
+                        "doc_ids": ["refund_policy_current"],
+                        "memory_keys": ["order_id"],
+                        "claim": "Order 123 is eligible for refund.",
+                        "freshness_checked": True,
+                    },
+                },
+                {
+                    "id": "memory_write",
+                    "name": "write_memory",
+                    "arguments": {"key": "last_resolution", "value": "refund eligible"},
+                },
+                {"id": "status", "name": "retrieval_memory_status", "arguments": {}},
+            ],
+        )
+
+    report = await LocalTextEngine().run(
+        scenario=_scenario(),
+        agent_callback=agent,
+        environment=RetrievalMemoryEnvironment(
+            {
+                "refund_policy_current": {
+                    "title": "Refund Policy v2",
+                    "content": "Order 123 can be refunded when policy approval is current.",
+                    "source": "policy.md",
+                    "version": "v2",
+                    "current": True,
+                },
+                "refund_policy_old": {
+                    "title": "Refund Policy v1",
+                    "content": "Old refund rules for order 123.",
+                    "source": "policy-old.md",
+                    "version": "v1",
+                    "current": False,
+                },
+            },
+            memory={"order_id": "123"},
+        ),
+        max_turns=1,
+        min_turns=1,
+    )
+
+    result = report.results[0]
+    state = result.metadata["environment_state"]["retrieval_memory"]
+    traces = [
+        artifact.data
+        for artifact in result.artifacts
+        if artifact.type == "trace" and artifact.metadata.get("kind") == "retrieval_memory_trace"
+    ]
+
+    assert {
+        "search_knowledge_base",
+        "retrieve_memory",
+        "read_document",
+        "cite_sources",
+        "write_memory",
+        "retrieval_memory_status",
+    } <= set(seen_tools)
+    assert state["queries"][-1]["documents"] == ["refund_policy_current"]
+    assert state["memory_reads"][-1]["value"] == "123"
+    assert state["document_reads"][-1]["id"] == "refund_policy_current"
+    assert state["citations"][-1]["doc_ids"] == ["refund_policy_current"]
+    assert state["memory"]["last_resolution"] == "refund eligible"
+    assert traces and traces[-1]["citations"]
+    assert any(event.type == "retrieval_memory" and event.name == "attribution" for event in result.events)
 
 
 @pytest.mark.asyncio

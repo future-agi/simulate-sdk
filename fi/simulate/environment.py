@@ -1115,6 +1115,260 @@ class AdversarialEnvironmentPack(EnvironmentAdapter):
         )
 
 
+class RetrievalMemoryEnvironment(EnvironmentAdapter):
+    """Local retrieval and memory environment with citation/attribution trace evidence."""
+
+    name = "retrieval_memory"
+
+    def __init__(
+        self,
+        documents: Mapping[str, Any] | Iterable[Mapping[str, Any]],
+        *,
+        memory: Optional[Mapping[str, Any]] = None,
+        top_k: int = 3,
+        require_current: bool = True,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        self.initial_documents = _normalize_retrieval_documents(documents)
+        self.initial_memory = copy.deepcopy(dict(memory or {}))
+        self.top_k = int(top_k)
+        self.require_current = require_current
+        self.metadata = copy.deepcopy(dict(metadata or {}))
+        self.documents = copy.deepcopy(self.initial_documents)
+        self.memory = copy.deepcopy(self.initial_memory)
+        self.queries: List[Dict[str, Any]] = []
+        self.document_reads: List[Dict[str, Any]] = []
+        self.memory_reads: List[Dict[str, Any]] = []
+        self.memory_writes: List[Dict[str, Any]] = []
+        self.citations: List[Dict[str, Any]] = []
+
+    def reset(self, **context: Any) -> EnvironmentSnapshot:
+        self.documents = copy.deepcopy(self.initial_documents)
+        self.memory = copy.deepcopy(self.initial_memory)
+        self.queries = []
+        self.document_reads = []
+        self.memory_reads = []
+        self.memory_writes = []
+        self.citations = []
+        return EnvironmentSnapshot(
+            tools=self._tool_specs(),
+            artifacts=[self._trace_artifact()],
+            state={"retrieval_memory": self._state_payload()},
+            events=[
+                SimulationEvent(
+                    type="retrieval_memory",
+                    name="retrieval_memory_ready",
+                    payload={
+                        "document_count": len(self.documents),
+                        "memory_keys": sorted(self.memory.keys()),
+                        "require_current": self.require_current,
+                    },
+                )
+            ],
+            metadata={
+                "retrieval_memory": {
+                    "document_count": len(self.documents),
+                    "memory_keys": sorted(self.memory.keys()),
+                    "require_current": self.require_current,
+                }
+            },
+        )
+
+    def handle_tool_call(
+        self,
+        tool_call: Mapping[str, Any],
+        **context: Any,
+    ) -> Optional[ToolExecutionResult]:
+        name = _tool_name(tool_call)
+        if name not in {
+            "search_knowledge_base",
+            "query_knowledge",
+            "retrieve_documents",
+            "read_document",
+            "retrieve_memory",
+            "write_memory",
+            "cite_sources",
+            "record_attribution",
+            "retrieval_memory_status",
+        }:
+            return None
+
+        arguments = _tool_arguments(tool_call)
+        call_id = _tool_call_id(tool_call)
+
+        if name in {"search_knowledge_base", "query_knowledge", "retrieve_documents"}:
+            query = str(arguments.get("query") or arguments.get("input") or arguments.get("question") or "")
+            top_k = int(arguments.get("top_k", arguments.get("k", self.top_k)))
+            include_stale = bool(arguments.get("include_stale", not self.require_current))
+            documents = self._search(query, top_k=top_k, include_stale=include_stale)
+            result = {"query": query, "documents": documents}
+            self.queries.append(
+                {
+                    "query": query,
+                    "top_k": top_k,
+                    "include_stale": include_stale,
+                    "documents": [doc["id"] for doc in documents],
+                }
+            )
+            event_name = "query"
+            content = json.dumps(result, default=str)
+        elif name == "read_document":
+            doc_id = str(arguments.get("id") or arguments.get("doc_id") or arguments.get("document_id") or "")
+            document = _find_retrieval_document(self.documents, doc_id)
+            success = document is not None
+            result = {"document": copy.deepcopy(document), "id": doc_id}
+            if success:
+                self.document_reads.append({"id": doc_id, "document": copy.deepcopy(document)})
+            return self._tool_result(
+                call_id,
+                name,
+                "Document read." if success else f"Document not found: {doc_id}",
+                result,
+                event_name="document_read" if success else "document_missing",
+                success=success,
+                error=None if success else "document_not_found",
+            )
+        elif name == "retrieve_memory":
+            key = str(arguments.get("key") or arguments.get("query") or "")
+            value = self.memory.get(key) if key else copy.deepcopy(self.memory)
+            result = {"key": key, "value": copy.deepcopy(value)}
+            self.memory_reads.append(result)
+            event_name = "memory_read"
+            content = json.dumps(result, default=str)
+        elif name == "write_memory":
+            key = str(arguments.get("key") or arguments.get("name") or "")
+            value = arguments.get("value", arguments.get("content", arguments.get("data")))
+            if not key and isinstance(value, Mapping):
+                for item_key, item_value in value.items():
+                    self.memory[str(item_key)] = copy.deepcopy(item_value)
+            elif key:
+                self.memory[key] = copy.deepcopy(value)
+            result = {"key": key, "value": copy.deepcopy(value)}
+            self.memory_writes.append(result)
+            event_name = "memory_write"
+            content = json.dumps(result, default=str)
+        elif name in {"cite_sources", "record_attribution"}:
+            citation = {
+                "doc_ids": [str(item) for item in _as_iterable(arguments.get("doc_ids", arguments.get("documents", [])))],
+                "memory_keys": [str(item) for item in _as_iterable(arguments.get("memory_keys", []))],
+                "claim": arguments.get("claim") or arguments.get("answer") or arguments.get("text"),
+                "reason": arguments.get("reason"),
+                "freshness_checked": bool(arguments.get("freshness_checked", arguments.get("current", False))),
+            }
+            self.citations.append(citation)
+            result = citation
+            event_name = "attribution"
+            content = json.dumps(result, default=str)
+        else:
+            result = self._trace_payload()
+            event_name = "retrieval_memory_status"
+            content = "Retrieval memory status recorded."
+
+        return self._tool_result(call_id, str(name), content, result, event_name=event_name)
+
+    def _search(self, query: str, *, top_k: int, include_stale: bool) -> List[Dict[str, Any]]:
+        query_terms = _token_set(query)
+        ranked = []
+        for document in self.documents:
+            if self.require_current and not include_stale and document.get("current") is False:
+                continue
+            doc_terms = _token_set(" ".join([document.get("content", ""), document.get("title", "")]))
+            score = len(query_terms & doc_terms)
+            if query_terms and score == 0:
+                continue
+            ranked.append((score, document))
+        ranked.sort(key=lambda item: (-item[0], str(item[1].get("id"))))
+        return [copy.deepcopy(document) for _, document in ranked[:top_k]]
+
+    def _tool_specs(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                "name": "search_knowledge_base",
+                "description": "Search local knowledge documents and return ranked source chunks.",
+                "parameters": {"type": "object", "properties": {"query": {"type": "string"}}},
+            },
+            {
+                "name": "read_document",
+                "description": "Read one retrieved document by id.",
+                "parameters": {"type": "object", "properties": {"id": {"type": "string"}}},
+            },
+            {
+                "name": "retrieve_memory",
+                "description": "Retrieve one memory key or all memory if no key is provided.",
+                "parameters": {"type": "object", "properties": {"key": {"type": "string"}}},
+            },
+            {
+                "name": "write_memory",
+                "description": "Write a simulated agent memory entry.",
+                "parameters": {"type": "object", "properties": {"key": {"type": "string"}}},
+            },
+            {
+                "name": "cite_sources",
+                "description": "Record source document and memory attribution for a claim.",
+                "parameters": {"type": "object", "properties": {"doc_ids": {"type": "array"}}},
+            },
+            {
+                "name": "retrieval_memory_status",
+                "description": "Inspect retrieval, citation, and memory trace state.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        ]
+
+    def _tool_result(
+        self,
+        call_id: Optional[str],
+        tool_name: str,
+        content: str,
+        result: Any,
+        *,
+        event_name: str,
+        success: bool = True,
+        error: Optional[str] = None,
+    ) -> ToolExecutionResult:
+        return ToolExecutionResult(
+            tool_call_id=call_id,
+            tool_name=tool_name,
+            content=content,
+            result=result,
+            success=success,
+            error=error,
+            state_updates={"retrieval_memory": self._state_payload()},
+            artifacts=[self._trace_artifact()],
+            events=[
+                SimulationEvent(
+                    type="retrieval_memory",
+                    name=event_name,
+                    payload=result if isinstance(result, dict) else {"result": result},
+                )
+            ],
+        )
+
+    def _trace_artifact(self) -> SimulationArtifact:
+        return SimulationArtifact(
+            type="trace",
+            role="environment",
+            data=self._trace_payload(),
+            metadata={"kind": "retrieval_memory_trace"},
+        )
+
+    def _trace_payload(self) -> Dict[str, Any]:
+        return {
+            "kind": "retrieval_memory_trace",
+            "documents": copy.deepcopy(self.documents),
+            "queries": copy.deepcopy(self.queries),
+            "document_reads": copy.deepcopy(self.document_reads),
+            "memory_reads": copy.deepcopy(self.memory_reads),
+            "memory_writes": copy.deepcopy(self.memory_writes),
+            "citations": copy.deepcopy(self.citations),
+            "memory": copy.deepcopy(self.memory),
+            "require_current": self.require_current,
+            "metadata": copy.deepcopy(self.metadata),
+        }
+
+    def _state_payload(self) -> Dict[str, Any]:
+        return self._trace_payload()
+
+
 class FileEnvironment(EnvironmentAdapter):
     """In-memory file environment with read/write/list tools."""
 
@@ -1940,6 +2194,64 @@ def _normalize_handoff_contracts(
         name = str(item.get("to") or item.get("role") or item.get("agent") or item.get("name") or f"contract_{index + 1}")
         normalized[name] = item
     return normalized
+
+
+def _normalize_retrieval_documents(
+    documents: Mapping[str, Any] | Iterable[Mapping[str, Any]],
+) -> List[Dict[str, Any]]:
+    raw_documents: List[Mapping[str, Any]] = []
+    if isinstance(documents, Mapping):
+        for doc_id, value in documents.items():
+            if isinstance(value, Mapping):
+                item = dict(value)
+            else:
+                item = {"content": str(value)}
+            item.setdefault("id", str(doc_id))
+            raw_documents.append(item)
+    else:
+        raw_documents = [dict(document) for document in documents]
+
+    normalized = []
+    for index, document in enumerate(raw_documents):
+        item = copy.deepcopy(dict(document))
+        item.setdefault("id", f"doc_{index + 1}")
+        item.setdefault("title", item.get("source", item["id"]))
+        item.setdefault("content", item.get("text", ""))
+        item.setdefault("source", item.get("uri", item.get("path", item["id"])))
+        item.setdefault("metadata", {})
+        item.setdefault("current", item.get("status", "current") not in {"stale", "superseded", "archived"})
+        if "version" not in item and isinstance(item.get("metadata"), Mapping):
+            item["version"] = item["metadata"].get("version")
+        normalized.append(item)
+    return normalized
+
+
+def _find_retrieval_document(
+    documents: Iterable[Mapping[str, Any]],
+    doc_id: str,
+) -> Optional[Mapping[str, Any]]:
+    if not doc_id:
+        return None
+    for document in documents:
+        if doc_id in {str(document.get("id")), str(document.get("source")), str(document.get("title"))}:
+            return document
+    return None
+
+
+def _token_set(text: str) -> set[str]:
+    return {
+        token.strip(".,:;!?()[]{}\"'").lower()
+        for token in str(text).split()
+        if len(token.strip(".,:;!?()[]{}\"'")) > 2
+    }
+
+
+def _as_iterable(value: Any) -> List[Any]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        return list(value)
+    return [value]
 
 
 FRAMEWORK_TRACE_ALIASES = {
