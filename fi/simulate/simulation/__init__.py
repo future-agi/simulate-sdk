@@ -6,6 +6,8 @@ from .synthetic import (
     AttackVector,
     SyntheticDataGenerator,
     SyntheticScenarioConfig,
+    SyntheticTrajectoryTemplateBundle,
+    SyntheticTrajectoryTemplateConfig,
     SyntheticToolTaskBundle,
     SyntheticToolTaskConfig,
 )
@@ -21,6 +23,8 @@ __all__ = [
     "AttackVector",
     "SyntheticDataGenerator",
     "SyntheticScenarioConfig",
+    "SyntheticTrajectoryTemplateBundle",
+    "SyntheticTrajectoryTemplateConfig",
     "SyntheticToolTaskBundle",
     "SyntheticToolTaskConfig",
 ]

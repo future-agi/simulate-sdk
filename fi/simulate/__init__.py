@@ -60,6 +60,8 @@ from .simulation import (
     ScenarioGenerator,
     SyntheticDataGenerator,
     SyntheticScenarioConfig,
+    SyntheticTrajectoryTemplateBundle,
+    SyntheticTrajectoryTemplateConfig,
     SyntheticToolTaskBundle,
     SyntheticToolTaskConfig,
 )
@@ -123,6 +125,8 @@ __all__ = [
     "ScenarioGenerator",
     "SyntheticDataGenerator",
     "SyntheticScenarioConfig",
+    "SyntheticTrajectoryTemplateBundle",
+    "SyntheticTrajectoryTemplateConfig",
     "SyntheticToolTaskBundle",
     "SyntheticToolTaskConfig",
     "evaluate_report",

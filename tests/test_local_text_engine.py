@@ -242,6 +242,38 @@ def test_synthetic_data_generator_builds_self_contained_tool_task():
     assert first.make_environment().reset().tools[0]["name"] == "update_order"
 
 
+def test_synthetic_data_generator_builds_trajectory_template_task():
+    generator = SyntheticDataGenerator()
+
+    first = generator.generate_trajectory_template_task(
+        "refund trajectory",
+        seed=12,
+        order_id="ord_123",
+        refund_amount=19.99,
+    )
+    second = generator.generate_trajectory_template_task(
+        "refund trajectory",
+        seed=12,
+        order_id="ord_123",
+        refund_amount=19.99,
+    )
+
+    assert _model_dump(first) == _model_dump(second)
+    assert first.scenario.name == "synthetic-refund-trajectory-trajectory-template"
+    assert first.tool_arguments["lookup_order"] == {"order_id": "ord_123"}
+    assert first.tool_arguments["issue_refund"] == {
+        "order_id": "ord_123",
+        "amount": 19.99,
+        "approved": True,
+    }
+    assert first.trajectory_templates[0]["tools"][1]["name"] == "issue_refund"
+    assert first.agent_report_config["trajectory_templates"][0]["memory"]["required_writes"] == {
+        "order_id": "ord_123",
+        "resolution": "refund approved",
+    }
+    assert first.make_environment().reset().tools[0]["name"] == "lookup_order"
+
+
 @pytest.mark.asyncio
 async def test_generated_tool_task_runs_and_scores_with_local_evaluator():
     bundle = SyntheticDataGenerator().generate_tool_task(
@@ -281,6 +313,71 @@ async def test_generated_tool_task_runs_and_scores_with_local_evaluator():
     assert scores["tool_argument_schema"] == 1.0
     assert scores["tool_outcome"] == 1.0
     assert scores["state_goal_accuracy"] == 1.0
+    assert evaluation.passed is True
+
+
+@pytest.mark.asyncio
+async def test_generated_trajectory_template_task_runs_and_scores_locally():
+    bundle = SyntheticDataGenerator().generate_trajectory_template_task(
+        "refund trajectory",
+        seed=19,
+    )
+
+    async def agent(input):
+        task = input.persona["trajectory_template_task"]
+        return AgentResponse(
+            content=(
+                "Approval confirmed. Refund approved for ord_123 within policy. "
+                "Receipt total is 19.99."
+            ),
+            tool_calls=[
+                {
+                    "id": "call_lookup_order",
+                    "name": task["lookup_tool"],
+                    "arguments": task["lookup_arguments"],
+                },
+                {
+                    "id": "call_issue_refund",
+                    "name": task["action_tool"],
+                    "arguments": task["action_arguments"],
+                },
+            ],
+            artifacts=bundle.make_artifacts(),
+            events=[
+                SimulationEvent(
+                    type="browser_action",
+                    name="navigate",
+                    payload={"action": "navigate", "url": task["browser_url"]},
+                )
+            ],
+            memory_updates={
+                "order_id": "ord_123",
+                "resolution": "refund approved",
+            },
+        )
+
+    report = await LocalTextEngine().run(
+        scenario=bundle.scenario,
+        agent_callback=agent,
+        environment=bundle.make_environment(),
+        max_turns=1,
+        min_turns=1,
+    )
+    evaluation = evaluate_agent_report(
+        report,
+        config=bundle.agent_report_config,
+        threshold=0.9,
+    )
+    scores = evaluation.summary["metric_averages"]
+
+    assert report.results[0].metadata["environment_state"]["case"]["resolved"] is True
+    assert scores["agent_goal_accuracy"] == 1.0
+    assert scores["tool_call_accuracy"] == 1.0
+    assert scores["tool_call_f1"] == 1.0
+    assert scores["policy_adherence"] == 1.0
+    assert scores["trajectory_browser_action_safety"] == 1.0
+    assert scores["memory_correctness"] == 1.0
+    assert scores["multimodal_faithfulness"] == 1.0
     assert evaluation.passed is True
 
 

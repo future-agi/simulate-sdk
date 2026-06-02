@@ -533,7 +533,9 @@ turn-taking, voice interaction quality, voice trace coverage, framework trace
 coverage, tool argument schema validation, retrieval context quality, source grounding,
 retrieval/memory attribution, autonomy-loop coverage, autonomy-loop quality,
 multi-agent trace coverage, multi-agent coordination quality, artifact coverage,
-and expected state.
+trajectory-template checks for agent goal accuracy, tool-call accuracy, Tool Call
+F1, policy adherence, trajectory browser action safety, memory correctness,
+multimodal faithfulness, and expected state.
 
 ```python
 from fi.simulate import evaluate_agent_report
@@ -543,6 +545,17 @@ evaluation = evaluate_agent_report(
     config={
         "required_tools": ["search_order"],
         "available_tools": ["search_order"],
+        "trajectory_templates": [
+            {
+                "name": "refund_support",
+                "goal": {"final_contains": ["refund approved"], "state": {"case": {"resolved": True}}},
+                "tools": [{"name": "search_order", "arguments": {"order_id": "123"}}],
+                "ordered": True,
+                "policy": {"required_terms": ["policy"], "forbidden_terms": ["skip approval"]},
+                "memory": {"required_keys": ["order_id", "status"]},
+                "multimodal": {"required_artifacts": [{"type": "image", "id": "receipt"}]},
+            }
+        ],
         "allowed_domains": ["shop.example.com"],
         "memory_allowed_keys": ["order_id", "status"],
         "required_artifact_types": ["image", "audio"],
@@ -597,6 +610,7 @@ print(report.results[0].evaluation["agent_report"]["case_score"])
 ```
 
 See [`examples/local_agent_report_evaluation.py`](examples/local_agent_report_evaluation.py) for a full local simulate -> evaluate cookbook.
+See [`examples/local_trajectory_template_evaluation.py`](examples/local_trajectory_template_evaluation.py) for a generated trajectory-template cookbook with mocked tools, browser action safety, memory, state, and image artifact grounding.
 
 50+ metrics are available out of the box — groundedness, faithfulness, tool-use correctness, RAG context relevance, hallucination, PII, toxicity, bias, audio quality, and custom rubrics. See the [evaluation docs](https://docs.futureagi.com/docs/evaluation) for the full catalog.
 
@@ -641,11 +655,12 @@ Traces from simulations flow into `Monitor`, scores flow into `Evaluate`, and fa
 - [x] Local environment adapters for mocked tools/APIs, framework trace replay with TraceAI/OpenTelemetry export ingestion, retrieval/memory attribution, autonomy-loop traces, multi-agent handoff traces, browser/CUA trace replay with Playwright trace/video import, HAR/resource bodies, OpenAI Computer Use and Browser Use trace import, actionability timelines, coordinate regions, image-derived pixel screenshot diffs, layout-shift distributions, stale-screenshot and layout-shift perturbations, voice frame replay/routing/noise/overlap/export replay/waveform/diarization/perceptual metrics, images, files, adversarial packs, and multi-agent rooms
 - [x] Deterministic synthetic data generator
 - [x] Self-contained synthetic tool-world generator with schemas, mocks, state expectations, and evaluator config
+- [x] Self-contained synthetic trajectory-template generator with ordered tool calls, policy, browser action safety, memory correctness, state, and multimodal faithfulness expectations
 - [x] Deterministic pentest scenario generator
 - [x] Per-speaker + combined audio capture
 - [x] Scenario auto-generation from a topic
 - [x] `evaluate_report` integration with `ai-evaluation`
-- [x] Local `evaluate_agent_report` scoring for trajectory, tools, memory, framework trace coverage, retrieval/memory attribution, autonomy-loop coverage, autonomy-loop quality, multi-agent trace coverage, multi-agent coordination quality, browser/CUA action outcome and grounding quality, browser trace coverage, voice trace coverage, voice interaction quality, environment injection, and pentest signals
+- [x] Local `evaluate_agent_report` scoring for trajectory, trajectory templates, agent goal accuracy, tool-call accuracy/F1, policy adherence, tools, memory correctness, multimodal faithfulness, framework trace coverage, retrieval/memory attribution, autonomy-loop coverage, autonomy-loop quality, multi-agent trace coverage, multi-agent coordination quality, browser/CUA action outcome and grounding quality, browser trace coverage, voice trace coverage, voice interaction quality, environment injection, and pentest signals
 - [x] Tool-call capture in wrapper responses
 
 </td>
