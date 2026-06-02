@@ -483,7 +483,7 @@ class BrowserEnvironment(EnvironmentAdapter):
 
 
 class VoiceEnvironment(EnvironmentAdapter):
-    """Local voice-frame environment with audio artifacts, STT/TTS events, and interruption tools."""
+    """Local voice/realtime environment with VAD/STT/TTS replay, routing, and interruption tools."""
 
     name = "voice"
 
@@ -496,6 +496,12 @@ class VoiceEnvironment(EnvironmentAdapter):
         stt_latency_ms: int = 180,
         tts_latency_ms: int = 320,
         state: Optional[Dict[str, Any]] = None,
+        event_replay: Optional[Iterable[Mapping[str, Any]]] = None,
+        latency_profile: Optional[Mapping[str, Any]] = None,
+        allow_interruptions: bool = True,
+        interruption_policy: Optional[Mapping[str, Any]] = None,
+        routes: Optional[Mapping[str, Any] | Iterable[str]] = None,
+        initial_route: Optional[str] = None,
     ) -> None:
         self.sample_rate_hz = sample_rate_hz
         self.stt_latency_ms = stt_latency_ms
@@ -503,14 +509,36 @@ class VoiceEnvironment(EnvironmentAdapter):
         self.initial_state = copy.deepcopy(state or {})
         self.state = copy.deepcopy(self.initial_state)
         self.utterances = _normalize_voice_utterances(utterances or [], audio_uris or [])
+        self.event_replay = [_normalize_voice_event(item) for item in event_replay or []]
+        self.latency_profile = _normalize_latency_profile(
+            latency_profile,
+            stt_latency_ms=stt_latency_ms,
+            tts_latency_ms=tts_latency_ms,
+        )
+        self.latency_cursors = {"stt": 0, "tts": 0}
+        self.allow_interruptions = allow_interruptions
+        self.interruption_policy = {
+            "allow_interruptions": allow_interruptions,
+            **copy.deepcopy(interruption_policy or {}),
+        }
+        self.routes = _normalize_voice_routes(routes)
+        self.initial_route = initial_route or next(iter(self.routes), "default")
+        self.route_history: List[Dict[str, Any]] = []
+        self.transcript_history: List[Dict[str, Any]] = []
+        self.tts_history: List[Dict[str, Any]] = []
 
     def reset(self, **context: Any) -> EnvironmentSnapshot:
         self.state = copy.deepcopy(self.initial_state)
+        self.latency_cursors = {"stt": 0, "tts": 0}
+        self.route_history = []
+        self.transcript_history = []
+        self.tts_history = []
         artifacts = [
             artifact
             for artifact in (_voice_artifact_from_utterance(item, self.sample_rate_hz) for item in self.utterances)
             if artifact is not None
         ]
+        artifacts.append(self._trace_artifact())
         events = [
             SimulationEvent(
                 type="voice",
@@ -518,20 +546,52 @@ class VoiceEnvironment(EnvironmentAdapter):
                 payload={
                     "sample_rate_hz": self.sample_rate_hz,
                     "utterance_count": len(self.utterances),
+                    "allow_interruptions": self.allow_interruptions,
+                    "routes": sorted(self.routes.keys()),
+                    "initial_route": self.initial_route,
                 },
             )
         ]
         for utterance in self.utterances:
+            vad_payload = {
+                "id": utterance["id"],
+                "speaker": utterance.get("speaker", "user"),
+                "turn_index": utterance.get("turn_index"),
+                "start_ms": utterance.get("start_ms"),
+                "end_ms": utterance.get("end_ms"),
+            }
+            events.append(SimulationEvent(type="voice", name="vad_start", payload=vad_payload))
             payload = {
                 "id": utterance["id"],
                 "speaker": utterance.get("speaker", "user"),
                 "transcript": utterance.get("transcript", ""),
                 "turn_index": utterance.get("turn_index"),
-                "latency_ms": utterance.get("latency_ms", self.stt_latency_ms),
+                "latency_ms": utterance.get("latency_ms", self._next_latency("stt")),
             }
             if utterance.get("barge_in"):
                 payload["barge_in"] = True
+                events.append(
+                    SimulationEvent(
+                        type="voice",
+                        name="barge_in",
+                        payload={
+                            "id": utterance["id"],
+                            "allowed": self.allow_interruptions,
+                            "policy": copy.deepcopy(self.interruption_policy),
+                        },
+                    )
+                )
             events.append(SimulationEvent(type="voice", name="stt_result", payload=payload))
+            events.append(SimulationEvent(type="voice", name="vad_end", payload=vad_payload))
+        for event in self.event_replay:
+            events.append(_coerce_event(event))
+        events.append(
+            SimulationEvent(
+                type="voice_trace",
+                name="voice_trace_ready",
+                payload=self._trace_payload(),
+            )
+        )
         return EnvironmentSnapshot(
             tools=[
                 {
@@ -558,17 +618,32 @@ class VoiceEnvironment(EnvironmentAdapter):
                         "properties": {"id": {"type": "string"}},
                     },
                 },
+                {
+                    "name": "route_call",
+                    "description": "Route the simulated call to a configured department, agent, or queue.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "route": {"type": "string"},
+                            "reason": {"type": "string"},
+                        },
+                    },
+                },
+                {
+                    "name": "voice_status",
+                    "description": "Return current simulated voice session state and replay trace.",
+                },
             ],
             artifacts=artifacts,
-            state={
-                "voice": {
-                    "sample_rate_hz": self.sample_rate_hz,
-                    "utterance_count": len(self.utterances),
-                    "speaking": False,
-                    **copy.deepcopy(self.state),
+            state={"voice": self._state_payload()},
+            events=events,
+            metadata={
+                "voice_trace": {
+                    "utterances": len(self.utterances),
+                    "events": len(events),
+                    "routes": sorted(self.routes.keys()),
                 }
             },
-            events=events,
         )
 
     def handle_tool_call(
@@ -577,7 +652,7 @@ class VoiceEnvironment(EnvironmentAdapter):
         **context: Any,
     ) -> Optional[ToolExecutionResult]:
         name = _tool_name(tool_call)
-        if name not in {"speak", "stop_speaking", "transcribe_audio"}:
+        if name not in {"speak", "stop_speaking", "transcribe_audio", "route_call", "voice_status"}:
             return None
         arguments = _tool_arguments(tool_call)
         call_id = _tool_call_id(tool_call)
@@ -586,61 +661,189 @@ class VoiceEnvironment(EnvironmentAdapter):
             utterance_id = str(arguments.get("id") or arguments.get("audio_id") or "")
             utterance = _find_by_id(self.utterances, utterance_id) or (self.utterances[0] if self.utterances else {})
             transcript = str(utterance.get("transcript", ""))
+            latency_ms = int(utterance.get("latency_ms", self._next_latency("stt")))
+            record = {"id": utterance.get("id"), "transcript": transcript, "latency_ms": latency_ms}
+            self.transcript_history.append(record)
+            self.state["last_transcript"] = transcript
             return ToolExecutionResult(
                 tool_call_id=call_id,
                 tool_name=name,
                 content=transcript,
-                result={"id": utterance.get("id"), "transcript": transcript},
+                result=record,
+                state_updates={"voice": self._state_payload()},
+                artifacts=[self._trace_artifact()],
                 events=[
                     SimulationEvent(
                         type="voice",
                         name="stt_result",
-                        payload={
-                            "id": utterance.get("id"),
-                            "transcript": transcript,
-                            "latency_ms": utterance.get("latency_ms", self.stt_latency_ms),
-                        },
+                        payload=record,
                     )
                 ],
             )
 
         if name == "stop_speaking":
+            if not self.allow_interruptions:
+                self.state.update({"speaking": True, "missed_interruptions": int(self.state.get("missed_interruptions", 0)) + 1})
+                return ToolExecutionResult(
+                    tool_call_id=call_id,
+                    tool_name=name,
+                    content="Interruption blocked by simulated policy.",
+                    result={"interruption_handled": False},
+                    success=False,
+                    error="interruptions_disabled",
+                    state_updates={"voice": self._state_payload()},
+                    artifacts=[self._trace_artifact()],
+                    events=[
+                        SimulationEvent(
+                            type="voice",
+                            name="barge_in_failed",
+                            payload={"interruption_handled": False, "policy": copy.deepcopy(self.interruption_policy)},
+                        )
+                    ],
+                )
             handled = int(self.state.get("interruptions_handled", 0)) + 1
             self.state.update({"speaking": False, "interruptions_handled": handled})
-            state_update = {"voice": copy.deepcopy(self.state)}
             return ToolExecutionResult(
                 tool_call_id=call_id,
                 tool_name=name,
                 content="Stopped simulated speech output.",
                 result={"interruption_handled": True},
-                state_updates=state_update,
+                state_updates={"voice": self._state_payload()},
+                artifacts=[self._trace_artifact()],
                 events=[
                     SimulationEvent(
                         type="voice",
                         name="barge_in_handled",
-                        payload={"interruption_handled": True},
+                        payload={"interruption_handled": True, "policy": copy.deepcopy(self.interruption_policy)},
+                    )
+                ],
+            )
+
+        if name == "route_call":
+            route = str(arguments.get("route") or arguments.get("to") or self.initial_route)
+            reason = str(arguments.get("reason") or arguments.get("task") or "")
+            if route not in self.routes:
+                return ToolExecutionResult(
+                    tool_call_id=call_id,
+                    tool_name=name,
+                    content=f"Unknown voice route: {route}",
+                    result={"route": route, "reason": reason},
+                    success=False,
+                    error="unknown_route",
+                    state_updates={"voice": self._state_payload()},
+                    artifacts=[self._trace_artifact()],
+                    events=[
+                        SimulationEvent(
+                            type="voice_route",
+                            name="route_failed",
+                            payload={"route": route, "reason": reason},
+                        )
+                    ],
+                )
+            route_record = {"route": route, "reason": reason, "target": self.routes[route]}
+            self.route_history.append(route_record)
+            self.state["current_route"] = route
+            return ToolExecutionResult(
+                tool_call_id=call_id,
+                tool_name=name,
+                content=f"Routed simulated call to {route}.",
+                result=route_record,
+                state_updates={"voice": self._state_payload()},
+                artifacts=[self._trace_artifact()],
+                events=[
+                    SimulationEvent(
+                        type="voice_route",
+                        name="call_routed",
+                        payload=route_record,
+                    )
+                ],
+            )
+
+        if name == "voice_status":
+            payload = self._trace_payload()
+            return ToolExecutionResult(
+                tool_call_id=call_id,
+                tool_name=name,
+                content=json.dumps(payload, default=str),
+                result=payload,
+                artifacts=[self._trace_artifact()],
+                events=[
+                    SimulationEvent(
+                        type="voice_trace",
+                        name="voice_status",
+                        payload=payload,
                     )
                 ],
             )
 
         text = str(arguments.get("text", arguments.get("content", "")))
-        latency_ms = int(arguments.get("latency_ms", self.tts_latency_ms))
+        latency_ms = int(arguments.get("latency_ms", self._next_latency("tts")))
+        tts_record = {"text": text, "latency_ms": latency_ms, "route": self.state.get("current_route", self.initial_route)}
+        self.tts_history.append(tts_record)
         self.state.update({"speaking": True, "last_tts_text": text, "last_tts_latency_ms": latency_ms})
-        state_update = {"voice": copy.deepcopy(self.state)}
         return ToolExecutionResult(
             tool_call_id=call_id,
             tool_name=name,
             content=f"Spoke simulated TTS output: {text}",
-            result={"text": text, "latency_ms": latency_ms},
-            state_updates=state_update,
+            result=tts_record,
+            state_updates={"voice": self._state_payload()},
+            artifacts=[self._trace_artifact()],
             events=[
                 SimulationEvent(
                     type="voice",
+                    name="tts_start",
+                    payload=tts_record,
+                ),
+                SimulationEvent(
+                    type="voice",
                     name="tts_output",
-                    payload={"text": text, "latency_ms": latency_ms},
+                    payload=tts_record,
                 )
             ],
         )
+
+    def _next_latency(self, kind: str) -> int:
+        values = self.latency_profile.get(kind) or [self.stt_latency_ms if kind == "stt" else self.tts_latency_ms]
+        index = self.latency_cursors.get(kind, 0)
+        self.latency_cursors[kind] = index + 1
+        return int(values[index % len(values)])
+
+    def _trace_artifact(self) -> SimulationArtifact:
+        return SimulationArtifact(
+            type="trace",
+            data=self._trace_payload(),
+            mime_type="application/json",
+            role="environment",
+            metadata={"kind": "voice_trace"},
+        )
+
+    def _trace_payload(self) -> Dict[str, Any]:
+        return {
+            "kind": "voice_trace",
+            "sample_rate_hz": self.sample_rate_hz,
+            "utterances": copy.deepcopy(self.utterances),
+            "event_replay": copy.deepcopy(self.event_replay),
+            "latency_profile": copy.deepcopy(self.latency_profile),
+            "interruption_policy": copy.deepcopy(self.interruption_policy),
+            "routes": copy.deepcopy(self.routes),
+            "route_history": copy.deepcopy(self.route_history),
+            "transcript_history": copy.deepcopy(self.transcript_history),
+            "tts_history": copy.deepcopy(self.tts_history),
+        }
+
+    def _state_payload(self) -> Dict[str, Any]:
+        return {
+            **copy.deepcopy(self.state),
+            "sample_rate_hz": self.sample_rate_hz,
+            "utterance_count": len(self.utterances),
+            "speaking": bool(self.state.get("speaking", False)),
+            "current_route": self.state.get("current_route", self.initial_route),
+            "route_history": copy.deepcopy(self.route_history),
+            "transcript_history": copy.deepcopy(self.transcript_history),
+            "tts_history": copy.deepcopy(self.tts_history),
+            "latency_profile": copy.deepcopy(self.latency_profile),
+            "interruption_policy": copy.deepcopy(self.interruption_policy),
+        }
 
 
 class ImageEnvironment(EnvironmentAdapter):
@@ -1214,6 +1417,62 @@ def _voice_artifact_from_utterance(
             "sample_rate_hz": utterance.get("sample_rate_hz", sample_rate_hz),
         },
     )
+
+
+def _normalize_voice_event(item: Mapping[str, Any]) -> Dict[str, Any]:
+    event = dict(item)
+    payload = dict(event.get("payload", {}))
+    for key in ("latency_ms", "duration_ms", "transcript", "speaker", "route", "status"):
+        if key in event and key not in payload:
+            payload[key] = event[key]
+    return {
+        "type": str(event.get("type", "voice")),
+        "name": str(event.get("name") or event.get("event") or "voice_event"),
+        "payload": payload,
+        "timestamp_ms": event.get("timestamp_ms"),
+        "metadata": dict(event.get("metadata", {})),
+    }
+
+
+def _normalize_latency_profile(
+    profile: Optional[Mapping[str, Any]],
+    *,
+    stt_latency_ms: int,
+    tts_latency_ms: int,
+) -> Dict[str, List[int]]:
+    profile = profile or {}
+    return {
+        "stt": _latency_series(profile.get("stt", profile.get("stt_latency_ms")), stt_latency_ms),
+        "tts": _latency_series(profile.get("tts", profile.get("tts_latency_ms")), tts_latency_ms),
+    }
+
+
+def _latency_series(value: Any, default: int) -> List[int]:
+    if value is None:
+        return [int(default)]
+    if isinstance(value, (int, float)):
+        return [int(value)]
+    if isinstance(value, Mapping):
+        for key in ("series", "latencies", "values"):
+            if key in value:
+                return _latency_series(value[key], default)
+        return [int(value.get("p50_ms", value.get("mean_ms", default)))]
+    if hasattr(value, "__iter__") and not isinstance(value, (str, bytes)):
+        values = [int(item) for item in value]
+        return values or [int(default)]
+    return [int(default)]
+
+
+def _normalize_voice_routes(routes: Optional[Mapping[str, Any] | Iterable[str]]) -> Dict[str, Any]:
+    if routes is None:
+        return {"default": {"kind": "agent", "name": "default"}}
+    if isinstance(routes, Mapping):
+        normalized = {}
+        for name, target in routes.items():
+            normalized[str(name)] = copy.deepcopy(target)
+        return normalized or {"default": {"kind": "agent", "name": "default"}}
+    normalized = {str(route): {"kind": "queue", "name": str(route)} for route in routes}
+    return normalized or {"default": {"kind": "agent", "name": "default"}}
 
 
 def _find_by_id(items: Iterable[Mapping[str, Any]], item_id: str) -> Optional[Mapping[str, Any]]:

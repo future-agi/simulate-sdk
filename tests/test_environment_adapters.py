@@ -316,6 +316,78 @@ async def test_voice_and_image_environments_expose_media_and_execute_tools():
 
 
 @pytest.mark.asyncio
+async def test_voice_environment_records_replay_latency_interruptions_and_routes():
+    async def agent(input):
+        return AgentResponse(
+            content="I will route the call, transcribe audio, answer, and handle interruption.",
+            tool_calls=[
+                {"id": "call_status", "name": "voice_status", "arguments": {}},
+                {
+                    "id": "call_route",
+                    "name": "route_call",
+                    "arguments": {"route": "billing", "reason": "billing question"},
+                },
+                {
+                    "id": "call_stt",
+                    "name": "transcribe_audio",
+                    "arguments": {"id": "caller_1"},
+                },
+                {
+                    "id": "call_tts",
+                    "name": "speak",
+                    "arguments": {"text": "I can help with billing."},
+                },
+                {"id": "call_stop", "name": "stop_speaking", "arguments": {}},
+            ],
+        )
+
+    report = await LocalTextEngine().run(
+        scenario=_scenario(),
+        agent_callback=agent,
+        environment=VoiceEnvironment(
+            [
+                {
+                    "id": "caller_1",
+                    "transcript": "Billing question for order 123.",
+                    "audio_uri": "file:///fixtures/caller.wav",
+                    "barge_in": True,
+                }
+            ],
+            sample_rate_hz=24000,
+            latency_profile={"stt": [120, 180], "tts": [360, 420]},
+            event_replay=[
+                {"name": "vad_start", "timestamp_ms": 10},
+                {"name": "stt_partial", "payload": {"transcript": "Billing question"}},
+            ],
+            routes={"default": {"agent": "support"}, "billing": {"agent": "billing"}},
+            initial_route="default",
+            allow_interruptions=True,
+        ),
+        max_turns=1,
+        min_turns=1,
+        modality="voice",
+    )
+
+    result = report.results[0]
+    voice_state = result.metadata["environment_state"]["voice"]
+    voice_traces = [
+        artifact.data
+        for artifact in result.artifacts
+        if artifact.type == "trace" and artifact.metadata.get("kind") == "voice_trace"
+    ]
+
+    assert voice_state["current_route"] == "billing"
+    assert voice_state["route_history"][-1]["route"] == "billing"
+    assert voice_state["transcript_history"][-1]["transcript"] == "Billing question for order 123."
+    assert voice_state["tts_history"][-1]["latency_ms"] == 360
+    assert voice_state["interruptions_handled"] == 1
+    assert voice_traces
+    assert any(event.name == "call_routed" for event in result.events)
+    assert any(event.name == "vad_start" for event in result.events)
+    assert any(event.name == "barge_in_handled" for event in result.events)
+
+
+@pytest.mark.asyncio
 async def test_adversarial_environment_pack_exposes_hostile_world_surfaces():
     async def agent(input):
         return AgentResponse(
