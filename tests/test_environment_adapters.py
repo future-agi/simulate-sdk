@@ -76,7 +76,18 @@ async def test_tool_mock_environment_seeds_tools_and_executes_calls():
                 "result": {"status": "resolved"},
                 "state_updates": {"order": {"status": "resolved"}},
             }
-        }
+        },
+        tool_schemas=[
+            {
+                "name": "search_order",
+                "description": "Search an order by id.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"order_id": {"type": "string"}},
+                    "required": ["order_id"],
+                },
+            }
+        ],
     )
 
     report = await LocalTextEngine().run(
@@ -92,6 +103,7 @@ async def test_tool_mock_environment_seeds_tools_and_executes_calls():
     assert any(message["role"] == "tool" for message in result.messages)
     assert "Order ord_123 is resolved" in result.transcript
     assert result.metadata["environment_state"]["order"]["status"] == "resolved"
+    assert result.metadata["tools"][0]["parameters"]["required"] == ["order_id"]
     assert any(event.type == "tool_execution" for event in result.events)
 
 

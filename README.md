@@ -421,7 +421,7 @@ For fully local agent scoring, use `evaluate_agent_report`. It scores the
 normalized simulation trace directly: trajectory, tool use, prompt-injection
 resistance, environment-injection resistance, memory integrity, browser/CUA
 safety, browser trace coverage, voice turn-taking, voice trace coverage,
-framework trace coverage, retrieval context quality, source grounding, retrieval/memory attribution, autonomy-loop coverage, multi-agent trace coverage, artifact coverage, and expected state.
+framework trace coverage, tool argument schema validation, retrieval context quality, source grounding, retrieval/memory attribution, autonomy-loop coverage, multi-agent trace coverage, artifact coverage, and expected state.
 
 ```python
 from fi.simulate import evaluate_agent_report

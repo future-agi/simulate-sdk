@@ -308,6 +308,7 @@ class LocalTextEngine(BaseEngine):
                 "duration_ms": int((time.time() - started_at) * 1000),
                 "environment": environment_metadata,
                 "environment_state": environment_state,
+                "tools": tools,
             },
         )
 
