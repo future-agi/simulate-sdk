@@ -156,7 +156,7 @@ class ToolMockEnvironment(EnvironmentAdapter):
 
 
 class BrowserEnvironment(EnvironmentAdapter):
-    """Minimal browser/CUA environment with DOM artifacts and domain policy."""
+    """Local browser/CUA environment with snapshots, replay, and domain policy."""
 
     name = "browser"
 
@@ -168,6 +168,10 @@ class BrowserEnvironment(EnvironmentAdapter):
         screenshot_uri: Optional[str] = None,
         allowed_domains: Optional[Iterable[str]] = None,
         state: Optional[Dict[str, Any]] = None,
+        snapshots: Optional[Iterable[Mapping[str, Any]]] = None,
+        console_logs: Optional[Iterable[str | Mapping[str, Any]]] = None,
+        network_log: Optional[Iterable[Mapping[str, Any]]] = None,
+        prompt_injections: Optional[Iterable[str | Mapping[str, Any]]] = None,
     ) -> None:
         self.initial_url = url
         self.url = url
@@ -176,26 +180,71 @@ class BrowserEnvironment(EnvironmentAdapter):
         self.allowed_domains = {domain.lower() for domain in allowed_domains or []}
         self.initial_state = copy.deepcopy(state or {})
         self.state = copy.deepcopy(self.initial_state)
+        self.initial_snapshots = _normalize_browser_snapshots(
+            snapshots,
+            url=url,
+            dom=dom,
+            screenshot_uri=screenshot_uri,
+            state=self.initial_state,
+        )
+        self.snapshots = copy.deepcopy(self.initial_snapshots)
+        self.current_snapshot_index = 0
+        self.console_logs = [_normalize_browser_log(item) for item in console_logs or []]
+        self.network_log = [dict(item) for item in network_log or []]
+        self.prompt_injections = [
+            dict(item) if isinstance(item, Mapping) else {"content": str(item)}
+            for item in prompt_injections or []
+        ]
+        self.action_replay: List[Dict[str, Any]] = []
 
     def reset(self, **context: Any) -> EnvironmentSnapshot:
         self.url = self.initial_url
         self.state = copy.deepcopy(self.initial_state)
-        artifacts = [
-            SimulationArtifact(
-                type="browser_dom",
-                data=self.dom,
-                mime_type="text/html",
-                role="environment",
-                metadata={"url": self.url},
-            )
+        self.snapshots = copy.deepcopy(self.initial_snapshots)
+        self.current_snapshot_index = 0
+        self.action_replay = []
+        artifacts = self._snapshot_artifacts(self._current_snapshot())
+        artifacts.append(self._trace_artifact())
+        events = [
+            SimulationEvent(
+                type="environment",
+                name="browser_ready",
+                payload={
+                    "url": self.url,
+                    "allowed_domains": sorted(self.allowed_domains),
+                    "snapshots": len(self.snapshots),
+                    "console_logs": len(self.console_logs),
+                    "network_log": len(self.network_log),
+                },
+            ),
+            SimulationEvent(
+                type="browser_snapshot",
+                name="initial_snapshot",
+                payload=self._snapshot_summary(self._current_snapshot()),
+            ),
         ]
-        if self.screenshot_uri:
-            artifacts.append(
-                SimulationArtifact(
-                    type="screenshot",
-                    uri=self.screenshot_uri,
-                    role="environment",
-                    metadata={"url": self.url},
+        if self.console_logs:
+            events.append(
+                SimulationEvent(
+                    type="browser_console",
+                    name="console_log_loaded",
+                    payload={"logs": copy.deepcopy(self.console_logs)},
+                )
+            )
+        if self.network_log:
+            events.append(
+                SimulationEvent(
+                    type="browser_network",
+                    name="network_log_loaded",
+                    payload={"requests": copy.deepcopy(self.network_log)},
+                )
+            )
+        for injection in self.prompt_injections:
+            events.append(
+                SimulationEvent(
+                    type="environment_injection",
+                    name="browser_prompt_injection_surface",
+                    payload=copy.deepcopy(injection),
                 )
             )
         return EnvironmentSnapshot(
@@ -220,16 +269,29 @@ class BrowserEnvironment(EnvironmentAdapter):
                         },
                     },
                 },
+                {
+                    "name": "browser_snapshot",
+                    "description": "Return the current simulated browser DOM, screenshot metadata, and action replay.",
+                },
+                {
+                    "name": "browser_console",
+                    "description": "Return simulated browser console logs.",
+                },
+                {
+                    "name": "browser_network",
+                    "description": "Return simulated browser network requests.",
+                },
             ],
             artifacts=artifacts,
-            state={"browser": {"url": self.url, **copy.deepcopy(self.state)}},
-            events=[
-                SimulationEvent(
-                    type="environment",
-                    name="browser_ready",
-                    payload={"url": self.url, "allowed_domains": sorted(self.allowed_domains)},
-                )
-            ],
+            state={"browser": self._state_payload()},
+            events=events,
+            metadata={
+                "browser_trace": {
+                    "snapshots": len(self.snapshots),
+                    "console_logs": len(self.console_logs),
+                    "network_log": len(self.network_log),
+                }
+            },
         )
 
     def handle_tool_call(
@@ -238,6 +300,8 @@ class BrowserEnvironment(EnvironmentAdapter):
         **context: Any,
     ) -> Optional[ToolExecutionResult]:
         name = _tool_name(tool_call)
+        if name in {"browser_snapshot", "browser_console", "browser_network"}:
+            return self._inspection_result(tool_call, name)
         if name not in {"browser_navigate", "browser_click", "playwright_click", "computer_click"}:
             return None
 
@@ -247,6 +311,16 @@ class BrowserEnvironment(EnvironmentAdapter):
         action = str(arguments.get("action") or arguments.get("selector") or name)
         allowed, reason = self._allowed_url(requested_url)
         if not allowed:
+            replay_event = {
+                "tool": name,
+                "url": requested_url,
+                "action": action,
+                "arguments": copy.deepcopy(arguments),
+                "blocked": True,
+                "reason": reason,
+                "turn_index": context.get("turn_index"),
+            }
+            self.action_replay.append(replay_event)
             return ToolExecutionResult(
                 tool_call_id=call_id,
                 tool_name=name,
@@ -254,28 +328,46 @@ class BrowserEnvironment(EnvironmentAdapter):
                 result={"url": requested_url, "action": action},
                 success=False,
                 error=reason,
+                state_updates={"browser": self._state_payload()},
+                artifacts=[self._trace_artifact()],
                 events=[
                     SimulationEvent(
                         type="browser_action",
                         name=name,
-                        payload={"url": requested_url, "action": action, "blocked": True},
+                        payload=replay_event,
                     )
                 ],
             )
 
         self.url = requested_url
-        state_update = {"browser": {"url": self.url, "last_action": action}}
+        self.current_snapshot_index = self._snapshot_index_for_url(self.url)
+        replay_event = {
+            "tool": name,
+            "url": self.url,
+            "action": action,
+            "arguments": copy.deepcopy(arguments),
+            "blocked": False,
+            "turn_index": context.get("turn_index"),
+        }
+        self.action_replay.append(replay_event)
+        state_update = {"browser": self._state_payload(last_action=action)}
         return ToolExecutionResult(
             tool_call_id=call_id,
             tool_name=name,
             content=f"Browser action completed: {action} at {self.url}",
-            result={"url": self.url, "action": action},
+            result={"url": self.url, "action": action, "snapshot": self._current_snapshot()},
             state_updates=state_update,
+            artifacts=self._snapshot_artifacts(self._current_snapshot()) + [self._trace_artifact()],
             events=[
                 SimulationEvent(
                     type="browser_action",
                     name=name,
-                    payload={"url": self.url, "action": action, "blocked": False},
+                    payload=replay_event,
+                ),
+                SimulationEvent(
+                    type="browser_snapshot",
+                    name="post_action_snapshot",
+                    payload=self._snapshot_summary(self._current_snapshot()),
                 )
             ],
         )
@@ -287,6 +379,107 @@ class BrowserEnvironment(EnvironmentAdapter):
         if any(host == domain or host.endswith(f".{domain}") for domain in self.allowed_domains):
             return True, ""
         return False, f"host '{host}' is outside allowed domains"
+
+    def _inspection_result(self, tool_call: Mapping[str, Any], name: str) -> ToolExecutionResult:
+        call_id = _tool_call_id(tool_call)
+        if name == "browser_console":
+            result = {"console_logs": copy.deepcopy(self.console_logs)}
+            event_type = "browser_console"
+        elif name == "browser_network":
+            result = {"network_log": copy.deepcopy(self.network_log)}
+            event_type = "browser_network"
+        else:
+            result = self._trace_payload()
+            event_type = "browser_snapshot"
+        return ToolExecutionResult(
+            tool_call_id=call_id,
+            tool_name=name,
+            content=json.dumps(result, default=str),
+            result=result,
+            artifacts=self._snapshot_artifacts(self._current_snapshot()) + [self._trace_artifact()],
+            events=[
+                SimulationEvent(
+                    type=event_type,
+                    name=name,
+                    payload=result,
+                )
+            ],
+        )
+
+    def _current_snapshot(self) -> Dict[str, Any]:
+        return copy.deepcopy(self.snapshots[self.current_snapshot_index])
+
+    def _snapshot_index_for_url(self, url: str) -> int:
+        for index, snapshot in enumerate(self.snapshots):
+            if str(snapshot.get("url")) == url:
+                return index
+        return self.current_snapshot_index
+
+    def _snapshot_artifacts(self, snapshot: Mapping[str, Any]) -> List[SimulationArtifact]:
+        artifacts = [
+            SimulationArtifact(
+                type="browser_dom",
+                data=snapshot.get("dom", ""),
+                mime_type="text/html",
+                role="environment",
+                metadata={"url": snapshot.get("url"), "snapshot_id": snapshot.get("id")},
+            )
+        ]
+        screenshot_uri = snapshot.get("screenshot_uri")
+        screenshot_path = snapshot.get("screenshot_path")
+        if screenshot_uri or screenshot_path:
+            artifacts.append(
+                SimulationArtifact(
+                    type="screenshot",
+                    uri=str(screenshot_uri) if screenshot_uri else None,
+                    path=str(screenshot_path) if screenshot_path else None,
+                    role="environment",
+                    metadata={"url": snapshot.get("url"), "snapshot_id": snapshot.get("id")},
+                )
+            )
+        return artifacts
+
+    def _trace_artifact(self) -> SimulationArtifact:
+        return SimulationArtifact(
+            type="trace",
+            data=self._trace_payload(),
+            mime_type="application/json",
+            role="environment",
+            metadata={"kind": "browser_trace", "url": self.url},
+        )
+
+    def _trace_payload(self) -> Dict[str, Any]:
+        return {
+            "kind": "browser_trace",
+            "url": self.url,
+            "snapshots": copy.deepcopy(self.snapshots),
+            "action_replay": copy.deepcopy(self.action_replay),
+            "console_logs": copy.deepcopy(self.console_logs),
+            "network_log": copy.deepcopy(self.network_log),
+            "prompt_injections": copy.deepcopy(self.prompt_injections),
+        }
+
+    def _state_payload(self, *, last_action: Optional[str] = None) -> Dict[str, Any]:
+        payload = {
+            **copy.deepcopy(self.state),
+            "url": self.url,
+            "snapshot": self._snapshot_summary(self._current_snapshot()),
+            "action_replay": copy.deepcopy(self.action_replay),
+            "console_logs": copy.deepcopy(self.console_logs),
+            "network_log": copy.deepcopy(self.network_log),
+        }
+        if last_action is not None:
+            payload["last_action"] = last_action
+        return payload
+
+    def _snapshot_summary(self, snapshot: Mapping[str, Any]) -> Dict[str, Any]:
+        return {
+            "id": snapshot.get("id"),
+            "url": snapshot.get("url"),
+            "has_dom": bool(snapshot.get("dom")),
+            "has_screenshot": bool(snapshot.get("screenshot_uri") or snapshot.get("screenshot_path")),
+            "metadata": copy.deepcopy(snapshot.get("metadata", {})),
+        }
 
 
 class VoiceEnvironment(EnvironmentAdapter):
@@ -931,6 +1124,50 @@ def _coerce_event(value: SimulationEvent | Dict[str, Any]) -> SimulationEvent:
     if isinstance(value, SimulationEvent):
         return value
     return SimulationEvent(**value)
+
+
+def _normalize_browser_snapshots(
+    snapshots: Optional[Iterable[Mapping[str, Any]]],
+    *,
+    url: str,
+    dom: str,
+    screenshot_uri: Optional[str],
+    state: Mapping[str, Any],
+) -> List[Dict[str, Any]]:
+    raw_snapshots = list(snapshots or [])
+    if not raw_snapshots:
+        raw_snapshots = [
+            {
+                "id": "initial",
+                "url": url,
+                "dom": dom,
+                "screenshot_uri": screenshot_uri,
+                "state": copy.deepcopy(state),
+            }
+        ]
+    normalized: List[Dict[str, Any]] = []
+    for index, snapshot in enumerate(raw_snapshots):
+        item = dict(snapshot)
+        item.setdefault("id", f"snapshot_{index + 1}")
+        item.setdefault("url", url)
+        item.setdefault("dom", dom)
+        if "screenshot_uri" not in item and "uri" in item:
+            item["screenshot_uri"] = item.get("uri")
+        if "screenshot_path" not in item and "path" in item:
+            item["screenshot_path"] = item.get("path")
+        item.setdefault("state", {})
+        item.setdefault("metadata", {})
+        normalized.append(item)
+    return normalized
+
+
+def _normalize_browser_log(item: str | Mapping[str, Any]) -> Dict[str, Any]:
+    if isinstance(item, Mapping):
+        log = dict(item)
+        log.setdefault("level", "info")
+        log.setdefault("message", "")
+        return log
+    return {"level": "info", "message": str(item)}
 
 
 def _normalize_voice_utterances(
