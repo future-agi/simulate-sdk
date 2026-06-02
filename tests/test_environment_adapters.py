@@ -6,6 +6,7 @@ from fi.simulate import (
     AutonomyLoopEnvironment,
     BrowserEnvironment,
     FileEnvironment,
+    FrameworkTraceEnvironment,
     ImageEnvironment,
     MultiAgentRoomEnvironment,
     ToolMockEnvironment,
@@ -324,6 +325,61 @@ async def test_multi_agent_room_records_handoff_review_reconciliation_trace():
     assert traces and traces[-1]["reconciliations"]
     assert any(event.type == "multi_agent" and event.name == "review_requested" for event in result.events)
     assert any(event.type == "multi_agent" and event.name == "reconciled" for event in result.events)
+
+
+@pytest.mark.asyncio
+async def test_framework_trace_environment_replays_and_inspects_framework_spans():
+    seen_tools = []
+
+    async def agent(input):
+        seen_tools.extend(tool["name"] for tool in input.tools)
+        return AgentResponse(
+            content="I inspected the framework trace and found model, tool, handoff, and guardrail spans.",
+            tool_calls=[
+                {"id": "status", "name": "framework_trace_status", "arguments": {}},
+                {
+                    "id": "list_tools",
+                    "name": "list_framework_spans",
+                    "arguments": {"signal": "tool"},
+                },
+                {
+                    "id": "inspect_handoff",
+                    "name": "inspect_framework_span",
+                    "arguments": {"id": "handoff_1"},
+                },
+            ],
+        )
+
+    report = await LocalTextEngine().run(
+        scenario=_scenario(),
+        agent_callback=agent,
+        environment=FrameworkTraceEnvironment(
+            framework="openai_agents",
+            spans=[
+                {"id": "agent_1", "name": "agent_span", "type": "agent", "duration_ms": 12},
+                {"id": "gen_1", "name": "generation_span", "type": "llm", "usage": {"tokens": 42}},
+                {"id": "tool_1", "name": "function_span search_order", "type": "tool"},
+                {"id": "handoff_1", "name": "handoff_span policy_specialist", "type": "handoff"},
+                {"id": "guard_1", "name": "guardrail_span pii_check", "type": "guardrail"},
+            ],
+        ),
+        max_turns=1,
+        min_turns=1,
+    )
+
+    result = report.results[0]
+    trace_state = result.metadata["environment_state"]["framework_trace"]
+    traces = [
+        artifact.data
+        for artifact in result.artifacts
+        if artifact.type == "trace" and artifact.metadata.get("kind") == "framework_trace"
+    ]
+
+    assert {"framework_trace_status", "list_framework_spans", "inspect_framework_span"} <= set(seen_tools)
+    assert trace_state["framework"] == "openai_agents"
+    assert {"agent", "model", "tool", "handoff", "guardrail", "latency", "cost"} <= set(trace_state["signals"])
+    assert traces and traces[-1]["spans"]
+    assert any(event.type == "framework_span" and event.name == "handoff_span policy_specialist" for event in result.events)
 
 
 @pytest.mark.asyncio

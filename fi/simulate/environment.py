@@ -1419,6 +1419,188 @@ class MultiAgentRoomEnvironment(EnvironmentAdapter):
         return self._trace_payload()
 
 
+class FrameworkTraceEnvironment(EnvironmentAdapter):
+    """
+    Replay framework-native spans/events as normalized simulation evidence.
+
+    Use this for LangChain/LangGraph stream events, OpenAI Agents traces, CrewAI
+    traces, AutoGen telemetry, LiveKit events, Pipecat frames, or any custom
+    orchestration trace that can be represented as dictionaries.
+    """
+
+    name = "framework_trace"
+
+    def __init__(
+        self,
+        *,
+        framework: str,
+        spans: Optional[Iterable[str | Mapping[str, Any]]] = None,
+        events: Optional[Iterable[str | Mapping[str, Any]]] = None,
+        state: Optional[Mapping[str, Any]] = None,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        self.framework = str(framework)
+        self.initial_spans = [
+            _normalize_framework_span(span, framework=self.framework)
+            for span in (spans or [])
+        ]
+        self.initial_events = [
+            _normalize_framework_span(event, framework=self.framework)
+            for event in (events or [])
+        ]
+        self.initial_state = copy.deepcopy(dict(state or {}))
+        self.metadata = copy.deepcopy(dict(metadata or {}))
+        self.spans: List[Dict[str, Any]] = []
+        self.events: List[Dict[str, Any]] = []
+        self.state = copy.deepcopy(self.initial_state)
+
+    def reset(self, **context: Any) -> EnvironmentSnapshot:
+        self.spans = copy.deepcopy(self.initial_spans)
+        self.events = copy.deepcopy(self.initial_events)
+        self.state = copy.deepcopy(self.initial_state)
+        framework_events = [
+            _framework_span_event(span, self.framework)
+            for span in [*self.spans, *self.events]
+        ]
+        return EnvironmentSnapshot(
+            tools=self._tool_specs(),
+            artifacts=[self._trace_artifact()],
+            events=[
+                SimulationEvent(
+                    type="framework_trace",
+                    name="framework_trace_ready",
+                    payload={
+                        "framework": self.framework,
+                        "span_count": len(self.spans),
+                        "event_count": len(self.events),
+                        "signals": sorted(self._observed_signals()),
+                    },
+                ),
+                *framework_events,
+            ],
+            state={"framework_trace": self._state_payload()},
+            metadata={
+                "framework_trace": {
+                    "framework": self.framework,
+                    "span_count": len(self.spans),
+                    "event_count": len(self.events),
+                    "signals": sorted(self._observed_signals()),
+                }
+            },
+        )
+
+    def handle_tool_call(
+        self,
+        tool_call: Mapping[str, Any],
+        **context: Any,
+    ) -> Optional[ToolExecutionResult]:
+        name = _tool_name(tool_call)
+        if name not in {"framework_trace_status", "list_framework_spans", "inspect_framework_span"}:
+            return None
+        arguments = _tool_arguments(tool_call)
+        call_id = _tool_call_id(tool_call)
+
+        if name == "framework_trace_status":
+            result = self._trace_payload()
+            event_name = "framework_trace_status"
+            content = f"{self.framework} framework trace status recorded."
+        elif name == "list_framework_spans":
+            signal = _normalize_framework_trace_key(arguments.get("signal") or arguments.get("kind") or "")
+            spans = [*self.spans, *self.events]
+            if signal:
+                spans = [span for span in spans if signal in set(span.get("signals", []))]
+            result = {"framework": self.framework, "spans": copy.deepcopy(spans)}
+            event_name = "framework_spans_listed"
+            content = f"Listed {len(spans)} {self.framework} framework span(s)."
+        else:
+            span_id = str(arguments.get("id") or arguments.get("span_id") or arguments.get("name") or "")
+            span = _find_framework_span([*self.spans, *self.events], span_id)
+            success = span is not None
+            result = {"framework": self.framework, "span": copy.deepcopy(span), "query": span_id}
+            event_name = "framework_span_inspected" if success else "framework_span_missing"
+            content = f"Inspected framework span {span_id}." if success else f"Framework span not found: {span_id}"
+            return ToolExecutionResult(
+                tool_call_id=call_id,
+                tool_name=name,
+                content=content,
+                result=result,
+                success=success,
+                error=None if success else "span_not_found",
+                state_updates={"framework_trace": self._state_payload()},
+                artifacts=[self._trace_artifact()],
+                events=[
+                    SimulationEvent(
+                        type="framework_trace",
+                        name=event_name,
+                        payload=result,
+                    )
+                ],
+            )
+
+        return ToolExecutionResult(
+            tool_call_id=call_id,
+            tool_name=name,
+            content=content,
+            result=result,
+            state_updates={"framework_trace": self._state_payload()},
+            artifacts=[self._trace_artifact()],
+            events=[
+                SimulationEvent(
+                    type="framework_trace",
+                    name=event_name,
+                    payload=result,
+                )
+            ],
+        )
+
+    def _tool_specs(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                "name": "framework_trace_status",
+                "description": "Return normalized framework trace state, spans, events, and observed signals.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            {
+                "name": "list_framework_spans",
+                "description": "List normalized framework spans, optionally filtered by signal.",
+                "parameters": {"type": "object", "properties": {"signal": {"type": "string"}}},
+            },
+            {
+                "name": "inspect_framework_span",
+                "description": "Inspect one framework span by id, span_id, or name.",
+                "parameters": {"type": "object", "properties": {"id": {"type": "string"}}},
+            },
+        ]
+
+    def _trace_artifact(self) -> SimulationArtifact:
+        return SimulationArtifact(
+            type="trace",
+            role="environment",
+            data=self._trace_payload(),
+            metadata={"kind": "framework_trace", "framework": self.framework},
+        )
+
+    def _trace_payload(self) -> Dict[str, Any]:
+        return {
+            "kind": "framework_trace",
+            "framework": self.framework,
+            "spans": copy.deepcopy(self.spans),
+            "events": copy.deepcopy(self.events),
+            "signals": sorted(self._observed_signals()),
+            "state": copy.deepcopy(self.state),
+            "metadata": copy.deepcopy(self.metadata),
+        }
+
+    def _state_payload(self) -> Dict[str, Any]:
+        return self._trace_payload()
+
+    def _observed_signals(self) -> set[str]:
+        signals: set[str] = set()
+        for span in [*self.spans, *self.events]:
+            signals.update(span.get("signals", []))
+        return signals
+
+
 class AutonomyLoopEnvironment(EnvironmentAdapter):
     """
     Local autonomy-loop harness for observe/orient/plan/act/verify/reflect traces.
@@ -1758,6 +1940,196 @@ def _normalize_handoff_contracts(
         name = str(item.get("to") or item.get("role") or item.get("agent") or item.get("name") or f"contract_{index + 1}")
         normalized[name] = item
     return normalized
+
+
+FRAMEWORK_TRACE_ALIASES = {
+    "llm": "model",
+    "generation": "model",
+    "chat_model": "model",
+    "model_call": "model",
+    "function": "tool",
+    "function_call": "tool",
+    "function_tool": "tool",
+    "tool_call": "tool",
+    "handoffs": "handoff",
+    "delegation": "handoff",
+    "transfer": "handoff",
+    "guardrails": "guardrail",
+    "safety": "guardrail",
+    "retriever": "retrieval",
+    "rag": "retrieval",
+    "vector_search": "retrieval",
+    "memory_update": "memory",
+    "memory_retrieval": "memory",
+    "computer": "browser",
+    "cua": "browser",
+    "computer_use": "browser",
+    "transcription": "voice",
+    "speech": "voice",
+    "audio": "voice",
+    "tts": "voice",
+    "stt": "voice",
+    "vision": "image",
+    "multimodal": "image",
+    "exception": "error",
+    "failure": "error",
+    "duration": "latency",
+    "duration_ms": "latency",
+    "tokens": "cost",
+    "usage": "cost",
+}
+
+
+def _normalize_framework_trace_key(value: Any) -> str:
+    normalized = str(value).strip().lower().replace("-", "_").replace(" ", "_").replace(".", "_")
+    return FRAMEWORK_TRACE_ALIASES.get(normalized, normalized)
+
+
+def _normalize_framework_span(value: str | Mapping[str, Any], *, framework: str) -> Dict[str, Any]:
+    raw = {"name": value} if isinstance(value, str) else copy.deepcopy(dict(value))
+    attributes = _nested_dict(raw, ("attributes", "attrs", "metadata", "data", "payload"))
+    name = str(
+        raw.get("name")
+        or raw.get("event")
+        or raw.get("span_name")
+        or raw.get("operation")
+        or raw.get("type")
+        or "framework_event"
+    )
+    span_id = str(raw.get("id") or raw.get("span_id") or raw.get("run_id") or name)
+    signals = _framework_signals(raw, attributes, name)
+    normalized = {
+        "id": span_id,
+        "name": name,
+        "framework": str(raw.get("framework") or framework),
+        "type": str(raw.get("type") or raw.get("kind") or raw.get("span_type") or ""),
+        "signals": sorted(signals),
+        "parent_id": raw.get("parent_id") or raw.get("parent_span_id") or raw.get("parent_run_id"),
+        "input": raw.get("input") or attributes.get("input"),
+        "output": raw.get("output") or attributes.get("output"),
+        "error": raw.get("error") or raw.get("exception") or attributes.get("error"),
+        "latency_ms": _first_number(raw, attributes, ("latency_ms", "duration_ms", "elapsed_ms")),
+        "cost": raw.get("cost") or attributes.get("cost") or attributes.get("usage"),
+        "attributes": attributes,
+    }
+    for key in ("start_time", "end_time", "timestamp_ms"):
+        if raw.get(key) is not None:
+            normalized[key] = raw.get(key)
+    return {key: value for key, value in normalized.items() if value is not None and value != ""}
+
+
+def _framework_signals(
+    raw: Mapping[str, Any],
+    attributes: Mapping[str, Any],
+    name: str,
+) -> set[str]:
+    text = " ".join(
+        [
+            name,
+            str(raw.get("type", "")),
+            str(raw.get("kind", "")),
+            str(raw.get("span_type", "")),
+            str(raw.get("event", "")),
+            " ".join(str(key) for key in raw.keys()),
+            " ".join(str(key) for key in attributes.keys()),
+        ]
+    ).lower()
+    signals = {"span"}
+    if raw.get("framework"):
+        signals.add("framework")
+    keyword_signals = {
+        "agent": "agent",
+        "chain": "agent",
+        "graph": "agent",
+        "node": "agent",
+        "llm": "model",
+        "model": "model",
+        "generation": "model",
+        "tool": "tool",
+        "function": "tool",
+        "handoff": "handoff",
+        "transfer": "handoff",
+        "guardrail": "guardrail",
+        "retriev": "retrieval",
+        "rag": "retrieval",
+        "vector": "retrieval",
+        "memory": "memory",
+        "browser": "browser",
+        "computer": "browser",
+        "cua": "browser",
+        "voice": "voice",
+        "audio": "voice",
+        "speech": "voice",
+        "transcri": "voice",
+        "image": "image",
+        "vision": "image",
+        "state": "state",
+        "checkpoint": "state",
+        "error": "error",
+        "exception": "error",
+        "latency": "latency",
+        "duration": "latency",
+        "token": "cost",
+        "cost": "cost",
+        "usage": "cost",
+    }
+    for token, signal in keyword_signals.items():
+        if token in text:
+            signals.add(signal)
+    if _first_number(raw, attributes, ("latency_ms", "duration_ms", "elapsed_ms")) is not None:
+        signals.add("latency")
+    if raw.get("error") or raw.get("exception") or attributes.get("error"):
+        signals.add("error")
+    if raw.get("cost") or attributes.get("cost") or attributes.get("usage"):
+        signals.add("cost")
+    return {_normalize_framework_trace_key(signal) for signal in signals if signal}
+
+
+def _nested_dict(value: Mapping[str, Any], keys: Iterable[str]) -> Dict[str, Any]:
+    merged: Dict[str, Any] = {}
+    for key in keys:
+        candidate = value.get(key)
+        if isinstance(candidate, Mapping):
+            merged.update(copy.deepcopy(dict(candidate)))
+    return merged
+
+
+def _first_number(
+    raw: Mapping[str, Any],
+    attributes: Mapping[str, Any],
+    keys: Iterable[str],
+) -> Optional[int]:
+    for source in (raw, attributes):
+        for key in keys:
+            value = source.get(key)
+            if isinstance(value, (int, float)):
+                return int(value)
+    return None
+
+
+def _framework_span_event(span: Mapping[str, Any], framework: str) -> SimulationEvent:
+    return SimulationEvent(
+        type="framework_span",
+        name=str(span.get("name") or "framework_span"),
+        payload=copy.deepcopy(dict(span)),
+        timestamp_ms=span.get("timestamp_ms"),
+        metadata={
+            "framework": str(span.get("framework") or framework),
+            "signals": list(span.get("signals", [])),
+        },
+    )
+
+
+def _find_framework_span(
+    spans: Iterable[Mapping[str, Any]],
+    span_id: str,
+) -> Optional[Mapping[str, Any]]:
+    if not span_id:
+        return None
+    for span in spans:
+        if span_id in {str(span.get("id")), str(span.get("span_id")), str(span.get("name"))}:
+            return span
+    return None
 
 
 DEFAULT_AUTONOMY_STAGES = ["observe", "orient", "plan", "act", "verify", "reflect", "memory"]
