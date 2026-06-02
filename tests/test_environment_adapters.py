@@ -16,10 +16,12 @@ from fi.simulate import (
     ToolFaultInjectionEnvironment,
     ToolMockEnvironment,
     VoiceEnvironment,
+    load_voice_export,
     load_playwright_trace_export,
     load_framework_trace_export,
     normalize_framework_trace_events,
     normalize_framework_trace_export,
+    normalize_voice_export,
     normalize_playwright_trace_export,
 )
 from fi.simulate.simulation.engines.local_text import LocalTextEngine
@@ -1415,6 +1417,126 @@ async def test_voice_environment_replays_frames_noise_and_overlap_timeline():
     assert any(event.name == "overlapping_speech" for event in result.events)
     assert voice_traces[-1]["frame_replay"][-1]["frame_type"] == "InterruptionFrame"
     assert voice_traces[-1]["timeline"]
+
+
+@pytest.mark.asyncio
+async def test_voice_environment_loads_voice_exports_waveforms_diarization_and_quality():
+    voice_export = {
+        "framework": "livekit",
+        "events": [
+            {
+                "id": "caller_1",
+                "event": "user_input_transcribed",
+                "transcript": "Billing issue for order 123.",
+                "speaker_id": "caller",
+                "language": "en",
+                "is_final": True,
+                "timestamp_ms": 160,
+            },
+            {
+                "event": "agent_state_changed",
+                "old_state": "thinking",
+                "new_state": "speaking",
+                "timestamp_ms": 760,
+            },
+            {
+                "event": "overlapping_speech",
+                "overlap_ms": 140,
+                "probability": 0.73,
+                "timestamp_ms": 1180,
+            },
+        ],
+        "frames": [
+            {
+                "id": "raw_in",
+                "frame_type": "InputAudioRawFrame",
+                "sample_rate": 24000,
+                "num_channels": 1,
+                "num_frames": 4800,
+            },
+            {
+                "id": "pc_transcript",
+                "frame_type": "TranscriptionFrame",
+                "text": "Billing issue for order 123.",
+                "user_id": "caller",
+            },
+            {"id": "pc_interrupt", "frame_type": "InterruptionFrame", "timestamp_ms": 1185},
+            {"id": "pc_audio_out", "frame_type": "OutputAudioRawFrame", "num_frames": 2400},
+        ],
+        "recordings": [
+            {
+                "id": "caller_wave",
+                "speaker": "caller",
+                "duration_ms": 1700,
+                "sample_rate_hz": 24000,
+                "snr_db": 32,
+                "mos": 4.3,
+                "clipping_ratio": 0.002,
+                "jitter_ms": 18,
+                "packet_loss_pct": 0.4,
+            }
+        ],
+        "speaker_segments": [
+            {"id": "seg_caller", "speaker": "caller", "start_ms": 0, "end_ms": 1700, "confidence": 0.96},
+            {"id": "seg_agent", "speaker": "agent", "start_ms": 760, "end_ms": 1220, "confidence": 0.93},
+        ],
+        "perceptual_metrics": {
+            "overall": {
+                "snr_db": 32,
+                "mos": 4.3,
+                "clipping_ratio": 0.002,
+                "jitter_ms": 18,
+                "packet_loss_pct": 0.4,
+            }
+        },
+    }
+    normalized = normalize_voice_export(voice_export, framework="livekit")
+    assert normalized["framework"] == "livekit"
+    assert normalized["utterances"][0]["speaker"] == "caller"
+    assert normalized["perceptual_metrics"]["overall"]["mos"] == 4.3
+
+    async def agent(input):
+        return AgentResponse(
+            content="I will route the call and inspect the voice export.",
+            tool_calls=[
+                {"id": "route", "name": "route_call", "arguments": {"route": "billing"}},
+                {"id": "stt", "name": "transcribe_audio", "arguments": {"id": "caller_1"}},
+                {"id": "status", "name": "voice_status", "arguments": {}},
+            ],
+        )
+
+    report = await LocalTextEngine().run(
+        scenario=_scenario(),
+        agent_callback=agent,
+        environment=load_voice_export(
+            voice_export,
+            framework="livekit",
+            sample_rate_hz=24000,
+            routes={"default": {"agent": "support"}, "billing": {"agent": "billing"}},
+        ),
+        max_turns=1,
+        min_turns=1,
+        modality="voice",
+    )
+
+    result = report.results[0]
+    voice_state = result.metadata["environment_state"]["voice"]
+    voice_traces = [
+        artifact.data
+        for artifact in result.artifacts
+        if artifact.type == "trace" and artifact.metadata.get("kind") == "voice_trace"
+    ]
+
+    assert voice_state["current_route"] == "billing"
+    assert voice_state["transcript_history"][-1]["transcript"] == "Billing issue for order 123."
+    assert {segment["speaker"] for segment in voice_state["diarization"]} == {"agent", "caller"}
+    assert voice_state["perceptual_metrics"]["overall"]["snr_db"] == 32
+    assert any(waveform["id"] == "caller_wave" and waveform["sample_count"] == 40800 for waveform in voice_state["waveforms"])
+    assert any(event.name == "voice_audio_quality" for event in result.events)
+    assert any(event.name == "speaker_segment" for event in result.events)
+    assert any(artifact.type == "audio" and artifact.metadata.get("id") == "caller_wave" for artifact in result.artifacts)
+    assert voice_traces[-1]["export_framework"] == "livekit"
+    assert voice_traces[-1]["perceptual_metrics"]["overall"]["packet_loss_pct"] == 0.4
 
 
 @pytest.mark.asyncio

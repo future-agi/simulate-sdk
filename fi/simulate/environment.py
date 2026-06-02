@@ -1081,6 +1081,73 @@ def load_playwright_trace_export(
     )
 
 
+def normalize_voice_export(
+    voice_export: Any,
+    *,
+    framework: str = "voice",
+    source_label: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Normalize LiveKit/Pipecat/realtime voice exports into VoiceEnvironment fixtures."""
+
+    return _normalize_voice_export(
+        voice_export,
+        framework=framework,
+        source_label=source_label,
+    )
+
+
+def load_voice_export(
+    source: str | os.PathLike[str] | Mapping[str, Any] | Iterable[Any],
+    *,
+    framework: str = "voice",
+    headers: Optional[Mapping[str, str]] = None,
+    timeout: float = 30.0,
+    sample_rate_hz: int = 16000,
+    stt_latency_ms: int = 180,
+    tts_latency_ms: int = 320,
+    state: Optional[Dict[str, Any]] = None,
+    latency_profile: Optional[Mapping[str, Any]] = None,
+    noise_profile: Optional[Mapping[str, Any]] = None,
+    allow_interruptions: bool = True,
+    interruption_policy: Optional[Mapping[str, Any]] = None,
+    routes: Optional[Mapping[str, Any] | Iterable[str]] = None,
+    initial_route: Optional[str] = None,
+) -> "VoiceEnvironment":
+    """Load a local/HTTP voice export and return a voice replay environment."""
+
+    if isinstance(source, (str, os.PathLike)):
+        return VoiceEnvironment(
+            sample_rate_hz=sample_rate_hz,
+            stt_latency_ms=stt_latency_ms,
+            tts_latency_ms=tts_latency_ms,
+            state=state,
+            latency_profile=latency_profile,
+            noise_profile=noise_profile,
+            allow_interruptions=allow_interruptions,
+            interruption_policy=interruption_policy,
+            routes=routes,
+            initial_route=initial_route,
+            voice_export_source=source,
+            export_framework=framework,
+            export_headers=headers,
+            export_timeout=timeout,
+        )
+    return VoiceEnvironment(
+        sample_rate_hz=sample_rate_hz,
+        stt_latency_ms=stt_latency_ms,
+        tts_latency_ms=tts_latency_ms,
+        state=state,
+        latency_profile=latency_profile,
+        noise_profile=noise_profile,
+        allow_interruptions=allow_interruptions,
+        interruption_policy=interruption_policy,
+        routes=routes,
+        initial_route=initial_route,
+        voice_export=source,
+        export_framework=framework,
+    )
+
+
 class VoiceEnvironment(EnvironmentAdapter):
     """Local voice/realtime environment with VAD/STT/TTS replay, routing, and interruption tools."""
 
@@ -1103,15 +1170,86 @@ class VoiceEnvironment(EnvironmentAdapter):
         interruption_policy: Optional[Mapping[str, Any]] = None,
         routes: Optional[Mapping[str, Any] | Iterable[str]] = None,
         initial_route: Optional[str] = None,
+        voice_export: Optional[Any] = None,
+        voice_export_source: Optional[str | os.PathLike[str]] = None,
+        export_framework: str = "voice",
+        export_headers: Optional[Mapping[str, str]] = None,
+        export_timeout: float = 30.0,
+        waveforms: Optional[Iterable[str | Mapping[str, Any]]] = None,
+        diarization: Optional[Iterable[Mapping[str, Any]] | Mapping[str, Any]] = None,
+        perceptual_metrics: Optional[Mapping[str, Any] | Iterable[Mapping[str, Any]]] = None,
     ) -> None:
         self.sample_rate_hz = sample_rate_hz
         self.stt_latency_ms = stt_latency_ms
         self.tts_latency_ms = tts_latency_ms
         self.initial_state = copy.deepcopy(state or {})
         self.state = copy.deepcopy(self.initial_state)
-        self.utterances = _normalize_voice_utterances(utterances or [], audio_uris or [])
-        self.event_replay = [_normalize_voice_event(item) for item in event_replay or []]
-        self.frame_replay = [_normalize_voice_frame(item) for item in frame_replay or []]
+        export_payload: Dict[str, Any] = {
+            "framework": _normalize_voice_export_framework(export_framework),
+            "utterances": [],
+            "event_replay": [],
+            "frame_replay": [],
+            "waveforms": [],
+            "diarization": [],
+            "perceptual_metrics": {},
+            "metadata": {},
+        }
+        if voice_export_source is not None:
+            loaded_export = _load_framework_trace_export_source(
+                voice_export_source,
+                headers=export_headers,
+                timeout=export_timeout,
+            )
+            export_payload = _merge_voice_export_payloads(
+                export_payload,
+                normalize_voice_export(
+                    loaded_export,
+                    framework=export_framework,
+                    source_label=_framework_trace_source_label(voice_export_source),
+                ),
+            )
+        if voice_export is not None:
+            export_payload = _merge_voice_export_payloads(
+                export_payload,
+                normalize_voice_export(voice_export, framework=export_framework),
+            )
+
+        self.voice_export_framework = str(export_payload.get("framework") or _normalize_voice_export_framework(export_framework))
+        self.voice_export_metadata = copy.deepcopy(dict(export_payload.get("metadata", {})))
+        self.utterances = _normalize_voice_utterances(
+            [
+                *copy.deepcopy(list(export_payload.get("utterances", []))),
+                *list(utterances or []),
+            ],
+            audio_uris or [],
+        )
+        self.event_replay = [
+            *[_normalize_voice_event(item) for item in export_payload.get("event_replay", [])],
+            *[_normalize_voice_event(item) for item in event_replay or []],
+        ]
+        self.frame_replay = [
+            *[_normalize_voice_frame(item) for item in export_payload.get("frame_replay", [])],
+            *[_normalize_voice_frame(item) for item in frame_replay or []],
+        ]
+        self.waveforms = _normalize_voice_waveforms(
+            [
+                *copy.deepcopy(list(export_payload.get("waveforms", []))),
+                *list(waveforms or []),
+            ],
+            utterances=self.utterances,
+            sample_rate_hz=sample_rate_hz,
+        )
+        self.diarization = _normalize_voice_diarization(
+            [
+                *copy.deepcopy(list(export_payload.get("diarization", []))),
+                *_as_iterable(diarization),
+            ]
+        )
+        self.perceptual_metrics = _merge_voice_perceptual_metrics(
+            export_payload.get("perceptual_metrics"),
+            perceptual_metrics,
+            waveforms=self.waveforms,
+        )
         self.latency_profile = _normalize_latency_profile(
             latency_profile,
             stt_latency_ms=stt_latency_ms,
@@ -1145,6 +1283,11 @@ class VoiceEnvironment(EnvironmentAdapter):
             for artifact in (_voice_artifact_from_utterance(item, self.sample_rate_hz) for item in self.utterances)
             if artifact is not None
         ]
+        artifacts.extend(
+            artifact
+            for artifact in (_voice_artifact_from_waveform(item, self.sample_rate_hz) for item in self.waveforms)
+            if artifact is not None
+        )
         artifacts.append(self._trace_artifact())
         events = [
             SimulationEvent(
@@ -1158,9 +1301,39 @@ class VoiceEnvironment(EnvironmentAdapter):
                     "initial_route": self.initial_route,
                     "frame_count": len(self.frame_replay),
                     "noise_profile": copy.deepcopy(self.noise_profile),
+                    "export_framework": self.voice_export_framework,
+                    "waveform_count": len(self.waveforms),
+                    "diarization_segments": len(self.diarization),
+                    "perceptual_metrics": copy.deepcopy(self.perceptual_metrics.get("overall", {})),
                 },
             )
         ]
+        for waveform in self.waveforms:
+            self.timeline.append(_voice_timeline_entry("waveform", waveform, speaker=waveform.get("speaker")))
+            events.append(
+                SimulationEvent(
+                    type="voice",
+                    name="voice_waveform_ready",
+                    payload=copy.deepcopy(waveform),
+                )
+            )
+        for segment in self.diarization:
+            self.timeline.append(_voice_timeline_entry("diarization", segment, speaker=segment.get("speaker")))
+            events.append(
+                SimulationEvent(
+                    type="voice",
+                    name="speaker_segment",
+                    payload=copy.deepcopy(segment),
+                )
+            )
+        if self.perceptual_metrics.get("overall") or self.perceptual_metrics.get("segments"):
+            events.append(
+                SimulationEvent(
+                    type="voice",
+                    name="voice_audio_quality",
+                    payload=copy.deepcopy(self.perceptual_metrics),
+                )
+            )
         for utterance in self.utterances:
             vad_payload = {
                 "id": utterance["id"],
@@ -1269,6 +1442,9 @@ class VoiceEnvironment(EnvironmentAdapter):
                     "frames": len(self.frame_replay),
                     "events": len(events),
                     "routes": sorted(self.routes.keys()),
+                    "export_framework": self.voice_export_framework,
+                    "waveforms": len(self.waveforms),
+                    "diarization_segments": len(self.diarization),
                 }
             },
         )
@@ -1469,9 +1645,14 @@ class VoiceEnvironment(EnvironmentAdapter):
         return {
             "kind": "voice_trace",
             "sample_rate_hz": self.sample_rate_hz,
+            "export_framework": self.voice_export_framework,
+            "export_metadata": copy.deepcopy(self.voice_export_metadata),
             "utterances": copy.deepcopy(self.utterances),
             "event_replay": copy.deepcopy(self.event_replay),
             "frame_replay": copy.deepcopy(self.frame_replay),
+            "waveforms": copy.deepcopy(self.waveforms),
+            "diarization": copy.deepcopy(self.diarization),
+            "perceptual_metrics": copy.deepcopy(self.perceptual_metrics),
             "timeline": copy.deepcopy(self.timeline),
             "overlap_events": copy.deepcopy(self.overlap_events),
             "latency_profile": copy.deepcopy(self.latency_profile),
@@ -1494,6 +1675,9 @@ class VoiceEnvironment(EnvironmentAdapter):
             "transcript_history": copy.deepcopy(self.transcript_history),
             "tts_history": copy.deepcopy(self.tts_history),
             "frame_replay": copy.deepcopy(self.frame_replay),
+            "waveforms": copy.deepcopy(self.waveforms),
+            "diarization": copy.deepcopy(self.diarization),
+            "perceptual_metrics": copy.deepcopy(self.perceptual_metrics),
             "timeline": copy.deepcopy(self.timeline),
             "overlap_events": copy.deepcopy(self.overlap_events),
             "latency_profile": copy.deepcopy(self.latency_profile),
@@ -5636,6 +5820,723 @@ def _normalize_voice_utterances(
             }
         )
     return normalized
+
+
+def _normalize_voice_export(
+    voice_export: Any,
+    *,
+    framework: str,
+    source_label: Optional[str],
+) -> Dict[str, Any]:
+    framework_name = _normalize_voice_export_framework(
+        _get_mapping_value(voice_export, "framework")
+        or _get_mapping_value(voice_export, "source")
+        or framework
+    )
+    payload: Dict[str, Any] = {
+        "framework": framework_name,
+        "utterances": [],
+        "event_replay": [],
+        "frame_replay": [],
+        "waveforms": [],
+        "diarization": [],
+        "perceptual_metrics": {},
+        "metadata": {"framework": framework_name},
+    }
+    if source_label:
+        payload["metadata"]["source"] = source_label
+
+    if isinstance(voice_export, Mapping):
+        export = copy.deepcopy(dict(voice_export))
+        payload["metadata"].update(copy.deepcopy(dict(export.get("metadata", {}))))
+        for key in ("utterances", "transcripts", "transcriptions"):
+            for index, item in enumerate(_as_iterable(export.get(key))):
+                utterance = _voice_utterance_from_export_record(item, key, index=index)
+                if utterance:
+                    payload["utterances"].append(utterance)
+        for key in ("audio", "audio_artifacts", "recordings", "waveforms"):
+            payload["waveforms"].extend(_normalize_voice_waveforms(_as_iterable(export.get(key)), sample_rate_hz=16000))
+        for key in ("diarization", "speaker_segments", "speakers"):
+            payload["diarization"].extend(_normalize_voice_diarization(export.get(key)))
+        payload["perceptual_metrics"] = _merge_voice_perceptual_metrics(
+            export.get("perceptual_metrics"),
+            export.get("audio_quality"),
+            export.get("quality_profile"),
+            export.get("metrics") if _looks_like_voice_quality_mapping(_as_mapping(export.get("metrics"))) else None,
+        )
+
+    for index, record in enumerate(_voice_export_records(voice_export)):
+        item = _as_mapping(record)
+        if not item:
+            continue
+        name = _voice_export_record_name(item)
+        if _voice_export_record_is_frame(item, name):
+            payload["frame_replay"].append(_normalize_voice_frame(item))
+        event = _voice_event_from_export_record(item, name)
+        if event:
+            payload["event_replay"].append(event)
+        utterance = _voice_utterance_from_export_record(item, name, index=index)
+        if utterance:
+            payload["utterances"].append(utterance)
+        waveform = _voice_waveform_from_export_record(item, name, index=index)
+        if waveform:
+            payload["waveforms"].append(waveform)
+        payload["diarization"].extend(_normalize_voice_diarization(item.get("diarization") or item.get("speaker_segments")))
+        segment = _voice_diarization_segment_from_record(item, name)
+        if segment:
+            payload["diarization"].append(segment)
+        payload["perceptual_metrics"] = _merge_voice_perceptual_metrics(
+            payload["perceptual_metrics"],
+            _voice_perceptual_metrics_from_record(item),
+        )
+
+    payload["utterances"] = _dedupe_voice_dicts(payload["utterances"], "id")
+    payload["event_replay"] = _dedupe_voice_dicts(payload["event_replay"], "name", include_timestamp=True)
+    payload["frame_replay"] = _dedupe_voice_dicts(payload["frame_replay"], "id", include_timestamp=True)
+    payload["waveforms"] = _dedupe_voice_dicts(payload["waveforms"], "id")
+    payload["diarization"] = _dedupe_voice_dicts(payload["diarization"], "id", include_timestamp=True)
+    payload["perceptual_metrics"] = _merge_voice_perceptual_metrics(
+        payload["perceptual_metrics"],
+        waveforms=payload["waveforms"],
+    )
+    return payload
+
+
+def _merge_voice_export_payloads(*payloads: Mapping[str, Any]) -> Dict[str, Any]:
+    merged: Dict[str, Any] = {
+        "framework": "voice",
+        "utterances": [],
+        "event_replay": [],
+        "frame_replay": [],
+        "waveforms": [],
+        "diarization": [],
+        "perceptual_metrics": {},
+        "metadata": {},
+    }
+    for payload in payloads:
+        if not payload:
+            continue
+        merged["framework"] = str(payload.get("framework") or merged["framework"])
+        merged["metadata"].update(copy.deepcopy(dict(payload.get("metadata", {}))))
+        for key in ("utterances", "event_replay", "frame_replay", "waveforms", "diarization"):
+            merged[key].extend(copy.deepcopy(list(payload.get(key, []))))
+        merged["perceptual_metrics"] = _merge_voice_perceptual_metrics(
+            merged["perceptual_metrics"],
+            payload.get("perceptual_metrics"),
+        )
+    return merged
+
+
+def _normalize_voice_export_framework(value: Any) -> str:
+    normalized = str(value or "voice").strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "livekit_agents": "livekit",
+        "livekit_agent": "livekit",
+        "lk": "livekit",
+        "pipecat_ai": "pipecat",
+        "pipecat_server": "pipecat",
+        "traceai_voice": "traceai",
+        "future_agi": "future_agi",
+        "futureagi": "future_agi",
+    }
+    return aliases.get(normalized, normalized or "voice")
+
+
+def _voice_export_records(voice_export: Any) -> List[Any]:
+    if voice_export is None:
+        return []
+    if hasattr(voice_export, "model_dump"):
+        return _voice_export_records(voice_export.model_dump())
+    if hasattr(voice_export, "dict"):
+        return _voice_export_records(voice_export.dict())
+    if isinstance(voice_export, str):
+        text = voice_export.strip()
+        if text.startswith(("{", "[")) or "\n" in text:
+            return _voice_export_records(_parse_framework_trace_export_text(text))
+        return [{"text": voice_export}]
+    if isinstance(voice_export, Mapping):
+        export = copy.deepcopy(dict(voice_export))
+        records: List[Any] = []
+        for key in (
+            "events",
+            "session_events",
+            "frames",
+            "frame_replay",
+            "records",
+            "items",
+            "results",
+            "messages",
+            "history",
+            "conversation",
+            "transcripts",
+            "transcriptions",
+        ):
+            if key in export:
+                records.extend(_voice_export_records(export[key]))
+        for key in ("data", "result", "payload", "response", "body"):
+            nested = export.get(key)
+            if isinstance(nested, (Mapping, list, tuple)):
+                nested_records = _voice_export_records(nested)
+                if nested_records:
+                    records.extend(nested_records)
+        if records:
+            return records
+        return [export] if _looks_like_voice_export_record(export) else []
+    if isinstance(voice_export, Iterable):
+        records = []
+        for item in voice_export:
+            records.extend(_voice_export_records(item))
+        return records
+    return []
+
+
+def _looks_like_voice_export_record(record: Mapping[str, Any]) -> bool:
+    if not record:
+        return False
+    text = _stringify_dict(record).lower()
+    return any(
+        token in text
+        for token in (
+            "voice",
+            "audio",
+            "speech",
+            "transcript",
+            "transcription",
+            "speaker",
+            "diarization",
+            "frame",
+            "user_input_transcribed",
+            "conversation_item_added",
+            "agent_state_changed",
+            "user_state_changed",
+            "overlapping_speech",
+            "interruption",
+            "on_audio_data",
+            "on_transcript_update",
+        )
+    )
+
+
+def _voice_export_record_name(record: Mapping[str, Any]) -> str:
+    payload = _as_mapping(record.get("payload") or record.get("data"))
+    return str(
+        record.get("name")
+        or record.get("event")
+        or record.get("type")
+        or record.get("frame_type")
+        or payload.get("name")
+        or payload.get("event")
+        or payload.get("type")
+        or payload.get("frame_type")
+        or "voice_event"
+    )
+
+
+def _voice_export_record_is_frame(record: Mapping[str, Any], name: str) -> bool:
+    return bool(record.get("frame_type") or str(name).lower().endswith("frame") or "frame_type" in _as_mapping(record.get("payload")))
+
+
+def _voice_event_from_export_record(record: Mapping[str, Any], name: str) -> Optional[Dict[str, Any]]:
+    if not _looks_like_voice_export_record(record) and not _voice_export_record_is_frame(record, name):
+        return None
+    payload = copy.deepcopy(_as_mapping(record.get("payload") or record.get("data")))
+    for key in (
+        "transcript",
+        "text",
+        "speaker",
+        "speaker_id",
+        "role",
+        "language",
+        "is_final",
+        "confidence",
+        "old_state",
+        "new_state",
+        "route",
+        "latency_ms",
+        "duration_ms",
+        "start_ms",
+        "end_ms",
+        "overlap_ms",
+        "jitter_ms",
+        "packet_loss_pct",
+        "snr_db",
+        "mos",
+    ):
+        if key in record and key not in payload:
+            payload[key] = record[key]
+    event_type = "voice_frame" if _voice_export_record_is_frame(record, name) else "voice"
+    return {
+        "type": event_type,
+        "name": name,
+        "payload": payload,
+        "timestamp_ms": _voice_record_timestamp_ms(record),
+        "metadata": {"source": "voice_export", **copy.deepcopy(dict(record.get("metadata", {})))},
+    }
+
+
+def _voice_utterance_from_export_record(record: Any, name: str, *, index: int) -> Optional[Dict[str, Any]]:
+    item = _as_mapping(record)
+    if not item:
+        return None
+    payload = _as_mapping(item.get("payload") or item.get("data"))
+    event_text = f"{name} {_stringify_dict(item)}".lower()
+    role = str(item.get("role") or payload.get("role") or "").lower()
+    transcript = (
+        item.get("transcript")
+        or payload.get("transcript")
+        or item.get("text")
+        or payload.get("text")
+        or item.get("text_content")
+        or payload.get("text_content")
+    )
+    nested_item = _as_mapping(item.get("item") or payload.get("item"))
+    if transcript is None and nested_item:
+        role = str(nested_item.get("role") or role).lower()
+        transcript = (
+            nested_item.get("transcript")
+            or nested_item.get("text")
+            or nested_item.get("text_content")
+            or _voice_text_from_content(nested_item.get("content"))
+        )
+    if transcript in (None, ""):
+        return None
+    if role and role not in {"user", "caller", "participant", "human"} and not any(
+        token in event_text for token in ("transcription", "transcribed", "user_input", "user")
+    ):
+        return None
+    if not (
+        role in {"user", "caller", "participant", "human"}
+        or any(token in event_text for token in ("transcription", "transcribed", "user_input", "user"))
+    ):
+        return None
+    utterance_id = (
+        item.get("id")
+        or item.get("utterance_id")
+        or item.get("speech_id")
+        or item.get("frame_id")
+        or payload.get("id")
+        or payload.get("speech_id")
+        or f"voice_export_utt_{index + 1}"
+    )
+    speaker = (
+        item.get("speaker")
+        or payload.get("speaker")
+        or item.get("speaker_id")
+        or payload.get("speaker_id")
+        or item.get("user_id")
+        or payload.get("user_id")
+        or "user"
+    )
+    result = {
+        "id": str(utterance_id),
+        "speaker": str(speaker),
+        "transcript": str(transcript),
+    }
+    for key in ("language", "confidence", "turn_index", "start_ms", "end_ms", "duration_ms", "latency_ms", "audio_uri", "audio_path"):
+        value = item.get(key, payload.get(key))
+        if value is not None:
+            result[key] = value
+    if item.get("is_final", payload.get("is_final")) is not None:
+        result["is_final"] = bool(item.get("is_final", payload.get("is_final")))
+    return result
+
+
+def _voice_waveform_from_export_record(record: Mapping[str, Any], name: str, *, index: int) -> Optional[Dict[str, Any]]:
+    payload = _as_mapping(record.get("payload") or record.get("data"))
+    text = f"{name} {_stringify_dict(record)}".lower()
+    if not any(token in text for token in ("audio", "waveform", "recording", "webrtc", "rtp", "on_user_turn_audio_data", "on_bot_turn_audio_data")):
+        return None
+    waveform = {
+        "id": str(record.get("id") or record.get("frame_id") or payload.get("id") or f"voice_export_audio_{index + 1}"),
+        "source": "voice_export",
+        "speaker": record.get("speaker", payload.get("speaker", payload.get("speaker_id", payload.get("user_id")))),
+    }
+    for source_key, target_key in (
+        ("uri", "uri"),
+        ("audio_uri", "uri"),
+        ("recording_uri", "uri"),
+        ("url", "uri"),
+        ("path", "path"),
+        ("audio_path", "path"),
+        ("audio", "data"),
+        ("audio_data", "data"),
+        ("data", "data"),
+        ("sample_rate_hz", "sample_rate_hz"),
+        ("sample_rate", "sample_rate_hz"),
+        ("num_channels", "channels"),
+        ("channels", "channels"),
+        ("num_frames", "sample_count"),
+        ("sample_count", "sample_count"),
+        ("duration_ms", "duration_ms"),
+        ("start_ms", "start_ms"),
+        ("end_ms", "end_ms"),
+        ("transcript", "transcript"),
+        ("text", "transcript"),
+    ):
+        value = record.get(source_key, payload.get(source_key))
+        if value is not None:
+            waveform[target_key] = value
+    waveform.update(_voice_quality_from_mapping(record))
+    waveform.update(_voice_quality_from_mapping(payload))
+    return waveform
+
+
+def _voice_text_from_content(content: Any) -> Optional[str]:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            else:
+                item_dict = _as_mapping(item)
+                text = item_dict.get("text") or item_dict.get("transcript")
+                if text:
+                    parts.append(str(text))
+        return " ".join(parts) if parts else None
+    return None
+
+
+def _voice_record_timestamp_ms(record: Mapping[str, Any]) -> Optional[int]:
+    for key in ("timestamp_ms", "time_ms", "start_ms"):
+        value = _voice_int(record.get(key))
+        if value is not None:
+            return value
+    for key in ("timestamp", "created_at", "detected_at"):
+        value = _voice_float(record.get(key))
+        if value is not None:
+            return int(value * 1000 if value < 10_000 else value)
+    return None
+
+
+def _normalize_voice_waveforms(
+    waveforms: Iterable[str | Mapping[str, Any]],
+    *,
+    utterances: Optional[Iterable[Mapping[str, Any]]] = None,
+    sample_rate_hz: int = 16000,
+) -> List[Dict[str, Any]]:
+    normalized: List[Dict[str, Any]] = []
+    for index, value in enumerate(waveforms):
+        if value in (None, ""):
+            continue
+        item = _normalize_voice_waveform(value, index=index, sample_rate_hz=sample_rate_hz)
+        normalized.append(item)
+    seen_ids = {str(item.get("id")) for item in normalized}
+    for index, utterance in enumerate(utterances or []):
+        utterance_id = str(utterance.get("id") or f"utt_{index + 1}")
+        if utterance_id in seen_ids:
+            continue
+        normalized.append(_voice_waveform_from_utterance(utterance, sample_rate_hz=sample_rate_hz))
+        seen_ids.add(utterance_id)
+    return _dedupe_voice_dicts(normalized, "id")
+
+
+def _normalize_voice_waveform(value: str | Mapping[str, Any], *, index: int, sample_rate_hz: int) -> Dict[str, Any]:
+    if isinstance(value, str):
+        location_key = "uri" if value.startswith(("http://", "https://", "file://", "data:")) else "path"
+        item: Dict[str, Any] = {location_key: value}
+    else:
+        item = copy.deepcopy(dict(value))
+    item.setdefault("id", f"waveform_{index + 1}")
+    item["id"] = str(item["id"])
+    if "sample_rate" in item and "sample_rate_hz" not in item:
+        item["sample_rate_hz"] = item.pop("sample_rate")
+    item.setdefault("sample_rate_hz", sample_rate_hz)
+    if "num_channels" in item and "channels" not in item:
+        item["channels"] = item.pop("num_channels")
+    item.setdefault("channels", 1)
+    if "num_frames" in item and "sample_count" not in item:
+        item["sample_count"] = item.pop("num_frames")
+    if item.get("duration_ms") is None and item.get("start_ms") is not None and item.get("end_ms") is not None:
+        item["duration_ms"] = max(0, int(item["end_ms"]) - int(item["start_ms"]))
+    if item.get("sample_count") is None and item.get("duration_ms") is not None:
+        item["sample_count"] = int(float(item["sample_rate_hz"]) * float(item["duration_ms"]) / 1000)
+    item.update(_voice_quality_from_mapping(item))
+    if item.get("uri") is None and item.get("path") is None and item.get("data") is None:
+        item["data"] = _voice_synthetic_waveform_data(item)
+    return item
+
+
+def _voice_waveform_from_utterance(utterance: Mapping[str, Any], *, sample_rate_hz: int) -> Dict[str, Any]:
+    duration_ms = utterance.get("duration_ms")
+    if duration_ms is None and utterance.get("start_ms") is not None and utterance.get("end_ms") is not None:
+        duration_ms = max(0, int(utterance["end_ms"]) - int(utterance["start_ms"]))
+    if duration_ms is None:
+        transcript = str(utterance.get("transcript", ""))
+        duration_ms = max(320, min(10_000, 180 + len(transcript.split()) * 260))
+    item = {
+        "id": str(utterance.get("id") or "utterance_waveform"),
+        "speaker": utterance.get("speaker", "user"),
+        "transcript": utterance.get("transcript", ""),
+        "sample_rate_hz": utterance.get("sample_rate_hz", sample_rate_hz),
+        "channels": utterance.get("channels", 1),
+        "duration_ms": int(duration_ms),
+        "source": "synthetic_utterance",
+    }
+    for key in ("audio_uri", "uri", "audio_path", "path", "audio_data", "data", "mime_type", "snr_db", "mos", "clipping_ratio", "jitter_ms", "packet_loss_pct", "rms_db", "peak_db"):
+        if key in utterance:
+            target = {
+                "audio_uri": "uri",
+                "audio_path": "path",
+                "audio_data": "data",
+            }.get(key, key)
+            item[target] = utterance[key]
+    item["sample_count"] = int(float(item["sample_rate_hz"]) * float(item["duration_ms"]) / 1000)
+    item.update(_voice_quality_from_mapping(item))
+    if item.get("uri") is None and item.get("path") is None and item.get("data") is None:
+        item["data"] = _voice_synthetic_waveform_data(item)
+    return item
+
+
+def _voice_artifact_from_waveform(
+    waveform: Mapping[str, Any],
+    sample_rate_hz: int,
+) -> Optional[SimulationArtifact]:
+    return SimulationArtifact(
+        type="audio",
+        uri=str(waveform.get("uri")) if waveform.get("uri") is not None else None,
+        path=str(waveform.get("path")) if waveform.get("path") is not None else None,
+        data=waveform.get("data"),
+        mime_type=str(waveform.get("mime_type", "audio/wav")),
+        role=str(waveform.get("role", "environment")),
+        metadata={
+            "id": waveform.get("id"),
+            "speaker": waveform.get("speaker", "user"),
+            "transcript": waveform.get("transcript", ""),
+            "sample_rate_hz": waveform.get("sample_rate_hz", sample_rate_hz),
+            "channels": waveform.get("channels", 1),
+            "duration_ms": waveform.get("duration_ms"),
+            "sample_count": waveform.get("sample_count"),
+            "source": waveform.get("source", "voice_waveform"),
+            **_voice_quality_from_mapping(waveform),
+        },
+    )
+
+
+def _voice_synthetic_waveform_data(waveform: Mapping[str, Any]) -> Dict[str, Any]:
+    sample_count = int(waveform.get("sample_count") or 0)
+    preview_len = max(8, min(64, sample_count or 32))
+    seed = sum(ord(ch) for ch in str(waveform.get("transcript") or waveform.get("id") or "voice"))
+    preview = [int((((seed + index * 37) % 2048) - 1024) * 0.8) for index in range(preview_len)]
+    return {
+        "synthetic": True,
+        "encoding": "pcm16_preview",
+        "preview_samples": preview,
+        "sample_count": sample_count,
+        "sample_rate_hz": waveform.get("sample_rate_hz"),
+        "duration_ms": waveform.get("duration_ms"),
+    }
+
+
+def _normalize_voice_diarization(value: Any) -> List[Dict[str, Any]]:
+    if value in (None, ""):
+        return []
+    if isinstance(value, Mapping):
+        for key in ("segments", "speaker_segments", "diarization"):
+            if key in value:
+                return _normalize_voice_diarization(value[key])
+        values = [value]
+    else:
+        values = _as_iterable(value)
+    segments: List[Dict[str, Any]] = []
+    for index, raw in enumerate(values):
+        item = _as_mapping(raw)
+        if not item:
+            continue
+        segment = {
+            "id": str(item.get("id") or item.get("segment_id") or f"speaker_segment_{index + 1}"),
+            "speaker": str(item.get("speaker") or item.get("speaker_id") or item.get("user_id") or f"speaker_{index + 1}"),
+            "start_ms": _voice_int(item.get("start_ms", item.get("start"))),
+            "end_ms": _voice_int(item.get("end_ms", item.get("end"))),
+            "confidence": _voice_float(item.get("confidence")),
+            "overlap": bool(item.get("overlap", item.get("overlapping", False))),
+        }
+        if segment["end_ms"] is None and segment["start_ms"] is not None and item.get("duration_ms") is not None:
+            segment["end_ms"] = segment["start_ms"] + int(item["duration_ms"])
+        if item.get("transcript") is not None:
+            segment["transcript"] = str(item["transcript"])
+        segments.append({key: value for key, value in segment.items() if value is not None})
+    return segments
+
+
+def _voice_diarization_segment_from_record(record: Mapping[str, Any], name: str) -> Optional[Dict[str, Any]]:
+    text = f"{name} {_stringify_dict(record)}".lower()
+    if not any(token in text for token in ("diarization", "speaker_segment", "speaker turn", "speaker_turn")):
+        return None
+    return (_normalize_voice_diarization(record) or [None])[0]
+
+
+def _merge_voice_perceptual_metrics(*values: Any, waveforms: Optional[Iterable[Mapping[str, Any]]] = None) -> Dict[str, Any]:
+    overall: Dict[str, Any] = {}
+    segments: List[Dict[str, Any]] = []
+    for value in values:
+        normalized = _normalize_voice_perceptual_metrics(value)
+        overall.update(copy.deepcopy(normalized.get("overall", {})))
+        segments.extend(copy.deepcopy(normalized.get("segments", [])))
+    for waveform in waveforms or []:
+        quality = _voice_quality_from_mapping(waveform)
+        if quality:
+            segments.append({"id": waveform.get("id"), "speaker": waveform.get("speaker"), **quality})
+    if not overall and segments:
+        numeric_keys = sorted({key for item in segments for key, value in item.items() if isinstance(value, (int, float))})
+        for key in numeric_keys:
+            values_for_key = [float(item[key]) for item in segments if isinstance(item.get(key), (int, float))]
+            if values_for_key:
+                overall[key] = round(sum(values_for_key) / len(values_for_key), 4)
+    return {
+        "overall": overall,
+        "segments": _dedupe_voice_dicts(segments, "id", include_timestamp=True),
+    }
+
+
+def _normalize_voice_perceptual_metrics(value: Any) -> Dict[str, Any]:
+    if value in (None, ""):
+        return {"overall": {}, "segments": []}
+    if isinstance(value, Mapping):
+        item = copy.deepcopy(dict(value))
+        overall = _voice_quality_from_mapping(item)
+        if "overall" in item:
+            overall.update(_voice_quality_from_mapping(_as_mapping(item.get("overall"))))
+        segments: List[Dict[str, Any]] = []
+        for key in ("segments", "items", "turns", "frames"):
+            for index, raw in enumerate(_as_iterable(item.get(key))):
+                segment = _as_mapping(raw)
+                quality = _voice_quality_from_mapping(segment)
+                if quality:
+                    segments.append(
+                        {
+                            "id": segment.get("id") or segment.get("segment_id") or f"quality_segment_{index + 1}",
+                            "speaker": segment.get("speaker") or segment.get("speaker_id"),
+                            **quality,
+                        }
+                    )
+        return {"overall": overall, "segments": segments}
+    segments = []
+    for index, raw in enumerate(_as_iterable(value)):
+        segment = _as_mapping(raw)
+        quality = _voice_quality_from_mapping(segment)
+        if quality:
+            segments.append({"id": segment.get("id") or f"quality_segment_{index + 1}", **quality})
+    return {"overall": {}, "segments": segments}
+
+
+def _voice_perceptual_metrics_from_record(record: Mapping[str, Any]) -> Dict[str, Any]:
+    return _merge_voice_perceptual_metrics(
+        record.get("perceptual_metrics"),
+        record.get("audio_quality"),
+        record.get("quality_profile"),
+        record.get("metrics") if _looks_like_voice_quality_mapping(_as_mapping(record.get("metrics"))) else None,
+        _voice_quality_from_mapping(record),
+    )
+
+
+def _looks_like_voice_quality_mapping(value: Mapping[str, Any]) -> bool:
+    return bool(value) and bool(_voice_quality_from_mapping(value))
+
+
+def _voice_quality_from_mapping(value: Mapping[str, Any]) -> Dict[str, float]:
+    if not value:
+        return {}
+    aliases = {
+        "snr": "snr_db",
+        "snr_db": "snr_db",
+        "signal_to_noise_ratio_db": "snr_db",
+        "mos": "mos",
+        "polqa_mos": "mos",
+        "p863_mos": "mos",
+        "pesq": "pesq",
+        "pesq_mos": "pesq",
+        "stoi": "stoi",
+        "clipping_ratio": "clipping_ratio",
+        "clip_ratio": "clipping_ratio",
+        "clipped_ratio": "clipping_ratio",
+        "clipping_pct": "clipping_ratio",
+        "clipping_percent": "clipping_ratio",
+        "jitter_ms": "jitter_ms",
+        "jitter": "jitter_ms",
+        "jitter_seconds": "jitter_ms",
+        "packet_loss_pct": "packet_loss_pct",
+        "packet_loss_percent": "packet_loss_pct",
+        "fraction_lost": "packet_loss_pct",
+        "rms_db": "rms_db",
+        "peak_db": "peak_db",
+        "noise_db": "noise_db",
+        "processed_noise_db": "processed_noise_db",
+    }
+    result: Dict[str, float] = {}
+    for raw_key, canonical in aliases.items():
+        if raw_key not in value:
+            continue
+        raw = _voice_float(value.get(raw_key))
+        if raw is None:
+            continue
+        if raw_key == "jitter_seconds" or (raw_key == "jitter" and raw <= 10):
+            raw *= 1000
+        if raw_key in {"fraction_lost", "clipping_pct", "clipping_percent"} and raw <= 1:
+            raw *= 100
+        if canonical == "clipping_ratio" and raw_key in {"clipping_pct", "clipping_percent"}:
+            raw = raw / 100
+        result[canonical] = raw
+    packets_lost = _voice_float(value.get("packets_lost", value.get("packetsLost")))
+    packets_received = _voice_float(value.get("packets_received", value.get("packetsReceived")))
+    if "packet_loss_pct" not in result and packets_lost is not None and packets_received is not None:
+        denominator = packets_lost + packets_received
+        if denominator > 0:
+            result["packet_loss_pct"] = round((packets_lost / denominator) * 100, 4)
+    return result
+
+
+def _voice_int(value: Any) -> Optional[int]:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        return int(float(str(value)))
+    except (TypeError, ValueError):
+        return None
+
+
+def _voice_float(value: Any) -> Optional[float]:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        return float(str(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _as_mapping(value: Any) -> Dict[str, Any]:
+    if hasattr(value, "model_dump"):
+        return _as_mapping(value.model_dump())
+    if hasattr(value, "dict"):
+        return _as_mapping(value.dict())
+    return copy.deepcopy(dict(value)) if isinstance(value, Mapping) else {}
+
+
+def _get_mapping_value(value: Any, key: str) -> Any:
+    return value.get(key) if isinstance(value, Mapping) else None
+
+
+def _dedupe_voice_dicts(
+    items: Iterable[Mapping[str, Any]],
+    key: str,
+    *,
+    include_timestamp: bool = False,
+) -> List[Dict[str, Any]]:
+    seen: set[tuple[Any, ...]] = set()
+    deduped: List[Dict[str, Any]] = []
+    for item in items:
+        item_dict = copy.deepcopy(dict(item))
+        identity = (
+            item_dict.get(key),
+            item_dict.get("timestamp_ms") if include_timestamp else None,
+            item_dict.get("start_ms") if include_timestamp else None,
+        )
+        if identity in seen:
+            continue
+        seen.add(identity)
+        deduped.append(item_dict)
+    return deduped
 
 
 def _voice_artifact_from_utterance(
