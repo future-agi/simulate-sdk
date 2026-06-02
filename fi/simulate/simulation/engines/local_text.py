@@ -1,10 +1,16 @@
 from __future__ import annotations
 
 import time
-from typing import Any, Callable, Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional
 
 from fi.simulate.agent.generic import wrap_agent
 from fi.simulate.agent.wrapper import AgentInput, AgentResponse, AgentWrapper, SimulationArtifact, SimulationEvent
+from fi.simulate.environment import (
+    EnvironmentAdapter,
+    EnvironmentSnapshot,
+    ToolExecutionResult,
+    coerce_environment_adapters,
+)
 from fi.simulate.simulation.engines.base import BaseEngine
 from fi.simulate.simulation.models import Persona, Scenario, TestCaseResult, TestReport
 from fi.simulate.simulation.synthetic import SyntheticDataGenerator
@@ -32,6 +38,8 @@ class LocalTextEngine(BaseEngine):
         modality: str = "text",
         artifacts: Optional[List[SimulationArtifact | Dict[str, Any]]] = None,
         events: Optional[List[SimulationEvent | Dict[str, Any]]] = None,
+        environment: Optional[EnvironmentAdapter | Iterable[EnvironmentAdapter]] = None,
+        auto_execute_tools: bool = True,
         stop_when: Optional[Callable[[List[Dict[str, Any]], Persona], bool]] = None,
         agent_wrapper_kwargs: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
@@ -55,6 +63,9 @@ class LocalTextEngine(BaseEngine):
         attack_list = list(attacks or ["prompt_injection"])
         base_artifacts = [_coerce_artifact(artifact) for artifact in artifacts or []]
         base_events = [_coerce_event(event) for event in events or []]
+        environment_adapters = coerce_environment_adapters(
+            environment or kwargs.get("environments")
+        )
 
         results = []
         for index, persona in enumerate(scenario.dataset):
@@ -70,6 +81,8 @@ class LocalTextEngine(BaseEngine):
                     modality=modality,
                     base_artifacts=base_artifacts,
                     base_events=base_events,
+                    environment_adapters=environment_adapters,
+                    auto_execute_tools=auto_execute_tools,
                     stop_when=stop_when,
                 )
             )
@@ -89,6 +102,8 @@ class LocalTextEngine(BaseEngine):
         modality: str,
         base_artifacts: List[SimulationArtifact],
         base_events: List[SimulationEvent],
+        environment_adapters: List[EnvironmentAdapter],
+        auto_execute_tools: bool,
         stop_when: Optional[Callable[[List[Dict[str, Any]], Persona], bool]],
     ) -> TestCaseResult:
         started_at = time.time()
@@ -98,7 +113,28 @@ class LocalTextEngine(BaseEngine):
         tool_calls: List[Dict[str, Any]] = []
         artifacts = list(base_artifacts)
         events = list(base_events)
+        tools: List[Dict[str, Any]] = []
+        environment_state: Dict[str, Any] = {}
+        environment_metadata: Dict[str, Any] = {
+            "adapters": [adapter.name for adapter in environment_adapters],
+        }
         stop_reason = "max_turns"
+
+        for adapter in environment_adapters:
+            snapshot = adapter.reset(
+                scenario=scenario,
+                persona=persona,
+                thread_id=thread_id,
+                modality=modality,
+            )
+            _apply_environment_snapshot(
+                snapshot,
+                tools=tools,
+                artifacts=artifacts,
+                events=events,
+                environment_state=environment_state,
+                metadata=environment_metadata,
+            )
 
         user_message = self._initial_user_message(persona)
         messages.append({"role": "user", "content": user_message})
@@ -118,7 +154,12 @@ class LocalTextEngine(BaseEngine):
                 messages=list(messages),
                 new_message=messages[-1],
                 memory=memory,
-                metadata={"engine": "local_text"},
+                tools=tools,
+                metadata={
+                    "engine": "local_text",
+                    "environment": environment_metadata,
+                    "environment_state": environment_state,
+                },
             )
 
             raw_response = await wrapper.call(agent_input)
@@ -136,6 +177,11 @@ class LocalTextEngine(BaseEngine):
                 )
             messages.append(assistant_message)
 
+            provided_tool_response_ids = {
+                response.get("tool_call_id")
+                for response in response.tool_responses or []
+                if isinstance(response, Mapping)
+            }
             if response.tool_responses:
                 for tool_response in response.tool_responses:
                     messages.append(dict(tool_response))
@@ -146,6 +192,31 @@ class LocalTextEngine(BaseEngine):
                             payload=dict(tool_response),
                         )
                     )
+            if auto_execute_tools and response.tool_calls:
+                executed = _execute_environment_tool_calls(
+                    response.tool_calls,
+                    environment_adapters=environment_adapters,
+                    provided_tool_response_ids=provided_tool_response_ids,
+                    messages=messages,
+                    persona=persona,
+                    memory=memory,
+                    environment_state=environment_state,
+                    turn_index=turn_index,
+                    thread_id=thread_id,
+                )
+                for execution in executed:
+                    messages.append(execution.to_tool_message())
+                    artifacts.extend(execution.artifacts)
+                    events.extend(execution.events)
+                    _deep_merge(environment_state, execution.state_updates)
+                    if execution.state_updates:
+                        events.append(
+                            SimulationEvent(
+                                type="state_update",
+                                name=f"{execution.tool_name}_state_update",
+                                payload=execution.state_updates,
+                            )
+                        )
             artifacts.extend(response.artifacts)
             events.extend(response.events)
             if response.memory_updates:
@@ -165,6 +236,24 @@ class LocalTextEngine(BaseEngine):
                         name="agent_state_update",
                         payload=response.state,
                     )
+                )
+
+            for adapter in environment_adapters:
+                snapshot = adapter.observe(
+                    messages=messages,
+                    persona=persona,
+                    memory=memory,
+                    environment_state=environment_state,
+                    turn_index=turn_index,
+                    thread_id=thread_id,
+                )
+                _apply_environment_snapshot(
+                    snapshot,
+                    tools=tools,
+                    artifacts=artifacts,
+                    events=events,
+                    environment_state=environment_state,
+                    metadata=environment_metadata,
                 )
 
             if turn_index + 1 >= min_turns:
@@ -205,6 +294,8 @@ class LocalTextEngine(BaseEngine):
                 "turn_count": len([m for m in messages if m.get("role") == "assistant"]),
                 "stop_reason": stop_reason,
                 "duration_ms": int((time.time() - started_at) * 1000),
+                "environment": environment_metadata,
+                "environment_state": environment_state,
             },
         )
 
@@ -276,3 +367,67 @@ def _coerce_event(value: SimulationEvent | Dict[str, Any]) -> SimulationEvent:
     if isinstance(value, SimulationEvent):
         return value
     return SimulationEvent(**value)
+
+
+def _apply_environment_snapshot(
+    snapshot: EnvironmentSnapshot,
+    *,
+    tools: List[Dict[str, Any]],
+    artifacts: List[SimulationArtifact],
+    events: List[SimulationEvent],
+    environment_state: Dict[str, Any],
+    metadata: Dict[str, Any],
+) -> None:
+    if not snapshot:
+        return
+    tools.extend(snapshot.tools)
+    artifacts.extend(snapshot.artifacts)
+    events.extend(snapshot.events)
+    _deep_merge(environment_state, snapshot.state)
+    _deep_merge(metadata, snapshot.metadata)
+
+
+def _execute_environment_tool_calls(
+    tool_calls: Iterable[Mapping[str, Any]],
+    *,
+    environment_adapters: List[EnvironmentAdapter],
+    provided_tool_response_ids: set[Any],
+    messages: List[Dict[str, Any]],
+    persona: Persona,
+    memory: Dict[str, Any],
+    environment_state: Dict[str, Any],
+    turn_index: int,
+    thread_id: str,
+) -> List[ToolExecutionResult]:
+    executions: List[ToolExecutionResult] = []
+    for tool_call in tool_calls:
+        call_id = _tool_call_id(tool_call)
+        if call_id in provided_tool_response_ids:
+            continue
+        for adapter in environment_adapters:
+            result = adapter.handle_tool_call(
+                tool_call,
+                messages=messages,
+                persona=persona,
+                memory=memory,
+                environment_state=environment_state,
+                turn_index=turn_index,
+                thread_id=thread_id,
+            )
+            if result is not None:
+                executions.append(result)
+                break
+    return executions
+
+
+def _tool_call_id(tool_call: Mapping[str, Any]) -> Optional[str]:
+    value = tool_call.get("id") or tool_call.get("tool_call_id") or tool_call.get("call_id")
+    return str(value) if value is not None else None
+
+
+def _deep_merge(target: Dict[str, Any], updates: Mapping[str, Any]) -> None:
+    for key, value in updates.items():
+        if isinstance(value, Mapping) and isinstance(target.get(key), dict):
+            _deep_merge(target[key], value)
+        else:
+            target[key] = value

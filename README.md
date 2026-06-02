@@ -266,6 +266,46 @@ print(report.results[0].events)
 
 See [`examples/local_multimodal_simulation.py`](examples/local_multimodal_simulation.py) for a full offline browser/CUA-style cookbook.
 
+### Local environments
+
+Use environment adapters when the agent needs a world to act on: mocked APIs,
+browser/CUA state, files, or multi-agent handoffs. The local engine exposes
+environment tools through `AgentInput.tools`, auto-executes matching tool calls,
+and records tool results, state updates, artifacts, and events in the report.
+
+```python
+from fi.simulate import (
+    BrowserEnvironment,
+    FileEnvironment,
+    MultiAgentRoomEnvironment,
+    ToolMockEnvironment,
+    TestRunner,
+)
+
+report = await TestRunner().run_test(
+    scenario=scenario,
+    agent_callback=agent,
+    environment=[
+        ToolMockEnvironment({
+            "search_order": lambda args, ctx: {
+                "content": "Order is ready",
+                "state_updates": {"case": {"resolved": True}},
+            }
+        }),
+        BrowserEnvironment(
+            url="https://shop.example.com/checkout",
+            dom="<button id='review'>Review</button>",
+            allowed_domains=["shop.example.com"],
+        ),
+        FileEnvironment({"refund-policy.md": "Refunds require approval."}),
+        MultiAgentRoomEnvironment(["support_agent", "policy_specialist"]),
+    ],
+    max_turns=1,
+)
+```
+
+See [`examples/local_environment_adapters.py`](examples/local_environment_adapters.py) for a full local world simulation with ai-evaluation scoring.
+
 ---
 
 ## Evaluation
@@ -357,6 +397,7 @@ Traces from simulations flow into `Monitor`, scores flow into `Evaluate`, and fa
 - [x] OpenAI / Anthropic / Gemini / LangChain wrappers
 - [x] Generic framework adapter presets
 - [x] Multimodal artifacts + event trajectories
+- [x] Local environment adapters for mocked tools/APIs, browser/CUA state, files, and multi-agent rooms
 - [x] Deterministic synthetic data generator
 - [x] Per-speaker + combined audio capture
 - [x] Scenario auto-generation from a topic

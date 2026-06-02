@@ -24,6 +24,15 @@ from .agent import (
     GeminiAgentWrapper,
     AnthropicAgentWrapper,
 )
+from .environment import (
+    BrowserEnvironment,
+    EnvironmentAdapter,
+    EnvironmentSnapshot,
+    FileEnvironment,
+    MultiAgentRoomEnvironment,
+    ToolExecutionResult,
+    ToolMockEnvironment,
+)
 from .simulation import (
     Persona,
     Scenario,
@@ -61,6 +70,13 @@ __all__ = [
     "LangChainAgentWrapper",
     "GeminiAgentWrapper",
     "AnthropicAgentWrapper",
+    "BrowserEnvironment",
+    "EnvironmentAdapter",
+    "EnvironmentSnapshot",
+    "FileEnvironment",
+    "MultiAgentRoomEnvironment",
+    "ToolExecutionResult",
+    "ToolMockEnvironment",
     "Persona",
     "Scenario",
     "TestReport",
