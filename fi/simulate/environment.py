@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import copy
 import json
+import os
+import urllib.request
 from abc import ABC
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional
 from urllib.parse import urlparse
@@ -2238,15 +2240,31 @@ class FrameworkTraceEnvironment(EnvironmentAdapter):
         framework: str,
         spans: Optional[Iterable[str | Mapping[str, Any]]] = None,
         events: Optional[Iterable[str | Mapping[str, Any]]] = None,
+        trace_export: Optional[Any] = None,
+        export_source: Optional[str | os.PathLike[str]] = None,
+        export_headers: Optional[Mapping[str, str]] = None,
+        export_timeout: float = 30.0,
         state: Optional[Mapping[str, Any]] = None,
         metadata: Optional[Mapping[str, Any]] = None,
     ) -> None:
         self.framework = str(framework)
+        export_spans: List[Dict[str, Any]] = []
+        export_metadata: Dict[str, Any] = {}
+        if export_source is not None:
+            loaded_export = _load_framework_trace_export_source(
+                export_source,
+                headers=export_headers,
+                timeout=export_timeout,
+            )
+            export_spans.extend(normalize_framework_trace_export(loaded_export, framework=self.framework))
+            export_metadata["export_source"] = _framework_trace_source_label(export_source)
+        if trace_export is not None:
+            export_spans.extend(normalize_framework_trace_export(trace_export, framework=self.framework))
         self.initial_spans = normalize_framework_trace_events(
             self.framework,
             spans or [],
             category="span",
-        )
+        ) + export_spans
         self.initial_events = normalize_framework_trace_events(
             self.framework,
             events or [],
@@ -2254,9 +2272,33 @@ class FrameworkTraceEnvironment(EnvironmentAdapter):
         )
         self.initial_state = copy.deepcopy(dict(state or {}))
         self.metadata = copy.deepcopy(dict(metadata or {}))
+        if export_metadata:
+            self.metadata.setdefault("trace_export", {}).update(export_metadata)
         self.spans: List[Dict[str, Any]] = []
         self.events: List[Dict[str, Any]] = []
         self.state = copy.deepcopy(self.initial_state)
+
+    @classmethod
+    def from_export(
+        cls,
+        *,
+        framework: str = "traceai",
+        export: Optional[Any] = None,
+        source: Optional[str | os.PathLike[str]] = None,
+        headers: Optional[Mapping[str, str]] = None,
+        timeout: float = 30.0,
+        state: Optional[Mapping[str, Any]] = None,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> "FrameworkTraceEnvironment":
+        return cls(
+            framework=framework,
+            trace_export=export,
+            export_source=source,
+            export_headers=headers,
+            export_timeout=timeout,
+            state=state,
+            metadata=metadata,
+        )
 
     def reset(self, **context: Any) -> EnvironmentSnapshot:
         self.spans = copy.deepcopy(self.initial_spans)
@@ -2424,6 +2466,51 @@ def normalize_framework_trace_events(
         _normalize_framework_span(record, framework=str(framework), category=category)
         for record in records
     ]
+
+
+def normalize_framework_trace_export(
+    trace_export: Any,
+    *,
+    framework: str = "traceai",
+) -> List[Dict[str, Any]]:
+    """
+    Normalize TraceAI/Future AGI/OpenTelemetry trace exports into framework spans.
+
+    Supported shapes include OTLP JSON `resourceSpans`/`scopeSpans`, wrapped
+    Future AGI-style payloads with `data`, `traces`, `records`, or `spans`, and
+    JSONL sequences of span records.
+    """
+
+    records = _framework_trace_export_records(trace_export)
+    return normalize_framework_trace_events(framework, records, category="span")
+
+
+def load_framework_trace_export(
+    source: str | os.PathLike[str] | Mapping[str, Any] | Iterable[Any],
+    *,
+    framework: str = "traceai",
+    headers: Optional[Mapping[str, str]] = None,
+    timeout: float = 30.0,
+    state: Optional[Mapping[str, Any]] = None,
+    metadata: Optional[Mapping[str, Any]] = None,
+) -> FrameworkTraceEnvironment:
+    """Load a local/HTTP trace export and return a replay environment."""
+
+    if isinstance(source, (str, os.PathLike)):
+        return FrameworkTraceEnvironment.from_export(
+            framework=framework,
+            source=source,
+            headers=headers,
+            timeout=timeout,
+            state=state,
+            metadata=metadata,
+        )
+    return FrameworkTraceEnvironment.from_export(
+        framework=framework,
+        export=source,
+        state=state,
+        metadata=metadata,
+    )
 
 
 class AutonomyLoopEnvironment(EnvironmentAdapter):
@@ -3123,6 +3210,295 @@ def _as_iterable(value: Any) -> List[Any]:
     return [value]
 
 
+def _load_framework_trace_export_source(
+    source: str | os.PathLike[str],
+    *,
+    headers: Optional[Mapping[str, str]] = None,
+    timeout: float = 30.0,
+) -> Any:
+    source_text = os.fspath(source)
+    parsed = urlparse(source_text)
+    if parsed.scheme in {"http", "https"}:
+        request = urllib.request.Request(source_text, headers=dict(headers or {}))
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            encoding = response.headers.get_content_charset() or "utf-8"
+            body = response.read().decode(encoding)
+        return _parse_framework_trace_export_text(body)
+    if os.path.exists(source_text):
+        with open(source_text, "r", encoding="utf-8") as file:
+            return _parse_framework_trace_export_text(file.read())
+    return _parse_framework_trace_export_text(source_text)
+
+
+def _parse_framework_trace_export_text(text: str) -> Any:
+    stripped = text.strip()
+    if not stripped:
+        return []
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError as exc:
+        records: List[Any] = []
+        for line_number, line in enumerate(stripped.splitlines(), start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError as line_exc:
+                raise ValueError(f"Invalid trace export JSON/JSONL at line {line_number}") from line_exc
+        if records:
+            return records
+        raise ValueError("Invalid trace export JSON/JSONL") from exc
+
+
+def _framework_trace_source_label(source: str | os.PathLike[str]) -> str:
+    source_text = os.fspath(source)
+    parsed = urlparse(source_text)
+    if parsed.scheme in {"http", "https"}:
+        return f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+    return source_text
+
+
+def _framework_trace_export_records(trace_export: Any) -> List[Any]:
+    if trace_export is None:
+        return []
+    if isinstance(trace_export, str):
+        text = trace_export.strip()
+        if text.startswith(("{", "[")) or "\n" in text:
+            return _framework_trace_export_records(_parse_framework_trace_export_text(text))
+        return [{"name": trace_export}]
+    if hasattr(trace_export, "model_dump"):
+        return _framework_trace_export_records(trace_export.model_dump())
+    if hasattr(trace_export, "dict"):
+        return _framework_trace_export_records(trace_export.dict())
+    if isinstance(trace_export, Mapping):
+        export = copy.deepcopy(dict(trace_export))
+        otlp_records = _flatten_otlp_resource_spans(export)
+        if otlp_records:
+            return otlp_records
+        if _looks_like_framework_export_record(export):
+            return [export]
+
+        records: List[Any] = []
+        for key in (
+            "traces",
+            "spans",
+            "events",
+            "records",
+            "items",
+            "results",
+            "resource_spans",
+            "scope_spans",
+        ):
+            if key in export:
+                records.extend(_framework_trace_export_records(export[key]))
+        if records:
+            return records
+
+        for key in ("data", "result", "payload", "response", "body"):
+            nested = export.get(key)
+            if isinstance(nested, (Mapping, list, tuple)):
+                nested_records = _framework_trace_export_records(nested)
+                if nested_records:
+                    return nested_records
+        return [export]
+    if isinstance(trace_export, Iterable):
+        records = []
+        for item in trace_export:
+            records.extend(_framework_trace_export_records(item))
+        return records
+    return [trace_export]
+
+
+def _looks_like_framework_export_record(export: Mapping[str, Any]) -> bool:
+    if "spans" in export and not any(key in export for key in ("spanId", "span_id", "id", "run_id")):
+        return False
+    if any(key in export for key in ("spanId", "span_id", "id", "run_id", "parentSpanId", "parent_span_id")):
+        return True
+    if any(key in export for key in ("event", "frame_type", "span_data")):
+        return True
+    if "name" in export and any(key in export for key in ("attributes", "attrs", "type", "kind", "events", "status")):
+        return True
+    if "attributes" in export and any(key in export for key in ("type", "kind", "traceId", "trace_id")):
+        return True
+    return False
+
+
+def _flatten_otlp_resource_spans(export: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    resource_spans = export.get("resourceSpans") or export.get("resource_spans")
+    if not resource_spans:
+        return []
+
+    records: List[Dict[str, Any]] = []
+    for resource_span in _as_iterable(resource_spans):
+        resource_span_dict = _coerce_plain_dict(resource_span)
+        resource = _coerce_plain_dict(resource_span_dict.get("resource"))
+        resource_attrs = _otel_attributes_to_dict(resource.get("attributes"))
+        schema_url = resource_span_dict.get("schemaUrl") or resource_span_dict.get("schema_url")
+        if schema_url:
+            resource_attrs.setdefault("otel.resource.schema_url", schema_url)
+
+        scope_spans = (
+            resource_span_dict.get("scopeSpans")
+            or resource_span_dict.get("scope_spans")
+            or resource_span_dict.get("instrumentationLibrarySpans")
+            or resource_span_dict.get("instrumentation_library_spans")
+        )
+        if not scope_spans and resource_span_dict.get("spans"):
+            scope_spans = [{"spans": resource_span_dict.get("spans")}]
+        for scope_span in _as_iterable(scope_spans):
+            scope_span_dict = _coerce_plain_dict(scope_span)
+            scope = _coerce_plain_dict(
+                scope_span_dict.get("scope")
+                or scope_span_dict.get("instrumentationLibrary")
+                or scope_span_dict.get("instrumentation_library")
+            )
+            scope_attrs = _otel_attributes_to_dict(scope.get("attributes"))
+            scope_info = {
+                key: value
+                for key, value in {
+                    "name": scope.get("name"),
+                    "version": scope.get("version"),
+                    "attributes": scope_attrs,
+                }.items()
+                if value
+            }
+            for span in _as_iterable(scope_span_dict.get("spans")):
+                span_dict = _coerce_plain_dict(span)
+                if span_dict:
+                    records.append(
+                        _flatten_otlp_span(
+                            span_dict,
+                            resource_attrs=resource_attrs,
+                            scope_info=scope_info,
+                        )
+                    )
+    return records
+
+
+def _flatten_otlp_span(
+    span: Mapping[str, Any],
+    *,
+    resource_attrs: Mapping[str, Any],
+    scope_info: Mapping[str, Any],
+) -> Dict[str, Any]:
+    span_attrs = _otel_attributes_to_dict(span.get("attributes"))
+    scope_attrs = _coerce_plain_dict(scope_info.get("attributes"))
+    attributes: Dict[str, Any] = {}
+    attributes.update(copy.deepcopy(dict(resource_attrs)))
+    attributes.update(copy.deepcopy(scope_attrs))
+    attributes.update(span_attrs)
+    if scope_info.get("name"):
+        attributes.setdefault("otel.scope.name", scope_info.get("name"))
+    if scope_info.get("version"):
+        attributes.setdefault("otel.scope.version", scope_info.get("version"))
+
+    event_payloads: List[Dict[str, Any]] = []
+    event_names: List[str] = []
+    for event in _as_iterable(span.get("events")):
+        event_dict = _coerce_plain_dict(event)
+        if not event_dict:
+            continue
+        event_attrs = _otel_attributes_to_dict(event_dict.get("attributes"))
+        event_name = str(event_dict.get("name") or "")
+        if event_name:
+            event_names.append(event_name)
+        event_payloads.append(
+            {
+                key: value
+                for key, value in {
+                    "name": event_name,
+                    "time_unix_nano": event_dict.get("timeUnixNano") or event_dict.get("time_unix_nano"),
+                    "attributes": event_attrs,
+                }.items()
+                if value not in (None, "", {})
+            }
+        )
+    if event_names:
+        attributes.setdefault("otel.event.names", " ".join(event_names))
+
+    status = _coerce_plain_dict(span.get("status"))
+    start_nano = _otel_int(span.get("startTimeUnixNano") or span.get("start_time_unix_nano"))
+    end_nano = _otel_int(span.get("endTimeUnixNano") or span.get("end_time_unix_nano"))
+    record: Dict[str, Any] = {
+        "name": span.get("name"),
+        "kind": span.get("kind"),
+        "trace_id": span.get("traceId") or span.get("trace_id"),
+        "span_id": span.get("spanId") or span.get("span_id"),
+        "parent_span_id": span.get("parentSpanId") or span.get("parent_span_id"),
+        "start_time_unix_nano": start_nano,
+        "end_time_unix_nano": end_nano,
+        "attributes": attributes,
+        "resource": dict(resource_attrs),
+        "scope": {key: value for key, value in scope_info.items() if key != "attributes"},
+        "status": status,
+        "events": event_payloads,
+    }
+    if start_nano is not None:
+        record["timestamp_ms"] = start_nano // 1_000_000
+    if start_nano is not None and end_nano is not None and end_nano >= start_nano:
+        record["latency_ms"] = (end_nano - start_nano) // 1_000_000
+    status_code = str(status.get("code") or "").upper()
+    if status_code in {"2", "ERROR", "STATUS_CODE_ERROR"}:
+        record["error"] = status.get("message") or status.get("description") or status_code
+    return {key: value for key, value in record.items() if value not in (None, "", [], {})}
+
+
+def _otel_attributes_to_dict(attributes: Any) -> Dict[str, Any]:
+    if isinstance(attributes, Mapping):
+        if "key" in attributes and "value" in attributes:
+            return {str(attributes.get("key")): _otel_value(attributes.get("value"))}
+        return {str(key): _otel_value(value) for key, value in attributes.items()}
+    result: Dict[str, Any] = {}
+    for item in _as_iterable(attributes):
+        item_dict = _coerce_plain_dict(item)
+        key = item_dict.get("key")
+        if key is None:
+            continue
+        result[str(key)] = _otel_value(item_dict.get("value"))
+    return result
+
+
+def _otel_value(value: Any) -> Any:
+    if not isinstance(value, Mapping):
+        return value
+    if "stringValue" in value:
+        return value.get("stringValue")
+    if "intValue" in value:
+        return _otel_int(value.get("intValue"))
+    if "doubleValue" in value:
+        try:
+            return float(value.get("doubleValue"))
+        except (TypeError, ValueError):
+            return value.get("doubleValue")
+    if "boolValue" in value:
+        return bool(value.get("boolValue"))
+    if "bytesValue" in value:
+        return value.get("bytesValue")
+    if "arrayValue" in value:
+        array_value = _coerce_plain_dict(value.get("arrayValue"))
+        return [_otel_value(item) for item in _as_iterable(array_value.get("values"))]
+    if "kvlistValue" in value:
+        kvlist_value = _coerce_plain_dict(value.get("kvlistValue"))
+        return _otel_attributes_to_dict(kvlist_value.get("values"))
+    if set(value.keys()) == {"value"}:
+        return _otel_value(value.get("value"))
+    return {str(key): _otel_value(item) for key, item in value.items()}
+
+
+def _otel_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, (int, float)):
+        return int(value)
+    try:
+        return int(str(value))
+    except (TypeError, ValueError):
+        return None
+
+
 FRAMEWORK_TRACE_ALIASES = {
     "llm": "model",
     "generation": "model",
@@ -3181,17 +3557,46 @@ def _normalize_framework_span(
     attributes.setdefault("source_category", category)
     if raw.get("ns") is not None:
         attributes.setdefault("namespace", raw.get("ns"))
+    status = _coerce_plain_dict(raw.get("status"))
+    if status.get("code") is not None:
+        attributes.setdefault("otel.status.code", status.get("code"))
+    if status.get("message") is not None:
+        attributes.setdefault("otel.status.message", status.get("message"))
 
     name = _framework_record_name(raw, span_data=span_data, data=data, payload=payload)
+    if name == "framework_event":
+        name = str(
+            attributes.get("gen_ai.operation.name")
+            or attributes.get("gen_ai.tool.name")
+            or attributes.get("mcp.tool.name")
+            or attributes.get("fi.span.kind")
+            or attributes.get("gen_ai.span.kind")
+            or name
+        )
+    native_span_id = (
+        raw.get("span_id")
+        or raw.get("spanId")
+        or data.get("span_id")
+        or data.get("spanId")
+    )
+    trace_id = raw.get("trace_id") or raw.get("traceId") or data.get("trace_id") or data.get("traceId")
+    parent_id = _framework_parent_id(raw, data=data)
     span_id = str(
         raw.get("id")
-        or raw.get("span_id")
+        or native_span_id
         or raw.get("run_id")
-        or raw.get("trace_id")
+        or trace_id
         or data.get("run_id")
         or name
     )
     signals = _framework_signals(raw, attributes, name, span_data=span_data, data=data, payload=payload)
+    latency_ms = _first_number(
+        raw,
+        attributes,
+        ("latency_ms", "duration_ms", "elapsed_ms", "duration"),
+    )
+    if latency_ms is None:
+        latency_ms = _duration_ms_from_span(raw, attributes)
     normalized = {
         "id": span_id,
         "name": name,
@@ -3205,42 +3610,54 @@ def _normalize_framework_span(
             or category
         ),
         "signals": sorted(signals),
-        "parent_id": _framework_parent_id(raw, data=data),
-        "input": (
-            raw.get("input")
-            or span_data.get("input")
-            or data.get("input")
-            or payload.get("input")
-            or attributes.get("input")
-            or attributes.get("input.value")
+        "trace_id": trace_id,
+        "span_id": native_span_id,
+        "parent_id": parent_id,
+        "parent_span_id": parent_id,
+        "input": _first_present(
+            (raw, span_data, data, payload, attributes),
+            (
+                "input",
+                "input.value",
+                "gen_ai.prompt",
+                "gen_ai.input",
+                "gen_ai.input.messages",
+                "llm.prompts",
+            ),
         ),
-        "output": (
-            raw.get("output")
-            or span_data.get("output")
-            or data.get("output")
-            or data.get("chunk")
-            or payload.get("output")
-            or attributes.get("output")
-            or attributes.get("output.value")
+        "output": _first_present(
+            (raw, span_data, data, payload, attributes),
+            (
+                "output",
+                "output.value",
+                "chunk",
+                "gen_ai.completion",
+                "gen_ai.output",
+                "gen_ai.output.messages",
+                "llm.completions",
+            ),
         ),
-        "error": raw.get("error") or raw.get("exception") or data.get("error") or payload.get("error") or attributes.get("error"),
-        "latency_ms": _first_number(raw, attributes, ("latency_ms", "duration_ms", "elapsed_ms", "duration")),
-        "cost": (
-            raw.get("cost")
-            or raw.get("usage")
-            or raw.get("usage_metadata")
-            or span_data.get("usage")
-            or data.get("usage")
-            or data.get("usage_metadata")
-            or attributes.get("cost")
-            or attributes.get("usage")
-            or attributes.get("gen_ai.usage")
-        ),
+        "error": _framework_error(raw, data=data, payload=payload, attributes=attributes),
+        "latency_ms": latency_ms,
+        "cost": _framework_usage(raw, span_data=span_data, data=data, attributes=attributes),
         "attributes": attributes,
     }
-    for key in ("start_time", "end_time", "timestamp_ms", "started_at", "ended_at"):
+    for key in (
+        "start_time",
+        "end_time",
+        "timestamp_ms",
+        "started_at",
+        "ended_at",
+        "start_time_unix_nano",
+        "end_time_unix_nano",
+        "startTimeUnixNano",
+        "endTimeUnixNano",
+    ):
         if raw.get(key) is not None:
             normalized[key] = raw.get(key)
+    for key in ("resource", "scope", "status", "events"):
+        if raw.get(key) not in (None, "", [], {}):
+            normalized[key] = copy.deepcopy(raw.get(key))
     return {key: value for key, value in normalized.items() if value is not None and value != ""}
 
 
@@ -3307,7 +3724,15 @@ def _framework_parent_id(raw: Mapping[str, Any], *, data: Mapping[str, Any]) -> 
     parent_ids = raw.get("parent_ids") or data.get("parent_ids")
     if isinstance(parent_ids, (list, tuple)) and parent_ids:
         return parent_ids[-1]
-    return raw.get("parent_id") or raw.get("parent_span_id") or raw.get("parent_run_id")
+    return (
+        raw.get("parent_id")
+        or raw.get("parent_span_id")
+        or raw.get("parentSpanId")
+        or raw.get("parent_run_id")
+        or data.get("parent_id")
+        or data.get("parent_span_id")
+        or data.get("parentSpanId")
+    )
 
 
 def _framework_signals(
@@ -3349,6 +3774,11 @@ def _framework_signals(
             " ".join(str(key) for key in span_data.keys()),
             " ".join(str(key) for key in data.keys()),
             " ".join(str(key) for key in payload.keys()),
+            " ".join(
+                str(event.get("name", ""))
+                for event in _as_iterable(raw.get("events"))
+                if isinstance(event, Mapping)
+            ),
         ]
     ).lower()
     signals = {"span"}
@@ -3365,6 +3795,13 @@ def _framework_signals(
         "tool": "tool",
         "function": "tool",
         "mcp": "tool",
+        "autogen": "agent",
+        "llamaindex": "retrieval",
+        "llama_index": "retrieval",
+        "query_engine": "retrieval",
+        "dspy": "agent",
+        "predict": "model",
+        "module": "agent",
         "task": "agent",
         "crew": "agent",
         "flow": "agent",
@@ -3409,9 +3846,45 @@ def _framework_signals(
     for token, signal in keyword_signals.items():
         if token in text:
             signals.add(signal)
+
+    span_kind = str(
+        _first_present(
+            (attributes,),
+            ("gen_ai.span.kind", "fi.span.kind", "openinference.span.kind", "span.kind"),
+        )
+        or ""
+    ).lower()
+    operation = str(
+        _first_present(
+            (attributes,),
+            ("gen_ai.operation.name", "llm.operation", "operation.name", "otel.operation"),
+        )
+        or ""
+    ).lower()
+    explicit_signal_groups = {
+        "agent": ("agent", "chain", "workflow", "graph", "task", "crew", "flow"),
+        "model": ("llm", "model", "chat", "generation", "embedding", "embedder", "predict"),
+        "tool": ("tool", "function", "execute_tool", "tool_call", "mcp_tool"),
+        "retrieval": ("retriev", "rag", "vector", "query", "search"),
+        "guardrail": ("guardrail", "safety"),
+        "memory": ("memory",),
+        "browser": ("browser", "computer", "cua"),
+        "voice": ("voice", "audio", "speech", "transcri", "tts", "stt"),
+        "image": ("image", "vision"),
+    }
+    for signal, tokens in explicit_signal_groups.items():
+        if any(token in span_kind or token in operation for token in tokens):
+            signals.add(signal)
+    if any(str(key).startswith("mcp.resource") for key in attributes.keys()):
+        signals.add("retrieval")
     if _first_number(raw, attributes, ("latency_ms", "duration_ms", "elapsed_ms")) is not None:
         signals.add("latency")
+    if _duration_ms_from_span(raw, attributes) is not None:
+        signals.add("latency")
     if raw.get("error") or raw.get("exception") or attributes.get("error"):
+        signals.add("error")
+    status_code = str(attributes.get("otel.status.code") or "").upper()
+    if status_code in {"2", "ERROR", "STATUS_CODE_ERROR"}:
         signals.add("error")
     if (
         raw.get("cost")
@@ -3420,6 +3893,8 @@ def _framework_signals(
         or attributes.get("gen_ai.usage")
         or data.get("usage")
         or data.get("usage_metadata")
+        or any(str(key).startswith("gen_ai.usage.") for key in attributes.keys())
+        or any(str(key).startswith("llm.token_count.") for key in attributes.keys())
     ):
         signals.add("cost")
     return {_normalize_framework_trace_key(signal) for signal in signals if signal}
@@ -3434,6 +3909,17 @@ def _nested_dict(value: Mapping[str, Any], keys: Iterable[str]) -> Dict[str, Any
     return merged
 
 
+def _first_present(
+    sources: Iterable[Mapping[str, Any]],
+    keys: Iterable[str],
+) -> Any:
+    for source in sources:
+        for key in keys:
+            if key in source and source.get(key) not in (None, ""):
+                return source.get(key)
+    return None
+
+
 def _first_number(
     raw: Mapping[str, Any],
     attributes: Mapping[str, Any],
@@ -3444,7 +3930,79 @@ def _first_number(
             value = source.get(key)
             if isinstance(value, (int, float)):
                 return int(value)
+            if isinstance(value, str):
+                try:
+                    return int(float(value))
+                except ValueError:
+                    continue
     return None
+
+
+def _duration_ms_from_span(
+    raw: Mapping[str, Any],
+    attributes: Mapping[str, Any],
+) -> Optional[int]:
+    start_nano = _first_number(raw, attributes, ("start_time_unix_nano", "startTimeUnixNano"))
+    end_nano = _first_number(raw, attributes, ("end_time_unix_nano", "endTimeUnixNano"))
+    if start_nano is None or end_nano is None or end_nano < start_nano:
+        return None
+    return (end_nano - start_nano) // 1_000_000
+
+
+def _framework_error(
+    raw: Mapping[str, Any],
+    *,
+    data: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    attributes: Mapping[str, Any],
+) -> Any:
+    error = raw.get("error") or raw.get("exception") or data.get("error") or payload.get("error") or attributes.get("error")
+    if error:
+        return error
+    status = _coerce_plain_dict(raw.get("status"))
+    status_code = str(status.get("code") or attributes.get("otel.status.code") or "").upper()
+    if status_code in {"2", "ERROR", "STATUS_CODE_ERROR"}:
+        return status.get("message") or attributes.get("otel.status.message") or status_code
+    return None
+
+
+def _framework_usage(
+    raw: Mapping[str, Any],
+    *,
+    span_data: Mapping[str, Any],
+    data: Mapping[str, Any],
+    attributes: Mapping[str, Any],
+) -> Any:
+    direct = (
+        raw.get("cost")
+        or raw.get("usage")
+        or raw.get("usage_metadata")
+        or span_data.get("usage")
+        or data.get("usage")
+        or data.get("usage_metadata")
+        or attributes.get("cost")
+        or attributes.get("usage")
+        or attributes.get("gen_ai.usage")
+    )
+    if direct:
+        return direct
+    usage_keys = {
+        "gen_ai.usage.input_tokens": "input_tokens",
+        "gen_ai.usage.output_tokens": "output_tokens",
+        "gen_ai.usage.total_tokens": "total_tokens",
+        "llm.token_count.prompt": "input_tokens",
+        "llm.token_count.completion": "output_tokens",
+        "llm.token_count.total": "total_tokens",
+        "input_token_count": "input_tokens",
+        "output_token_count": "output_tokens",
+        "total_token_count": "total_tokens",
+    }
+    usage = {
+        normalized_key: value
+        for key, normalized_key in usage_keys.items()
+        if (value := attributes.get(key)) is not None
+    }
+    return usage or None
 
 
 def _framework_span_event(span: Mapping[str, Any], framework: str) -> SimulationEvent:

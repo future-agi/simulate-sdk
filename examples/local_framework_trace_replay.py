@@ -3,8 +3,8 @@ Run a local framework trace replay simulation.
 
 This models native trace evidence from orchestration frameworks such as OpenAI
 Agents, LangGraph/LangChain, CrewAI, AutoGen, LiveKit, or Pipecat. The trace is
-normalized into framework spans and scored without importing the framework,
-starting a room, or calling a model.
+loaded from an OTLP-style TraceAI export, normalized into framework spans, and
+scored without importing the framework, starting a room, or calling a model.
 
 Requires:
     pip install agent-simulate ai-evaluation
@@ -47,20 +47,66 @@ async def main():
             )
         ],
     )
-    environment = FrameworkTraceEnvironment(
+    trace_export = {
+        "resourceSpans": [
+            {
+                "resource": {
+                    "attributes": [
+                        {"key": "service.name", "value": {"stringValue": "support-agent"}},
+                        {"key": "futureagi.project", "value": {"stringValue": "orders"}},
+                    ]
+                },
+                "scopeSpans": [
+                    {
+                        "scope": {"name": "traceAI.autoinstrumentation", "version": "0.1.0"},
+                        "spans": [
+                            {
+                                "traceId": "trace_1",
+                                "spanId": "agent_1",
+                                "name": "AutoGen AssistantAgent support_agent",
+                                "startTimeUnixNano": "1000000000",
+                                "endTimeUnixNano": "1014000000",
+                                "attributes": [
+                                    {"key": "fi.span.kind", "value": {"stringValue": "AGENT"}},
+                                    {"key": "input.value", "value": {"stringValue": "order 123"}},
+                                ],
+                            },
+                            {
+                                "traceId": "trace_1",
+                                "spanId": "model_1",
+                                "parentSpanId": "agent_1",
+                                "name": "DSPy Predict gpt_route",
+                                "attributes": [
+                                    {"key": "gen_ai.operation.name", "value": {"stringValue": "chat"}},
+                                    {"key": "gen_ai.usage.input_tokens", "value": {"intValue": "96"}},
+                                    {"key": "gen_ai.usage.output_tokens", "value": {"intValue": "24"}},
+                                ],
+                            },
+                            {
+                                "traceId": "trace_1",
+                                "spanId": "retrieval_1",
+                                "parentSpanId": "agent_1",
+                                "name": "LlamaIndex retriever policy_vector_search",
+                                "attributes": [
+                                    {"key": "gen_ai.operation.name", "value": {"stringValue": "retrieve"}}
+                                ],
+                            },
+                            {"traceId": "trace_1", "spanId": "memory_1", "name": "memory_update case_summary"},
+                            {"traceId": "trace_1", "spanId": "tool_1", "name": "MCP tool call search_order"},
+                            {"traceId": "trace_1", "spanId": "handoff_1", "name": "handoff_span policy_specialist"},
+                            {"traceId": "trace_1", "spanId": "guardrail_1", "name": "guardrail_span pii_check"},
+                            {"traceId": "trace_1", "spanId": "browser_1", "name": "computer_use browser_click"},
+                            {"traceId": "trace_1", "spanId": "voice_1", "name": "LiveKit transcription_span caller_audio"},
+                        ],
+                    }
+                ],
+            }
+        ]
+    }
+    environment = FrameworkTraceEnvironment.from_export(
         framework="mixed_agent_stack",
-        spans=[
-            {"id": "agent_1", "name": "langgraph node support_agent", "type": "agent", "duration_ms": 14},
-            {"id": "model_1", "name": "generation_span gpt_route", "type": "llm", "usage": {"tokens": 120}},
-            {"id": "retrieval_1", "name": "retriever policy_vector_search", "type": "retrieval"},
-            {"id": "memory_1", "name": "memory_update case_summary", "type": "memory"},
-            {"id": "tool_1", "name": "function_span search_order", "type": "tool"},
-            {"id": "handoff_1", "name": "handoff_span policy_specialist", "type": "handoff"},
-            {"id": "guardrail_1", "name": "guardrail_span pii_check", "type": "guardrail"},
-            {"id": "browser_1", "name": "computer_use browser_click", "type": "browser"},
-            {"id": "voice_1", "name": "transcription_span caller_audio", "type": "voice"},
-        ],
-        metadata={"source": "local fixture"},
+        export=trace_export,
+        metadata={"source": "local otlp fixture", "storage": "futureagi"},
     )
 
     report = await TestRunner().run_test(

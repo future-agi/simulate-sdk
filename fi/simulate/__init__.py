@@ -39,7 +39,9 @@ from .environment import (
     ToolFaultInjectionEnvironment,
     ToolMockEnvironment,
     VoiceEnvironment,
+    load_framework_trace_export,
     normalize_framework_trace_events,
+    normalize_framework_trace_export,
 )
 from .simulation import (
     AttackDefinition,
@@ -96,7 +98,9 @@ __all__ = [
     "ToolFaultInjectionEnvironment",
     "ToolMockEnvironment",
     "VoiceEnvironment",
+    "load_framework_trace_export",
     "normalize_framework_trace_events",
+    "normalize_framework_trace_export",
     "AttackDefinition",
     "AttackVector",
     "Persona",

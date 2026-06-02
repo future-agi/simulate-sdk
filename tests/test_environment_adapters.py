@@ -1,3 +1,5 @@
+import json
+
 import pytest
 
 from fi.simulate import (
@@ -13,7 +15,9 @@ from fi.simulate import (
     ToolFaultInjectionEnvironment,
     ToolMockEnvironment,
     VoiceEnvironment,
+    load_framework_trace_export,
     normalize_framework_trace_events,
+    normalize_framework_trace_export,
 )
 from fi.simulate.simulation.engines.local_text import LocalTextEngine
 from fi.simulate.simulation.models import Persona, Scenario
@@ -787,6 +791,129 @@ def test_normalize_framework_trace_events_accepts_traceai_and_native_records():
     assert normalized[0]["input"] == "order 123"
     assert normalized[0]["output"] == "planned tool call"
     assert normalized[2]["id"] == "lc_tool"
+
+
+def test_normalize_framework_trace_export_flattens_otlp_resource_spans():
+    export = {
+        "resourceSpans": [
+            {
+                "resource": {
+                    "attributes": [
+                        {"key": "service.name", "value": {"stringValue": "support-agent"}},
+                        {"key": "futureagi.project", "value": {"stringValue": "orders"}},
+                    ]
+                },
+                "scopeSpans": [
+                    {
+                        "scope": {"name": "traceAI.autoinstrumentation", "version": "0.1.0"},
+                        "spans": [
+                            {
+                                "traceId": "trace_1",
+                                "spanId": "agent_span",
+                                "name": "AutoGen AssistantAgent plan",
+                                "kind": "SPAN_KIND_INTERNAL",
+                                "startTimeUnixNano": "1000000000",
+                                "endTimeUnixNano": "1125000000",
+                                "attributes": [
+                                    {"key": "fi.span.kind", "value": {"stringValue": "AGENT"}},
+                                    {"key": "input.value", "value": {"stringValue": "order 123"}},
+                                    {"key": "output.value", "value": {"stringValue": "call search_order"}},
+                                ],
+                            },
+                            {
+                                "traceId": "trace_1",
+                                "spanId": "model_span",
+                                "parentSpanId": "agent_span",
+                                "name": "DSPy Predict answer",
+                                "kind": "SPAN_KIND_CLIENT",
+                                "startTimeUnixNano": "1125000000",
+                                "endTimeUnixNano": "1375000000",
+                                "attributes": [
+                                    {"key": "gen_ai.operation.name", "value": {"stringValue": "chat"}},
+                                    {"key": "gen_ai.usage.input_tokens", "value": {"intValue": "80"}},
+                                    {"key": "gen_ai.usage.output_tokens", "value": {"intValue": "24"}},
+                                ],
+                            },
+                            {
+                                "traceId": "trace_1",
+                                "spanId": "tool_span",
+                                "parentSpanId": "agent_span",
+                                "name": "MCP tool call search_order",
+                                "attributes": [
+                                    {"key": "gen_ai.operation.name", "value": {"stringValue": "execute_tool"}},
+                                    {"key": "mcp.tool.name", "value": {"stringValue": "search_order"}},
+                                ],
+                            },
+                            {
+                                "traceId": "trace_1",
+                                "spanId": "retriever_span",
+                                "parentSpanId": "agent_span",
+                                "name": "LlamaIndex retriever policy_vector",
+                                "attributes": [
+                                    {"key": "gen_ai.operation.name", "value": {"stringValue": "retrieve"}},
+                                    {
+                                        "key": "retrieval_documents",
+                                        "value": {
+                                            "arrayValue": {
+                                                "values": [{"stringValue": "policy: eligible"}]
+                                            }
+                                        },
+                                    },
+                                ],
+                            },
+                        ],
+                    }
+                ],
+            }
+        ]
+    }
+
+    normalized = normalize_framework_trace_export(export, framework="traceai")
+    signals = {signal for span in normalized for signal in span["signals"]}
+    model_span = next(span for span in normalized if span["span_id"] == "model_span")
+
+    assert len(normalized) == 4
+    assert {"agent", "model", "tool", "retrieval", "latency", "cost"} <= signals
+    assert model_span["trace_id"] == "trace_1"
+    assert model_span["parent_id"] == "agent_span"
+    assert model_span["latency_ms"] == 250
+    assert model_span["cost"] == {"input_tokens": 80, "output_tokens": 24}
+    assert model_span["attributes"]["service.name"] == "support-agent"
+    assert model_span["attributes"]["otel.scope.name"] == "traceAI.autoinstrumentation"
+
+
+def test_framework_trace_environment_replays_traceai_export_file(tmp_path):
+    export_path = tmp_path / "traceai-export.jsonl"
+    records = [
+        {
+            "name": "AutoGen groupchat support_agent",
+            "span_id": "agent_span",
+            "attributes": {"fi.span.kind": "AGENT", "autogen.agent.name": "support_agent"},
+        },
+        {
+            "name": "LlamaIndex query_engine response",
+            "span_id": "retriever_span",
+            "attributes": {"gen_ai.operation.name": "retrieve"},
+        },
+        {
+            "name": "MCP tool call search_order",
+            "span_id": "tool_span",
+            "attributes": {
+                "gen_ai.operation.name": "execute_tool",
+                "mcp.tool.name": "search_order",
+            },
+        },
+    ]
+    export_path.write_text("\n".join(json.dumps(record) for record in records), encoding="utf-8")
+
+    environment = load_framework_trace_export(export_path, framework="traceai")
+    snapshot = environment.reset()
+    trace_state = snapshot.state["framework_trace"]
+
+    assert trace_state["framework"] == "traceai"
+    assert trace_state["metadata"]["trace_export"]["export_source"] == str(export_path)
+    assert {"agent", "tool", "retrieval"} <= set(trace_state["signals"])
+    assert any(event.type == "framework_span" and event.payload["id"] == "tool_span" for event in snapshot.events)
 
 
 @pytest.mark.asyncio
