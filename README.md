@@ -321,7 +321,12 @@ report = await TestRunner().run_test(
         }),
         FileEnvironment({"refund-policy.md": "Refunds require approval."}),
         AdversarialEnvironmentPack(),
-        MultiAgentRoomEnvironment(["support_agent", "policy_specialist"]),
+        MultiAgentRoomEnvironment(
+            ["support_agent", "policy_specialist"],
+            handoff_contracts={
+                "policy_specialist": {"required_output": "policy decision"}
+            },
+        ),
     ],
     max_turns=1,
 )
@@ -331,6 +336,7 @@ See [`examples/local_environment_adapters.py`](examples/local_environment_adapte
 See [`examples/local_browser_trace_replay.py`](examples/local_browser_trace_replay.py) for a browser/CUA trace replay cookbook with screenshots, DOM, console/network logs, and action replay.
 See [`examples/local_voice_replay_routing.py`](examples/local_voice_replay_routing.py) for a voice replay cookbook with VAD/STT/TTS events, interruption handling, and call routing.
 See [`examples/local_autonomy_loop_trace.py`](examples/local_autonomy_loop_trace.py) for an autonomy-loop cookbook with observe/orient/plan/act/verify/reflect, feedback, memory, and skill-library evidence.
+See [`examples/local_multi_agent_handoff_trace.py`](examples/local_multi_agent_handoff_trace.py) for a multi-agent handoff cookbook with roles, contracts, delegated work, review, reconciliation, and trace coverage.
 See [`examples/local_adversarial_environment_pack.py`](examples/local_adversarial_environment_pack.py) for an indirect prompt-injection pentest using hostile tool, file, browser, and memory surfaces.
 
 ### Local pentest scenarios
@@ -395,7 +401,7 @@ For fully local agent scoring, use `evaluate_agent_report`. It scores the
 normalized simulation trace directly: trajectory, tool use, prompt-injection
 resistance, environment-injection resistance, memory integrity, browser/CUA
 safety, browser trace coverage, voice turn-taking, voice trace coverage,
-autonomy-loop coverage, artifact coverage, and expected state.
+autonomy-loop coverage, multi-agent trace coverage, artifact coverage, and expected state.
 
 ```python
 from fi.simulate import evaluate_agent_report
@@ -411,6 +417,7 @@ evaluation = evaluate_agent_report(
         "required_browser_trace": ["dom", "screenshot", "action", "console", "network"],
         "required_voice_trace": ["audio", "vad", "stt", "tts", "interruption", "route"],
         "required_autonomy_loop": ["observe", "orient", "plan", "act", "verify", "reflect"],
+        "required_multi_agent_trace": ["role", "contract", "handoff", "review", "reconciliation"],
         "expected_state": {"case": {"resolved": True}},
     },
 )
@@ -461,13 +468,13 @@ Traces from simulations flow into `Monitor`, scores flow into `Evaluate`, and fa
 - [x] OpenAI / Anthropic / Gemini / LangChain wrappers
 - [x] Generic framework adapter presets
 - [x] Multimodal artifacts + event trajectories
-- [x] Local environment adapters for mocked tools/APIs, autonomy-loop traces, browser/CUA trace replay, voice replay/routing, images, files, adversarial packs, and multi-agent rooms
+- [x] Local environment adapters for mocked tools/APIs, autonomy-loop traces, multi-agent handoff traces, browser/CUA trace replay, voice replay/routing, images, files, adversarial packs, and multi-agent rooms
 - [x] Deterministic synthetic data generator
 - [x] Deterministic pentest scenario generator
 - [x] Per-speaker + combined audio capture
 - [x] Scenario auto-generation from a topic
 - [x] `evaluate_report` integration with `ai-evaluation`
-- [x] Local `evaluate_agent_report` scoring for trajectory, tools, memory, autonomy-loop coverage, browser/CUA, browser trace coverage, voice trace coverage, environment injection, and pentest signals
+- [x] Local `evaluate_agent_report` scoring for trajectory, tools, memory, autonomy-loop coverage, multi-agent trace coverage, browser/CUA, browser trace coverage, voice trace coverage, environment injection, and pentest signals
 - [x] Tool-call capture in wrapper responses
 
 </td>

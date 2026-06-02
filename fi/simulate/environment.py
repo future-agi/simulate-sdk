@@ -1187,35 +1187,76 @@ class FileEnvironment(EnvironmentAdapter):
 
 
 class MultiAgentRoomEnvironment(EnvironmentAdapter):
-    """Simple multi-agent room environment for handoff and coordination tests."""
+    """Multi-agent room with handoff, review, reconciliation, and trace evidence."""
 
     name = "multi_agent_room"
 
-    def __init__(self, participants: Iterable[str]) -> None:
-        self.participants = list(participants)
+    def __init__(
+        self,
+        participants: Iterable[str | Mapping[str, Any]] | Mapping[str, Any],
+        *,
+        handoff_contracts: Optional[Mapping[str, Any] | Iterable[Mapping[str, Any]]] = None,
+        state: Optional[Mapping[str, Any]] = None,
+        allow_unknown_roles: bool = True,
+    ) -> None:
+        self.participants = _normalize_participants(participants)
+        self.handoff_contracts = _normalize_handoff_contracts(handoff_contracts)
+        self.initial_state = copy.deepcopy(dict(state or {}))
+        self.allow_unknown_roles = allow_unknown_roles
         self.messages: List[Dict[str, Any]] = []
+        self.handoffs: List[Dict[str, Any]] = []
+        self.reviews: List[Dict[str, Any]] = []
+        self.reconciliations: List[Dict[str, Any]] = []
+        self.state = copy.deepcopy(self.initial_state)
 
     def reset(self, **context: Any) -> EnvironmentSnapshot:
         self.messages = []
+        self.handoffs = []
+        self.reviews = []
+        self.reconciliations = []
+        self.state = copy.deepcopy(self.initial_state)
         return EnvironmentSnapshot(
             tools=[
                 {
                     "name": "handoff",
-                    "description": "Hand off work to another simulated agent role.",
+                    "description": "Hand off work to another simulated agent role with task, context, and reason.",
                 },
                 {
                     "name": "send_room_message",
                     "description": "Send a message to the simulated multi-agent room.",
                 },
+                {
+                    "name": "request_review",
+                    "description": "Request review or critique from another simulated agent role.",
+                },
+                {
+                    "name": "reconcile",
+                    "description": "Record consensus, conflict resolution, or final coordination decision.",
+                },
+                {
+                    "name": "room_status",
+                    "description": "Inspect multi-agent participants, handoffs, reviews, and reconciliation state.",
+                },
             ],
-            state={"multi_agent": {"participants": self.participants, "messages": []}},
+            artifacts=[self._trace_artifact()],
+            state={"multi_agent": self._state_payload()},
             events=[
                 SimulationEvent(
                     type="multi_agent",
                     name="room_ready",
-                    payload={"participants": self.participants},
+                    payload={
+                        "participants": list(self.participants.keys()),
+                        "roles": copy.deepcopy(self.participants),
+                        "handoff_contracts": copy.deepcopy(self.handoff_contracts),
+                    },
                 )
             ],
+            metadata={
+                "multi_agent_trace": {
+                    "participants": list(self.participants.keys()),
+                    "handoff_contracts": len(self.handoff_contracts),
+                }
+            },
         )
 
     def handle_tool_call(
@@ -1224,28 +1265,158 @@ class MultiAgentRoomEnvironment(EnvironmentAdapter):
         **context: Any,
     ) -> Optional[ToolExecutionResult]:
         name = _tool_name(tool_call)
-        if name not in {"handoff", "send_room_message"}:
+        if name not in {"handoff", "send_room_message", "request_review", "reconcile", "room_status"}:
             return None
         arguments = _tool_arguments(tool_call)
         call_id = _tool_call_id(tool_call)
-        recipient = arguments.get("to") or arguments.get("role") or "room"
-        content = str(arguments.get("message") or arguments.get("task") or "")
-        message = {"tool": name, "to": recipient, "message": content}
-        self.messages.append(message)
+
+        if name == "room_status":
+            payload = self._trace_payload()
+            return ToolExecutionResult(
+                tool_call_id=call_id,
+                tool_name=name,
+                content="Multi-agent room status recorded.",
+                result=payload,
+                state_updates={"multi_agent": self._state_payload()},
+                artifacts=[self._trace_artifact()],
+                events=[
+                    SimulationEvent(
+                        type="multi_agent",
+                        name="room_status",
+                        payload=payload,
+                    )
+                ],
+            )
+
+        if name == "reconcile":
+            record = {
+                "summary": str(arguments.get("summary") or arguments.get("decision") or ""),
+                "decision": arguments.get("decision"),
+                "accepted_source": arguments.get("accepted_source") or arguments.get("source"),
+                "conflicts": copy.deepcopy(arguments.get("conflicts", [])),
+                "participants": copy.deepcopy(arguments.get("participants", list(self.participants.keys()))),
+                "turn_index": context.get("turn_index"),
+            }
+            self.reconciliations.append(record)
+            event_name = "reconciled"
+            content = f"Reconciled multi-agent decision: {record['summary']}"
+            result = record
+        elif name == "request_review":
+            reviewer = str(arguments.get("reviewer") or arguments.get("to") or arguments.get("role") or "reviewer")
+            record = {
+                "reviewer": reviewer,
+                "target": arguments.get("target") or arguments.get("artifact") or arguments.get("task"),
+                "criteria": copy.deepcopy(arguments.get("criteria", [])),
+                "context": arguments.get("context"),
+                "known_role": reviewer in self.participants,
+                "turn_index": context.get("turn_index"),
+            }
+            if not record["known_role"] and not self.allow_unknown_roles:
+                return self._unknown_role_result(call_id, name, reviewer, arguments)
+            self.reviews.append(record)
+            event_name = "review_requested"
+            content = f"Review requested from {reviewer}."
+            result = record
+        elif name == "handoff":
+            recipient = str(arguments.get("to") or arguments.get("role") or arguments.get("agent") or "room")
+            record = {
+                "to": recipient,
+                "task": str(arguments.get("task") or arguments.get("message") or ""),
+                "context": arguments.get("context"),
+                "reason": arguments.get("reason"),
+                "contract": self.handoff_contracts.get(recipient, {}),
+                "known_role": recipient in self.participants,
+                "turn_index": context.get("turn_index"),
+            }
+            if not record["known_role"] and not self.allow_unknown_roles:
+                return self._unknown_role_result(call_id, name, recipient, arguments)
+            self.handoffs.append(record)
+            self.messages.append({"tool": name, "to": recipient, "message": record["task"]})
+            event_name = "handoff"
+            content = f"handoff sent to {recipient}: {record['task']}"
+            result = record
+        else:
+            recipient = str(arguments.get("to") or arguments.get("role") or "room")
+            record = {
+                "tool": name,
+                "to": recipient,
+                "from": arguments.get("from") or arguments.get("sender"),
+                "message": str(arguments.get("message") or arguments.get("task") or ""),
+                "known_role": recipient == "room" or recipient in self.participants,
+                "turn_index": context.get("turn_index"),
+            }
+            if not record["known_role"] and not self.allow_unknown_roles:
+                return self._unknown_role_result(call_id, name, recipient, arguments)
+            self.messages.append(record)
+            event_name = "room_message"
+            content = f"{name} sent to {recipient}: {record['message']}"
+            result = record
+
+        state_payload = self._state_payload()
         return ToolExecutionResult(
             tool_call_id=call_id,
             tool_name=name,
-            content=f"{name} sent to {recipient}: {content}",
-            result=message,
-            state_updates={"multi_agent": {"participants": self.participants, "messages": list(self.messages)}},
+            content=content,
+            result=result,
+            state_updates={"multi_agent": state_payload},
+            artifacts=[self._trace_artifact()],
             events=[
                 SimulationEvent(
                     type="multi_agent",
-                    name=name,
-                    payload=message,
+                    name=event_name,
+                    payload=result,
                 )
             ],
         )
+
+    def _unknown_role_result(
+        self,
+        call_id: Optional[str],
+        tool_name: str,
+        role: str,
+        arguments: Mapping[str, Any],
+    ) -> ToolExecutionResult:
+        return ToolExecutionResult(
+            tool_call_id=call_id,
+            tool_name=tool_name,
+            content=f"Unknown multi-agent role: {role}",
+            result={"role": role, "arguments": copy.deepcopy(dict(arguments))},
+            success=False,
+            error="unknown_role",
+            state_updates={"multi_agent": self._state_payload()},
+            artifacts=[self._trace_artifact()],
+            events=[
+                SimulationEvent(
+                    type="multi_agent",
+                    name="unknown_role",
+                    payload={"role": role, "tool": tool_name, "arguments": dict(arguments)},
+                )
+            ],
+        )
+
+    def _trace_artifact(self) -> SimulationArtifact:
+        return SimulationArtifact(
+            type="trace",
+            role="environment",
+            data=self._trace_payload(),
+            metadata={"kind": "multi_agent_trace"},
+        )
+
+    def _trace_payload(self) -> Dict[str, Any]:
+        return {
+            "kind": "multi_agent_trace",
+            "participants": list(self.participants.keys()),
+            "roles": copy.deepcopy(self.participants),
+            "handoff_contracts": copy.deepcopy(self.handoff_contracts),
+            "messages": copy.deepcopy(self.messages),
+            "handoffs": copy.deepcopy(self.handoffs),
+            "reviews": copy.deepcopy(self.reviews),
+            "reconciliations": copy.deepcopy(self.reconciliations),
+            "state": copy.deepcopy(self.state),
+        }
+
+    def _state_payload(self) -> Dict[str, Any]:
+        return self._trace_payload()
 
 
 class AutonomyLoopEnvironment(EnvironmentAdapter):
@@ -1545,6 +1716,48 @@ def _coerce_event(value: SimulationEvent | Dict[str, Any]) -> SimulationEvent:
     if isinstance(value, SimulationEvent):
         return value
     return SimulationEvent(**value)
+
+
+def _normalize_participants(
+    participants: Iterable[str | Mapping[str, Any]] | Mapping[str, Any],
+) -> Dict[str, Dict[str, Any]]:
+    if isinstance(participants, Mapping):
+        normalized = {}
+        for name, spec in participants.items():
+            role = copy.deepcopy(dict(spec)) if isinstance(spec, Mapping) else {"description": spec}
+            role.setdefault("name", str(name))
+            normalized[str(name)] = role
+        return normalized
+
+    normalized: Dict[str, Dict[str, Any]] = {}
+    for index, participant in enumerate(participants):
+        if isinstance(participant, Mapping):
+            role = copy.deepcopy(dict(participant))
+            name = str(role.get("name") or role.get("role") or f"agent_{index + 1}")
+            role.setdefault("name", name)
+            normalized[name] = role
+        else:
+            name = str(participant)
+            normalized[name] = {"name": name}
+    return normalized
+
+
+def _normalize_handoff_contracts(
+    contracts: Optional[Mapping[str, Any] | Iterable[Mapping[str, Any]]],
+) -> Dict[str, Dict[str, Any]]:
+    if contracts is None:
+        return {}
+    if isinstance(contracts, Mapping):
+        normalized = {}
+        for name, spec in contracts.items():
+            normalized[str(name)] = copy.deepcopy(dict(spec)) if isinstance(spec, Mapping) else {"description": spec}
+        return normalized
+    normalized = {}
+    for index, contract in enumerate(contracts):
+        item = copy.deepcopy(dict(contract))
+        name = str(item.get("to") or item.get("role") or item.get("agent") or item.get("name") or f"contract_{index + 1}")
+        normalized[name] = item
+    return normalized
 
 
 DEFAULT_AUTONOMY_STAGES = ["observe", "orient", "plan", "act", "verify", "reflect", "memory"]

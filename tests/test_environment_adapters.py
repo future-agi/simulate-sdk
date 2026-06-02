@@ -242,6 +242,91 @@ async def test_file_and_multi_agent_environments_update_state():
 
 
 @pytest.mark.asyncio
+async def test_multi_agent_room_records_handoff_review_reconciliation_trace():
+    seen_tools = []
+
+    async def agent(input):
+        seen_tools.extend(tool["name"] for tool in input.tools)
+        return AgentResponse(
+            content="I delegated policy review and reconciled the final answer.",
+            tool_calls=[
+                {
+                    "id": "handoff",
+                    "name": "handoff",
+                    "arguments": {
+                        "to": "policy_specialist",
+                        "task": "Check refund eligibility.",
+                        "reason": "Requires policy expertise.",
+                    },
+                },
+                {
+                    "id": "message",
+                    "name": "send_room_message",
+                    "arguments": {
+                        "to": "room",
+                        "message": "Policy specialist is checking refund eligibility.",
+                    },
+                },
+                {
+                    "id": "review",
+                    "name": "request_review",
+                    "arguments": {
+                        "reviewer": "qa_reviewer",
+                        "target": "refund decision",
+                        "criteria": ["policy", "tone"],
+                    },
+                },
+                {
+                    "id": "reconcile",
+                    "name": "reconcile",
+                    "arguments": {
+                        "summary": "Refund is eligible after policy review.",
+                        "accepted_source": "policy_specialist",
+                        "conflicts": [],
+                    },
+                },
+                {"id": "status", "name": "room_status", "arguments": {}},
+            ],
+        )
+
+    report = await LocalTextEngine().run(
+        scenario=_scenario(),
+        agent_callback=agent,
+        environment=MultiAgentRoomEnvironment(
+            {
+                "support_agent": {"role": "frontline"},
+                "policy_specialist": {"role": "policy"},
+                "qa_reviewer": {"role": "quality"},
+            },
+            handoff_contracts={
+                "policy_specialist": {
+                    "required_output": "eligibility decision with cited policy",
+                    "sla_turns": 1,
+                }
+            },
+        ),
+        max_turns=1,
+        min_turns=1,
+    )
+
+    result = report.results[0]
+    room_state = result.metadata["environment_state"]["multi_agent"]
+    traces = [
+        artifact.data
+        for artifact in result.artifacts
+        if artifact.type == "trace" and artifact.metadata.get("kind") == "multi_agent_trace"
+    ]
+
+    assert {"handoff", "send_room_message", "request_review", "reconcile", "room_status"} <= set(seen_tools)
+    assert room_state["handoffs"][-1]["to"] == "policy_specialist"
+    assert room_state["reviews"][-1]["reviewer"] == "qa_reviewer"
+    assert room_state["reconciliations"][-1]["accepted_source"] == "policy_specialist"
+    assert traces and traces[-1]["reconciliations"]
+    assert any(event.type == "multi_agent" and event.name == "review_requested" for event in result.events)
+    assert any(event.type == "multi_agent" and event.name == "reconciled" for event in result.events)
+
+
+@pytest.mark.asyncio
 async def test_voice_and_image_environments_expose_media_and_execute_tools():
     seen_tools = []
 
