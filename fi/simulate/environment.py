@@ -131,6 +131,9 @@ class ToolMockEnvironment(EnvironmentAdapter):
                 type="tool_execution",
                 name=name,
                 payload={
+                    "tool": name,
+                    "tool_name": name,
+                    "tool_call_id": call_id,
                     "arguments": arguments,
                     "success": result.success,
                     "result": result.result,
@@ -154,6 +157,106 @@ class ToolMockEnvironment(EnvironmentAdapter):
                 }
             )
         return specs
+
+
+class ToolFaultInjectionEnvironment(EnvironmentAdapter):
+    """
+    Controlled local tool/API fault injection.
+
+    Put this adapter before the real tool environment. It intercepts the first
+    N matching calls and returns a failed tool result, then lets later retries
+    fall through to the next environment adapter.
+    """
+
+    name = "tool_fault_injection"
+
+    def __init__(
+        self,
+        failures: Mapping[str, int | Mapping[str, Any]],
+        *,
+        default_error: str = "Injected transient tool failure.",
+    ) -> None:
+        self.failure_specs = {
+            name: self._normalize_spec(spec, default_error=default_error)
+            for name, spec in failures.items()
+        }
+        self.remaining: Dict[str, int] = {}
+
+    def reset(self, **context: Any) -> EnvironmentSnapshot:
+        self.remaining = {
+            name: int(spec["count"])
+            for name, spec in self.failure_specs.items()
+        }
+        return EnvironmentSnapshot(
+            events=[
+                SimulationEvent(
+                    type="environment",
+                    name="tool_fault_injection_ready",
+                    payload={"tools": sorted(self.failure_specs.keys())},
+                )
+            ],
+            metadata={"tool_fault_injection": copy.deepcopy(self.failure_specs)},
+        )
+
+    def handle_tool_call(
+        self,
+        tool_call: Mapping[str, Any],
+        **context: Any,
+    ) -> Optional[ToolExecutionResult]:
+        name = _tool_name(tool_call)
+        if not name or name not in self.failure_specs:
+            return None
+        if self.remaining.get(name, 0) <= 0:
+            return None
+
+        self.remaining[name] -= 1
+        spec = self.failure_specs[name]
+        arguments = _tool_arguments(tool_call)
+        call_id = _tool_call_id(tool_call)
+        error = str(spec.get("error") or "Injected transient tool failure.")
+        result = spec.get("result", {"error": error, "fault_injected": True})
+        payload = {
+            "tool": name,
+            "tool_name": name,
+            "tool_call_id": call_id,
+            "arguments": arguments,
+            "success": False,
+            "result": result,
+            "error": error,
+            "state_updates": {},
+            "fault_injected": True,
+            "remaining_failures": self.remaining[name],
+        }
+        return ToolExecutionResult(
+            tool_call_id=call_id,
+            tool_name=name,
+            content=str(spec.get("content") or f"Tool {name} failed: {error}"),
+            result=result,
+            success=False,
+            error=error,
+            events=[
+                SimulationEvent(type="tool_fault", name=name, payload=copy.deepcopy(payload)),
+                SimulationEvent(type="tool_execution", name=name, payload=copy.deepcopy(payload)),
+            ],
+            metadata={
+                "fault_injected": True,
+                "remaining_failures": self.remaining[name],
+            },
+        )
+
+    @staticmethod
+    def _normalize_spec(
+        spec: int | Mapping[str, Any],
+        *,
+        default_error: str,
+    ) -> Dict[str, Any]:
+        if isinstance(spec, int):
+            return {"count": max(0, spec), "error": default_error}
+        data = dict(spec)
+        count = data.get("count", data.get("failures", 1))
+        data["count"] = max(0, int(count))
+        data.setdefault("error", default_error)
+        return data
 
 
 class BrowserEnvironment(EnvironmentAdapter):

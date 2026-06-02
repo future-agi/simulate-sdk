@@ -269,7 +269,8 @@ See [`examples/local_multimodal_simulation.py`](examples/local_multimodal_simula
 ### Local environments
 
 Use environment adapters when the agent needs a world to act on: mocked APIs,
-browser/CUA state, voice turns, image fixtures, files, framework traces, or multi-agent handoffs.
+transient tool/API faults, browser/CUA state, voice turns, image fixtures,
+files, framework traces, or multi-agent handoffs.
 Browser adapters can emit DOM snapshots, screenshots, action replay,
 console/network logs, and trace artifacts. Voice adapters can replay VAD/STT/TTS
 events, latency profiles, barge-in handling, call routing, audio artifacts, and
@@ -291,6 +292,7 @@ from fi.simulate import (
     ImageEnvironment,
     MultiAgentRoomEnvironment,
     RetrievalMemoryEnvironment,
+    ToolFaultInjectionEnvironment,
     ToolMockEnvironment,
     TestRunner,
     VoiceEnvironment,
@@ -300,6 +302,9 @@ report = await TestRunner().run_test(
     scenario=scenario,
     agent_callback=agent,
     environment=[
+        ToolFaultInjectionEnvironment({
+            "search_order": {"count": 1, "error": "timeout"},
+        }),
         ToolMockEnvironment({
             "search_order": lambda args, ctx: {
                 "content": "Order is ready",
@@ -349,6 +354,11 @@ report = await TestRunner().run_test(
     max_turns=1,
 )
 ```
+
+Put `ToolFaultInjectionEnvironment` before the real or mocked tool adapter to
+fail the first N matching calls, emit structured `tool_fault` and
+`tool_execution` events, and then allow later retries to fall through to the
+next environment adapter.
 
 See [`examples/local_environment_adapters.py`](examples/local_environment_adapters.py) for a full local world simulation with ai-evaluation scoring, and [`examples/local_voice_image_environments.py`](examples/local_voice_image_environments.py) for a voice + image artifact cookbook.
 See [`examples/local_browser_trace_replay.py`](examples/local_browser_trace_replay.py) for a browser/CUA trace replay cookbook with screenshots, DOM, console/network logs, and action replay.

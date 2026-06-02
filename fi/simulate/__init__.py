@@ -36,6 +36,7 @@ from .environment import (
     MultiAgentRoomEnvironment,
     RetrievalMemoryEnvironment,
     ToolExecutionResult,
+    ToolFaultInjectionEnvironment,
     ToolMockEnvironment,
     VoiceEnvironment,
 )
@@ -91,6 +92,7 @@ __all__ = [
     "MultiAgentRoomEnvironment",
     "RetrievalMemoryEnvironment",
     "ToolExecutionResult",
+    "ToolFaultInjectionEnvironment",
     "ToolMockEnvironment",
     "VoiceEnvironment",
     "AttackDefinition",

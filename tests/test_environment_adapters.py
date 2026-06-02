@@ -10,6 +10,7 @@ from fi.simulate import (
     ImageEnvironment,
     MultiAgentRoomEnvironment,
     RetrievalMemoryEnvironment,
+    ToolFaultInjectionEnvironment,
     ToolMockEnvironment,
     VoiceEnvironment,
 )
@@ -107,6 +108,73 @@ async def test_tool_mock_environment_seeds_tools_and_executes_calls():
     assert any(event.type == "tool_execution" for event in result.events)
     tool_execution = next(event for event in result.events if event.type == "tool_execution")
     assert tool_execution.payload["state_updates"]["order"]["status"] == "resolved"
+
+
+@pytest.mark.asyncio
+async def test_tool_fault_injection_fails_then_allows_retry():
+    async def agent(input):
+        return AgentResponse(
+            content="I will update the order.",
+            tool_calls=[
+                {
+                    "id": f"call_order_{input.turn_index}",
+                    "name": "update_order",
+                    "arguments": {"order_id": "ord_123", "status": "resolved"},
+                }
+            ],
+        )
+
+    environment = [
+        ToolFaultInjectionEnvironment(
+            {"update_order": {"count": 1, "error": "timeout"}}
+        ),
+        ToolMockEnvironment(
+            {
+                "update_order": lambda args, ctx: {
+                    "content": "Order ord_123 is resolved",
+                    "result": {"status": args["status"]},
+                    "state_updates": {"order": {"status": args["status"]}},
+                }
+            },
+            tool_schemas=[
+                {
+                    "name": "update_order",
+                    "description": "Update an order by id.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "order_id": {"type": "string"},
+                            "status": {"type": "string"},
+                        },
+                        "required": ["order_id", "status"],
+                    },
+                }
+            ],
+        ),
+    ]
+
+    report = await LocalTextEngine().run(
+        scenario=_scenario(),
+        agent_callback=agent,
+        environment=environment,
+        max_turns=2,
+        min_turns=2,
+    )
+
+    result = report.results[0]
+    executions = [event for event in result.events if event.type == "tool_execution"]
+    assert len(executions) == 2
+    assert executions[0].payload["success"] is False
+    assert executions[0].payload["fault_injected"] is True
+    assert executions[0].payload["tool"] == "update_order"
+    assert executions[0].payload["tool_name"] == "update_order"
+    assert executions[0].payload["tool_call_id"] == "call_order_0"
+    assert executions[1].payload["success"] is True
+    assert executions[1].payload["tool"] == "update_order"
+    assert executions[1].payload["tool_name"] == "update_order"
+    assert executions[1].payload["tool_call_id"] == "call_order_1"
+    assert any(event.type == "tool_fault" for event in result.events)
+    assert result.metadata["environment_state"]["order"]["status"] == "resolved"
 
 
 @pytest.mark.asyncio
