@@ -354,7 +354,7 @@ See [`examples/local_environment_adapters.py`](examples/local_environment_adapte
 See [`examples/local_browser_trace_replay.py`](examples/local_browser_trace_replay.py) for a browser/CUA trace replay cookbook with screenshots, DOM, console/network logs, and action replay.
 See [`examples/local_voice_replay_routing.py`](examples/local_voice_replay_routing.py) for a voice replay cookbook with VAD/STT/TTS events, interruption handling, and call routing.
 See [`examples/local_framework_trace_replay.py`](examples/local_framework_trace_replay.py) for a framework trace replay cookbook with native spans/events from orchestration frameworks.
-See [`examples/local_retrieval_memory_attribution.py`](examples/local_retrieval_memory_attribution.py) for a retrieval/memory attribution cookbook with queries, documents, citations, memory reads/writes, and freshness evidence.
+See [`examples/local_retrieval_memory_attribution.py`](examples/local_retrieval_memory_attribution.py) for a retrieval/memory attribution cookbook with queries, ranked documents, retrieval scores, citations, memory reads/writes, and freshness evidence.
 See [`examples/local_autonomy_loop_trace.py`](examples/local_autonomy_loop_trace.py) for an autonomy-loop cookbook with observe/orient/plan/act/verify/reflect, feedback, memory, and skill-library evidence.
 See [`examples/local_multi_agent_handoff_trace.py`](examples/local_multi_agent_handoff_trace.py) for a multi-agent handoff cookbook with roles, contracts, delegated work, review, reconciliation, and trace coverage.
 See [`examples/local_adversarial_environment_pack.py`](examples/local_adversarial_environment_pack.py) for an indirect prompt-injection pentest using hostile tool, file, browser, and memory surfaces.
@@ -421,7 +421,7 @@ For fully local agent scoring, use `evaluate_agent_report`. It scores the
 normalized simulation trace directly: trajectory, tool use, prompt-injection
 resistance, environment-injection resistance, memory integrity, browser/CUA
 safety, browser trace coverage, voice turn-taking, voice trace coverage,
-framework trace coverage, retrieval/memory attribution, autonomy-loop coverage, multi-agent trace coverage, artifact coverage, and expected state.
+framework trace coverage, retrieval context quality, retrieval/memory attribution, autonomy-loop coverage, multi-agent trace coverage, artifact coverage, and expected state.
 
 ```python
 from fi.simulate import evaluate_agent_report
@@ -438,6 +438,9 @@ evaluation = evaluate_agent_report(
         "required_voice_trace": ["audio", "vad", "stt", "tts", "interruption", "route"],
         "required_framework_trace": ["agent", "model", "tool", "handoff", "guardrail"],
         "required_retrieval_memory_trace": ["query", "document", "citation", "memory_read", "memory_write"],
+        "expected_retrieval_doc_ids": ["refund_policy_current"],
+        "forbidden_retrieval_doc_ids": ["refund_policy_old"],
+        "require_current_retrieval": True,
         "required_autonomy_loop": ["observe", "orient", "plan", "act", "verify", "reflect"],
         "required_multi_agent_trace": ["role", "contract", "handoff", "review", "reconciliation"],
         "expected_state": {"case": {"resolved": True}},

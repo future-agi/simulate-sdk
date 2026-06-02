@@ -1208,6 +1208,16 @@ class RetrievalMemoryEnvironment(EnvironmentAdapter):
                     "top_k": top_k,
                     "include_stale": include_stale,
                     "documents": [doc["id"] for doc in documents],
+                    "ranked_documents": [
+                        {
+                            "id": doc["id"],
+                            "rank": doc.get("retrieval_rank", index + 1),
+                            "score": doc.get("retrieval_score", 0),
+                            "current": doc.get("current"),
+                            "source": doc.get("source"),
+                        }
+                        for index, doc in enumerate(documents)
+                    ],
                 }
             )
             event_name = "query"
@@ -1278,7 +1288,13 @@ class RetrievalMemoryEnvironment(EnvironmentAdapter):
                 continue
             ranked.append((score, document))
         ranked.sort(key=lambda item: (-item[0], str(item[1].get("id"))))
-        return [copy.deepcopy(document) for _, document in ranked[:top_k]]
+        results = []
+        for index, (score, document) in enumerate(ranked[:top_k]):
+            item = copy.deepcopy(document)
+            item["retrieval_score"] = score
+            item["retrieval_rank"] = index + 1
+            results.append(item)
+        return results
 
     def _tool_specs(self) -> List[Dict[str, Any]]:
         return [

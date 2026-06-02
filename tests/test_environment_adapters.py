@@ -329,6 +329,9 @@ async def test_retrieval_memory_environment_records_queries_citations_and_memory
         "retrieval_memory_status",
     } <= set(seen_tools)
     assert state["queries"][-1]["documents"] == ["refund_policy_current"]
+    assert state["queries"][-1]["ranked_documents"][0]["id"] == "refund_policy_current"
+    assert state["queries"][-1]["ranked_documents"][0]["rank"] == 1
+    assert state["queries"][-1]["ranked_documents"][0]["score"] > 0
     assert state["memory_reads"][-1]["value"] == "123"
     assert state["document_reads"][-1]["id"] == "refund_policy_current"
     assert state["citations"][-1]["doc_ids"] == ["refund_policy_current"]
