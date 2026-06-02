@@ -1,4 +1,5 @@
 import json
+import zipfile
 
 import pytest
 
@@ -15,9 +16,11 @@ from fi.simulate import (
     ToolFaultInjectionEnvironment,
     ToolMockEnvironment,
     VoiceEnvironment,
+    load_playwright_trace_export,
     load_framework_trace_export,
     normalize_framework_trace_events,
     normalize_framework_trace_export,
+    normalize_playwright_trace_export,
 )
 from fi.simulate.simulation.engines.local_text import LocalTextEngine
 from fi.simulate.simulation.models import Persona, Scenario
@@ -442,6 +445,190 @@ async def test_browser_environment_records_coordinate_regions_and_screenshot_dif
     assert trace["regions"]["confirm_button"]["width"] == 180.0
     assert trace["screenshot_diffs"][-1]["changed_regions"] == ["confirm_button", "status_banner"]
     assert any(event.type == "browser_screenshot_diff" for event in result.events)
+
+
+def test_normalize_playwright_trace_export_extracts_trace_zip(tmp_path):
+    trace_path = tmp_path / "playwright-trace.zip"
+    trace_records = [
+        {
+            "type": "frame-snapshot",
+            "snapshot": {
+                "id": "checkout_before",
+                "url": "https://shop.example.com/checkout",
+                "html": "<button id='confirm'>Confirm</button>",
+                "screenshotSha1": "before.png",
+            },
+        },
+        {
+            "type": "before",
+            "callId": "call_confirm",
+            "apiName": "locator.click",
+            "pageUrl": "https://shop.example.com/checkout",
+            "params": {
+                "selector": "#confirm",
+                "boundingBox": {"x": 160, "y": 380, "width": 180, "height": 54},
+            },
+        },
+        {"type": "after", "callId": "call_confirm", "endTime": 140, "startTime": 100},
+        {
+            "type": "console",
+            "level": "warning",
+            "text": "layout shifted after banner render",
+        },
+        {
+            "type": "resource-snapshot",
+            "snapshot": {
+                "url": "https://shop.example.com/api/order",
+                "method": "POST",
+                "status": 200,
+            },
+        },
+        {
+            "type": "frame-snapshot",
+            "snapshot": {
+                "id": "checkout_current",
+                "url": "https://shop.example.com/checkout",
+                "html": "<aside>Banner</aside><button id='confirm'>Confirm</button>",
+                "screenshotSha1": "after.png",
+            },
+        },
+    ]
+    with zipfile.ZipFile(trace_path, "w") as archive:
+        archive.writestr("trace.trace", "\n".join(json.dumps(record) for record in trace_records))
+        archive.writestr("resources/before.png", b"before")
+        archive.writestr("resources/after.png", b"after")
+        archive.writestr("resources/checkout.webm", b"video")
+
+    environment = load_playwright_trace_export(
+        trace_path,
+        perturbations=[
+            {
+                "id": "banner_shift",
+                "type": "layout_shift",
+                "score": 0.18,
+                "affected_regions": ["call_confirm_target"],
+                "delta": {"y": 70},
+            },
+            {
+                "id": "stale_before",
+                "type": "stale_screenshot",
+                "snapshot_id": "checkout_before",
+            },
+        ],
+    )
+    snapshot = environment.reset()
+    trace_state = snapshot.state["browser"]
+    trace_payload = [
+        artifact.data
+        for artifact in snapshot.artifacts
+        if artifact.type == "trace" and artifact.metadata.get("kind") == "browser_trace"
+    ][-1]
+
+    assert trace_payload["kind"] == "browser_trace"
+    assert trace_state["snapshot"]["id"] == "checkout_before"
+    assert trace_state["snapshot"]["metadata"]["stale_screenshot"] is True
+    assert trace_state["regions"]["call_confirm_target"]["y"] == 450.0
+    assert trace_state["video_artifacts"][0]["uri"].endswith("resources/checkout.webm")
+    assert any(artifact.type == "video" for artifact in snapshot.artifacts)
+    assert any(event.type == "browser_perturbation" for event in snapshot.events)
+    assert snapshot.metadata["browser_trace"]["video_artifacts"] == 1
+
+
+@pytest.mark.asyncio
+async def test_browser_environment_replays_playwright_trace_with_refresh_and_layout_shift(tmp_path):
+    trace_path = tmp_path / "playwright-trace.zip"
+    trace_records = [
+        {
+            "type": "frame-snapshot",
+            "snapshot": {
+                "id": "checkout_before",
+                "url": "https://shop.example.com/checkout",
+                "html": "<button id='confirm'>Confirm</button>",
+                "screenshotSha1": "before.png",
+            },
+        },
+        {
+            "type": "before",
+            "callId": "call_confirm",
+            "apiName": "locator.click",
+            "pageUrl": "https://shop.example.com/checkout",
+            "params": {
+                "selector": "#confirm",
+                "boundingBox": {"x": 160, "y": 380, "width": 180, "height": 54},
+            },
+        },
+        {
+            "type": "frame-snapshot",
+            "snapshot": {
+                "id": "checkout_current",
+                "url": "https://shop.example.com/checkout",
+                "html": "<aside>Banner</aside><button id='confirm'>Confirm</button>",
+                "screenshotSha1": "after.png",
+            },
+        },
+    ]
+    with zipfile.ZipFile(trace_path, "w") as archive:
+        archive.writestr("trace.trace", "\n".join(json.dumps(record) for record in trace_records))
+        archive.writestr("resources/before.png", b"before")
+        archive.writestr("resources/after.png", b"after")
+        archive.writestr("resources/checkout.webm", b"video")
+
+    async def agent(input):
+        return AgentResponse(
+            content="I refresh the stale screenshot, then click the shifted confirm control.",
+            tool_calls=[
+                {"id": "refresh", "name": "browser_refresh_snapshot", "arguments": {}},
+                {
+                    "id": "click",
+                    "name": "computer_click",
+                    "arguments": {"x": 190, "y": 475, "action": "locator.click", "selector": "#confirm"},
+                },
+            ],
+        )
+
+    report = await LocalTextEngine().run(
+        scenario=_scenario(),
+        agent_callback=agent,
+        environment=load_playwright_trace_export(
+            trace_path,
+            allowed_domains=["shop.example.com"],
+            perturbations=[
+                {
+                    "id": "banner_shift",
+                    "type": "layout_shift",
+                    "score": 0.18,
+                    "affected_regions": ["call_confirm_target"],
+                    "delta": {"y": 70},
+                },
+                {
+                    "id": "stale_before",
+                    "type": "stale_screenshot",
+                    "snapshot_id": "checkout_before",
+                },
+            ],
+        ),
+        max_turns=1,
+        min_turns=1,
+        modality="cua",
+    )
+
+    result = report.results[0]
+    browser = result.metadata["environment_state"]["browser"]
+    action = browser["action_replay"][-1]
+    trace = [
+        artifact.data
+        for artifact in result.artifacts
+        if artifact.type == "trace" and artifact.metadata.get("kind") == "browser_trace"
+    ][-1]
+
+    assert browser["snapshot"]["id"] == "checkout_current"
+    assert action["matched"] is True
+    assert action["success"] is True
+    assert action["region_matched"] is True
+    assert not action.get("stale_screenshot", False)
+    assert trace["perturbations"][0]["type"] == "layout_shift"
+    assert trace["video_artifacts"][0]["source"] == "playwright_trace_zip"
+    assert any(artifact.type == "video" for artifact in result.artifacts)
 
 
 @pytest.mark.asyncio

@@ -4,6 +4,7 @@ import copy
 import json
 import os
 import urllib.request
+import zipfile
 from abc import ABC
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional
 from urllib.parse import urlparse
@@ -280,7 +281,21 @@ class BrowserEnvironment(EnvironmentAdapter):
         console_logs: Optional[Iterable[str | Mapping[str, Any]]] = None,
         network_log: Optional[Iterable[Mapping[str, Any]]] = None,
         prompt_injections: Optional[Iterable[str | Mapping[str, Any]]] = None,
+        playwright_trace: Optional[Any] = None,
+        playwright_trace_source: Optional[str | os.PathLike[str]] = None,
+        video_artifacts: Optional[Iterable[str | Mapping[str, Any]]] = None,
+        perturbations: Optional[Iterable[str | Mapping[str, Any]]] = None,
     ) -> None:
+        trace_fixture = _normalize_playwright_trace_export(
+            _load_playwright_trace_source(playwright_trace_source) if playwright_trace_source is not None else playwright_trace,
+            source_label=_browser_source_label(playwright_trace_source) if playwright_trace_source is not None else None,
+        )
+        trace_snapshots = list(trace_fixture.get("snapshots", []))
+        if trace_snapshots and url == "https://example.test/":
+            first_snapshot = trace_snapshots[0]
+            url = str(first_snapshot.get("url") or url)
+            dom = str(first_snapshot.get("dom") or dom)
+            screenshot_uri = first_snapshot.get("screenshot_uri", screenshot_uri)
         self.initial_url = url
         self.initial_dom = dom
         self.initial_screenshot_uri = screenshot_uri
@@ -290,28 +305,52 @@ class BrowserEnvironment(EnvironmentAdapter):
         self.allowed_domains = {domain.lower() for domain in allowed_domains or []}
         self.initial_state = copy.deepcopy(state or {})
         self.state = copy.deepcopy(self.initial_state)
-        self.initial_snapshots = _normalize_browser_snapshots(
-            snapshots,
-            url=url,
-            dom=dom,
-            screenshot_uri=screenshot_uri,
-            state=self.initial_state,
+        initial_perturbations = _normalize_browser_perturbations(
+            [*list(trace_fixture.get("perturbations", [])), *list(perturbations or [])]
+        )
+        self.initial_snapshots = _apply_browser_perturbations_to_snapshots(
+            _normalize_browser_snapshots(
+                [*trace_snapshots, *list(snapshots or [])],
+                url=url,
+                dom=dom,
+                screenshot_uri=screenshot_uri,
+                state=self.initial_state,
+            ),
+            initial_perturbations,
         )
         self.snapshots = copy.deepcopy(self.initial_snapshots)
         self.current_snapshot_index = 0
-        self.initial_actions = _normalize_browser_actions(actions)
+        self.initial_actions = _normalize_browser_actions(
+            [*list(trace_fixture.get("actions", [])), *_browser_action_items(actions)]
+        )
         self.actions = copy.deepcopy(self.initial_actions)
-        self.initial_regions = _normalize_browser_regions(regions)
+        self.initial_perturbations = initial_perturbations
+        self.initial_regions = _apply_browser_perturbations_to_regions(
+            _normalize_browser_regions([*list(trace_fixture.get("regions", [])), *_browser_region_items(regions)]),
+            self.initial_perturbations,
+        )
         self.regions = copy.deepcopy(self.initial_regions)
-        self.initial_console_logs = [_normalize_browser_log(item) for item in console_logs or []]
-        self.initial_network_log = [dict(item) for item in network_log or []]
+        self.initial_console_logs = [
+            _normalize_browser_log(item)
+            for item in [*list(trace_fixture.get("console_logs", [])), *list(console_logs or [])]
+        ]
+        self.initial_network_log = [
+            dict(item)
+            for item in [*list(trace_fixture.get("network_log", [])), *list(network_log or [])]
+        ]
         self.console_logs = copy.deepcopy(self.initial_console_logs)
         self.network_log = copy.deepcopy(self.initial_network_log)
         self.initial_prompt_injections = _normalize_browser_prompt_injections(
-            prompt_injections,
+            [*list(trace_fixture.get("prompt_injections", [])), *list(prompt_injections or [])],
             self.initial_regions,
         )
         self.prompt_injections = copy.deepcopy(self.initial_prompt_injections)
+        self.initial_video_artifacts = _normalize_browser_video_artifacts(
+            [*list(trace_fixture.get("video_artifacts", [])), *list(video_artifacts or [])]
+        )
+        self.video_artifacts = copy.deepcopy(self.initial_video_artifacts)
+        self.trace_import_metadata = copy.deepcopy(dict(trace_fixture.get("metadata", {})))
+        self.perturbations = copy.deepcopy(self.initial_perturbations)
         self.action_replay: List[Dict[str, Any]] = []
         self.dom_mutations: List[Dict[str, Any]] = []
         self.screenshot_diffs: List[Dict[str, Any]] = []
@@ -327,11 +366,14 @@ class BrowserEnvironment(EnvironmentAdapter):
         self.console_logs = copy.deepcopy(self.initial_console_logs)
         self.network_log = copy.deepcopy(self.initial_network_log)
         self.prompt_injections = copy.deepcopy(self.initial_prompt_injections)
+        self.video_artifacts = copy.deepcopy(self.initial_video_artifacts)
+        self.perturbations = copy.deepcopy(self.initial_perturbations)
         self.current_snapshot_index = 0
         self.action_replay = []
         self.dom_mutations = []
         self.screenshot_diffs = []
         artifacts = self._snapshot_artifacts(self._current_snapshot())
+        artifacts.extend(self._video_artifacts())
         artifacts.append(self._trace_artifact())
         events = [
             SimulationEvent(
@@ -345,6 +387,9 @@ class BrowserEnvironment(EnvironmentAdapter):
                     "regions": sorted(self.regions.keys()),
                     "console_logs": len(self.console_logs),
                     "network_log": len(self.network_log),
+                    "video_artifacts": len(self.video_artifacts),
+                    "perturbations": len(self.perturbations),
+                    "trace_import": copy.deepcopy(self.trace_import_metadata),
                 },
             ),
             SimulationEvent(
@@ -375,6 +420,14 @@ class BrowserEnvironment(EnvironmentAdapter):
                     type="environment_injection",
                     name="browser_prompt_injection_surface",
                     payload=copy.deepcopy(injection),
+                )
+            )
+        for perturbation in self.perturbations:
+            events.append(
+                SimulationEvent(
+                    type="browser_perturbation",
+                    name=str(perturbation.get("type") or perturbation.get("id") or "browser_perturbation"),
+                    payload=copy.deepcopy(perturbation),
                 )
             )
         return EnvironmentSnapshot(
@@ -409,6 +462,10 @@ class BrowserEnvironment(EnvironmentAdapter):
                     "description": "Return the current simulated browser DOM, screenshot metadata, and action replay.",
                 },
                 {
+                    "name": "browser_refresh_snapshot",
+                    "description": "Move to the latest non-stale simulated browser snapshot for the current URL.",
+                },
+                {
                     "name": "browser_console",
                     "description": "Return simulated browser console logs.",
                 },
@@ -427,6 +484,8 @@ class BrowserEnvironment(EnvironmentAdapter):
                     "regions": sorted(self.regions.keys()),
                     "console_logs": len(self.console_logs),
                     "network_log": len(self.network_log),
+                    "video_artifacts": len(self.video_artifacts),
+                    "perturbations": len(self.perturbations),
                 }
             },
         )
@@ -437,7 +496,7 @@ class BrowserEnvironment(EnvironmentAdapter):
         **context: Any,
     ) -> Optional[ToolExecutionResult]:
         name = _tool_name(tool_call)
-        if name in {"browser_snapshot", "browser_console", "browser_network"}:
+        if name in {"browser_snapshot", "browser_refresh_snapshot", "browser_console", "browser_network"}:
             return self._inspection_result(tool_call, name)
         if name not in {"browser_navigate", "browser_click", "playwright_click", "computer_click"}:
             return None
@@ -674,6 +733,10 @@ class BrowserEnvironment(EnvironmentAdapter):
         elif name == "browser_network":
             result = {"network_log": copy.deepcopy(self.network_log)}
             event_type = "browser_network"
+        elif name == "browser_refresh_snapshot":
+            refreshed = self._refresh_snapshot()
+            result = {"refreshed": refreshed, "snapshot": self._snapshot_summary(self._current_snapshot())}
+            event_type = "browser_snapshot"
         else:
             result = self._trace_payload()
             event_type = "browser_snapshot"
@@ -682,7 +745,8 @@ class BrowserEnvironment(EnvironmentAdapter):
             tool_name=name,
             content=json.dumps(result, default=str),
             result=result,
-            artifacts=self._snapshot_artifacts(self._current_snapshot()) + [self._trace_artifact()],
+            artifacts=self._snapshot_artifacts(self._current_snapshot()) + self._video_artifacts() + [self._trace_artifact()],
+            state_updates={"browser": self._state_payload()} if name == "browser_refresh_snapshot" else {},
             events=[
                 SimulationEvent(
                     type=event_type,
@@ -691,6 +755,24 @@ class BrowserEnvironment(EnvironmentAdapter):
                 )
             ],
         )
+
+    def _refresh_snapshot(self) -> bool:
+        current = self._current_snapshot()
+        current_url = str(current.get("url") or self.url)
+        old_index = self.current_snapshot_index
+        for index in range(len(self.snapshots) - 1, -1, -1):
+            snapshot = self.snapshots[index]
+            metadata = _as_mapping(snapshot.get("metadata"))
+            if str(snapshot.get("url") or current_url) != current_url:
+                continue
+            if metadata.get("stale") or metadata.get("stale_screenshot"):
+                continue
+            self.current_snapshot_index = index
+            self.url = str(snapshot.get("url") or self.url)
+            self.dom = str(snapshot.get("dom", self.dom) or "")
+            self.screenshot_uri = snapshot.get("screenshot_uri", self.screenshot_uri)
+            return index != old_index
+        return False
 
     def _current_snapshot(self) -> Dict[str, Any]:
         return copy.deepcopy(self.snapshots[self.current_snapshot_index])
@@ -746,6 +828,7 @@ class BrowserEnvironment(EnvironmentAdapter):
             "region_matched": region_matched,
             "prompt_injection_touched": bool(touched_surfaces),
             "prompt_injection_surfaces": copy.deepcopy(touched_surfaces),
+            **_browser_snapshot_perturbation_payload(self._current_snapshot(), self.perturbations),
         }
         return {key: value for key, value in payload.items() if value not in (None, [], {})}
 
@@ -850,7 +933,6 @@ class BrowserEnvironment(EnvironmentAdapter):
                 result["screenshot_diff"] = screenshot_diff
             return result
 
-        self.current_snapshot_index = self._snapshot_index_for_url(self.url)
         result = {"state_updates": state_updates}
         if screenshot_diff:
             result["screenshot_diff"] = screenshot_diff
@@ -886,6 +968,22 @@ class BrowserEnvironment(EnvironmentAdapter):
             )
         return artifacts
 
+    def _video_artifacts(self) -> List[SimulationArtifact]:
+        artifacts: List[SimulationArtifact] = []
+        for video in self.video_artifacts:
+            artifacts.append(
+                SimulationArtifact(
+                    type="video",
+                    uri=video.get("uri"),
+                    path=video.get("path"),
+                    data=video.get("data"),
+                    mime_type=video.get("mime_type", "video/webm"),
+                    role="environment",
+                    metadata={key: value for key, value in video.items() if key not in {"uri", "path", "data", "mime_type"}},
+                )
+            )
+        return artifacts
+
     def _trace_artifact(self) -> SimulationArtifact:
         return SimulationArtifact(
             type="trace",
@@ -907,6 +1005,9 @@ class BrowserEnvironment(EnvironmentAdapter):
             "console_logs": copy.deepcopy(self.console_logs),
             "network_log": copy.deepcopy(self.network_log),
             "prompt_injections": copy.deepcopy(self.prompt_injections),
+            "video_artifacts": copy.deepcopy(self.video_artifacts),
+            "perturbations": copy.deepcopy(self.perturbations),
+            "trace_import": copy.deepcopy(self.trace_import_metadata),
             "final_state": {"browser": self._state_payload()},
         }
 
@@ -920,6 +1021,8 @@ class BrowserEnvironment(EnvironmentAdapter):
             "regions": copy.deepcopy(self.regions),
             "console_logs": copy.deepcopy(self.console_logs),
             "network_log": copy.deepcopy(self.network_log),
+            "video_artifacts": copy.deepcopy(self.video_artifacts),
+            "perturbations": copy.deepcopy(self.perturbations),
         }
         if last_action is not None:
             payload["last_action"] = last_action
@@ -933,6 +1036,49 @@ class BrowserEnvironment(EnvironmentAdapter):
             "has_screenshot": bool(snapshot.get("screenshot_uri") or snapshot.get("screenshot_path")),
             "metadata": copy.deepcopy(snapshot.get("metadata", {})),
         }
+
+
+def normalize_playwright_trace_export(
+    trace_export: Any,
+    *,
+    source_label: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Normalize Playwright trace JSON/JSONL/zip data into BrowserEnvironment fixtures."""
+
+    return _normalize_playwright_trace_export(trace_export, source_label=source_label)
+
+
+def load_playwright_trace_export(
+    source: str | os.PathLike[str] | Mapping[str, Any] | Iterable[Any],
+    *,
+    url: str = "https://example.test/",
+    dom: str = "<html><body></body></html>",
+    screenshot_uri: Optional[str] = None,
+    allowed_domains: Optional[Iterable[str]] = None,
+    state: Optional[Dict[str, Any]] = None,
+    perturbations: Optional[Iterable[str | Mapping[str, Any]]] = None,
+) -> BrowserEnvironment:
+    """Load a Playwright trace export and return a browser replay environment."""
+
+    if isinstance(source, (str, os.PathLike)):
+        return BrowserEnvironment(
+            url=url,
+            dom=dom,
+            screenshot_uri=screenshot_uri,
+            allowed_domains=allowed_domains,
+            state=state,
+            playwright_trace_source=source,
+            perturbations=perturbations,
+        )
+    return BrowserEnvironment(
+        url=url,
+        dom=dom,
+        screenshot_uri=screenshot_uri,
+        allowed_domains=allowed_domains,
+        state=state,
+        playwright_trace=source,
+        perturbations=perturbations,
+    )
 
 
 class VoiceEnvironment(EnvironmentAdapter):
@@ -4424,6 +4570,591 @@ def _normalize_skill_library(
         name = str(item.get("name") or item.get("skill") or f"skill_{index + 1}")
         normalized[name] = item
     return normalized
+
+
+def _browser_action_items(
+    actions: Optional[Mapping[str, Any] | Iterable[Mapping[str, Any]]],
+) -> List[Dict[str, Any]]:
+    if actions is None:
+        return []
+    if isinstance(actions, Mapping):
+        return [
+            {"selector": str(key), **copy.deepcopy(dict(value))}
+            if isinstance(value, Mapping)
+            else {"selector": str(key), "next_url": value}
+            for key, value in actions.items()
+        ]
+    return [copy.deepcopy(dict(item)) for item in actions]
+
+
+def _browser_region_items(
+    regions: Optional[Mapping[str, Any] | Iterable[Mapping[str, Any]]],
+) -> List[Dict[str, Any]]:
+    if regions is None:
+        return []
+    if isinstance(regions, Mapping):
+        items: List[Dict[str, Any]] = []
+        for name, value in regions.items():
+            item = copy.deepcopy(dict(value)) if isinstance(value, Mapping) else {"bounds": value}
+            item.setdefault("name", str(name))
+            items.append(item)
+        return items
+    return [copy.deepcopy(dict(item)) for item in regions]
+
+
+def _load_playwright_trace_source(source: str | os.PathLike[str]) -> Dict[str, Any]:
+    source_text = os.fspath(source)
+    metadata = {"source": _browser_source_label(source), "source_type": "playwright_trace"}
+    if zipfile.is_zipfile(source_text):
+        records: List[Any] = []
+        resources: Dict[str, str] = {}
+        videos: List[Dict[str, Any]] = []
+        with zipfile.ZipFile(source_text) as archive:
+            for name in archive.namelist():
+                lower = name.lower()
+                uri = f"zip://{source_text}#{name}"
+                if lower.endswith((".png", ".jpg", ".jpeg", ".webp")):
+                    resources[name] = uri
+                    resources[os.path.basename(name)] = uri
+                    continue
+                if lower.endswith((".webm", ".mp4", ".mov")):
+                    videos.append(
+                        {
+                            "uri": uri,
+                            "id": os.path.basename(name),
+                            "source": "playwright_trace_zip",
+                            "mime_type": _browser_video_mime_type(name),
+                        }
+                    )
+                    continue
+                if not lower.endswith((".trace", ".json", ".jsonl")):
+                    continue
+                try:
+                    text = archive.read(name).decode("utf-8")
+                except UnicodeDecodeError:
+                    continue
+                parsed = _parse_framework_trace_export_text(text)
+                records.extend(_as_iterable(parsed))
+        return {"records": records, "resources": resources, "video_artifacts": videos, "metadata": metadata}
+
+    parsed = _load_framework_trace_export_source(source_text)
+    return {"records": _as_iterable(parsed), "metadata": metadata}
+
+
+def _browser_source_label(source: Optional[str | os.PathLike[str]]) -> Optional[str]:
+    if source is None:
+        return None
+    source_text = os.fspath(source)
+    parsed = urlparse(source_text)
+    if parsed.scheme in {"http", "https"}:
+        return f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+    return source_text
+
+
+def _normalize_playwright_trace_export(
+    trace_export: Any,
+    *,
+    source_label: Optional[str] = None,
+) -> Dict[str, Any]:
+    fixture = {
+        "snapshots": [],
+        "actions": [],
+        "regions": [],
+        "console_logs": [],
+        "network_log": [],
+        "video_artifacts": [],
+        "prompt_injections": [],
+        "perturbations": [],
+        "metadata": {"source": source_label} if source_label else {},
+    }
+    if trace_export is None:
+        return fixture
+
+    export = trace_export
+    resources: Dict[str, str] = {}
+    if isinstance(export, Mapping) and any(key in export for key in ("records", "resources", "video_artifacts", "metadata")):
+        wrapper = copy.deepcopy(dict(export))
+        resources = {str(key): str(value) for key, value in dict(wrapper.get("resources", {})).items()}
+        fixture["video_artifacts"].extend(_as_iterable(wrapper.get("video_artifacts", [])))
+        fixture["metadata"].update(copy.deepcopy(dict(wrapper.get("metadata", {}))))
+        export = wrapper.get("records", wrapper)
+
+    direct = _coerce_plain_dict(export) if isinstance(export, Mapping) else {}
+    fixture["snapshots"].extend(_as_iterable(direct.get("snapshots", [])))
+    fixture["actions"].extend(_as_iterable(direct.get("actions", [])))
+    fixture["regions"].extend(_as_iterable(direct.get("regions", [])))
+    fixture["console_logs"].extend(_as_iterable(direct.get("console_logs", direct.get("console", []))))
+    fixture["network_log"].extend(_as_iterable(direct.get("network_log", direct.get("network", []))))
+    fixture["video_artifacts"].extend(_as_iterable(direct.get("videos", direct.get("video", []))))
+    fixture["prompt_injections"].extend(_as_iterable(direct.get("prompt_injections", [])))
+    fixture["perturbations"].extend(_as_iterable(direct.get("perturbations", [])))
+
+    records = _playwright_trace_records(export)
+    actions_by_id: Dict[str, Dict[str, Any]] = {}
+    current_url: Optional[str] = None
+    for index, record in enumerate(records):
+        record_dict = _coerce_plain_dict(record)
+        if not record_dict:
+            continue
+        current_url = str(record_dict.get("url") or record_dict.get("pageUrl") or current_url or "")
+
+        action = _playwright_action_from_record(record_dict, index=index, current_url=current_url)
+        if action:
+            call_id = str(action.get("id"))
+            if _playwright_record_type(record_dict) in {"after", "afteraction"} and call_id in actions_by_id:
+                actions_by_id[call_id].update(action)
+            else:
+                actions_by_id[call_id] = action
+            region = action.get("region")
+            if isinstance(region, Mapping):
+                fixture["regions"].append(region)
+
+        snapshot = _playwright_snapshot_from_record(record_dict, index=index, resources=resources, current_url=current_url)
+        if snapshot:
+            fixture["snapshots"].append(snapshot)
+            current_url = str(snapshot.get("url") or current_url or "")
+
+        log = _playwright_console_log_from_record(record_dict)
+        if log:
+            fixture["console_logs"].append(log)
+
+        request = _playwright_network_log_from_record(record_dict)
+        if request:
+            fixture["network_log"].append(request)
+
+        fixture["video_artifacts"].extend(_playwright_video_artifacts_from_record(record_dict, resources=resources))
+        fixture["perturbations"].extend(_playwright_perturbations_from_record(record_dict))
+
+    fixture["actions"].extend(actions_by_id.values())
+    fixture["video_artifacts"] = _dedupe_dicts(fixture["video_artifacts"])
+    fixture["snapshots"] = _dedupe_dicts(fixture["snapshots"])
+    fixture["actions"] = _dedupe_dicts(fixture["actions"])
+    fixture["regions"] = _dedupe_dicts(fixture["regions"])
+    fixture["console_logs"] = _dedupe_dicts(fixture["console_logs"])
+    fixture["network_log"] = _dedupe_dicts(fixture["network_log"])
+    fixture["perturbations"] = _dedupe_dicts(fixture["perturbations"])
+    if any(fixture[key] for key in ("snapshots", "actions", "video_artifacts", "perturbations")):
+        fixture["metadata"].setdefault("source_type", "playwright_trace")
+    return fixture
+
+
+def _playwright_trace_records(export: Any) -> List[Any]:
+    if export is None:
+        return []
+    if isinstance(export, str):
+        text = export.strip()
+        if text.startswith(("{", "[")) or "\n" in text:
+            return _playwright_trace_records(_parse_framework_trace_export_text(text))
+        return []
+    if hasattr(export, "model_dump"):
+        return _playwright_trace_records(export.model_dump())
+    if hasattr(export, "dict"):
+        return _playwright_trace_records(export.dict())
+    if isinstance(export, Mapping):
+        data = dict(export)
+        records: List[Any] = []
+        for key in ("records", "events", "traceEvents", "trace_events", "actions", "snapshots"):
+            if key in data:
+                records.extend(_playwright_trace_records(data[key]))
+        if records:
+            return records
+        if any(key in data for key in ("type", "method", "apiName", "snapshot", "params", "url", "selector")):
+            return [data]
+        for key in ("data", "payload", "result"):
+            if isinstance(data.get(key), (Mapping, list, tuple)):
+                nested = _playwright_trace_records(data[key])
+                if nested:
+                    return nested
+        return []
+    if isinstance(export, Iterable):
+        records: List[Any] = []
+        for item in export:
+            records.extend(_playwright_trace_records(item))
+        return records
+    return []
+
+
+def _playwright_record_type(record: Mapping[str, Any]) -> str:
+    return str(record.get("type") or record.get("event") or record.get("kind") or "").lower().replace("_", "")
+
+
+def _playwright_action_from_record(
+    record: Mapping[str, Any],
+    *,
+    index: int,
+    current_url: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    params = _coerce_plain_dict(record.get("params") or record.get("arguments") or record.get("args"))
+    method = str(
+        record.get("apiName")
+        or record.get("method")
+        or record.get("action")
+        or record.get("name")
+        or params.get("method")
+        or ""
+    )
+    record_type = _playwright_record_type(record)
+    if record_type in {"after", "afteraction"}:
+        call_id = str(record.get("callId") or record.get("call_id") or record.get("id") or f"playwright_action_{index + 1}")
+        error = record.get("error") or record.get("errorMessage")
+        return {
+            "id": call_id,
+            "success": not bool(error),
+            "error": str(error) if error else None,
+            "duration_ms": _playwright_duration_ms(record),
+        }
+    if not method:
+        return None
+    method_lower = method.lower()
+    if not any(token in method_lower for token in ("click", "tap", "goto", "navigate", "fill", "press", "hover", "check", "select")):
+        return None
+    selector = (
+        params.get("selector")
+        or params.get("locator")
+        or params.get("target")
+        or record.get("selector")
+        or record.get("locator")
+    )
+    url = params.get("url") or record.get("url") or record.get("pageUrl")
+    call_id = str(record.get("callId") or record.get("call_id") or record.get("id") or f"playwright_action_{index + 1}")
+    action: Dict[str, Any] = {
+        "id": call_id,
+        "action": method,
+        "actions": [method],
+        "current_url": current_url or record.get("pageUrl"),
+        "next_url": url,
+        "metadata": {
+            "source": "playwright_trace",
+            "api_name": method,
+            "record_type": record_type,
+            "start_time": record.get("startTime"),
+            "end_time": record.get("endTime"),
+        },
+    }
+    if selector:
+        action["selector"] = str(selector)
+        action["selectors"] = [str(selector)]
+    if any(token in method_lower for token in ("click", "tap", "hover", "check", "select")):
+        action["tool_names"] = ["browser_click", "playwright_click", "computer_click"]
+    if any(token in method_lower for token in ("goto", "navigate")):
+        action["tool_names"] = ["browser_navigate"]
+    coordinates = _browser_action_coordinates({**params, **record})
+    if coordinates:
+        action["coordinates"] = coordinates
+    region = _playwright_region_from_record(record, params=params, default_name=f"{call_id}_target")
+    if region:
+        action["region"] = region
+    if record.get("error"):
+        action["success"] = False
+        action["error"] = str(record.get("error"))
+    return {key: value for key, value in action.items() if value not in (None, "", [], {})}
+
+
+def _playwright_region_from_record(
+    record: Mapping[str, Any],
+    *,
+    params: Mapping[str, Any],
+    default_name: str,
+) -> Optional[Dict[str, Any]]:
+    for source in (params, record):
+        box = source.get("boundingBox") or source.get("bounding_box") or source.get("bbox") or source.get("bounds")
+        if box:
+            region = _normalize_browser_region({"bounds": box, "name": default_name}, default_name=default_name)
+            selector = source.get("selector") or source.get("locator")
+            if selector:
+                region["selectors"] = [str(selector)]
+            return region
+    return None
+
+
+def _playwright_snapshot_from_record(
+    record: Mapping[str, Any],
+    *,
+    index: int,
+    resources: Mapping[str, str],
+    current_url: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    record_type = _playwright_record_type(record)
+    snapshot = _coerce_plain_dict(record.get("snapshot"))
+    if record_type not in {"framesnapshot", "screencastframe", "snapshot"} and not snapshot:
+        if not any(key in record for key in ("html", "dom", "screenshot_uri", "screenshot_path", "sha1")):
+            return None
+    source = snapshot or record
+    html = source.get("html") or source.get("dom") or source.get("body")
+    if isinstance(html, (list, tuple, dict)):
+        html = json.dumps(html, default=str)
+    url = source.get("url") or source.get("pageUrl") or record.get("url") or current_url
+    sha1 = source.get("screenshotSha1") or source.get("screenshot_sha1") or source.get("sha1")
+    screenshot_uri = source.get("screenshot_uri") or source.get("uri")
+    if not screenshot_uri and sha1:
+        screenshot_uri = resources.get(str(sha1)) or resources.get(os.path.basename(str(sha1)))
+    item = {
+        "id": str(source.get("id") or source.get("snapshotName") or source.get("frameId") or f"playwright_snapshot_{index + 1}"),
+        "url": url,
+        "dom": html,
+        "screenshot_uri": screenshot_uri,
+        "screenshot_path": source.get("screenshot_path") or source.get("path"),
+        "metadata": {
+            "source": "playwright_trace",
+            "record_type": record_type,
+            "page_id": record.get("pageId") or record.get("page_id"),
+            "frame_id": source.get("frameId") or record.get("frameId"),
+            "timestamp_ms": _as_number(record.get("timestamp") or record.get("time")),
+        },
+    }
+    if source.get("stale") or source.get("stale_screenshot"):
+        item["metadata"]["stale_screenshot"] = True
+        item["metadata"]["stale"] = True
+    return {key: value for key, value in item.items() if value not in (None, "", {}, [])}
+
+
+def _playwright_console_log_from_record(record: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    text = " ".join(str(record.get(key, "")) for key in ("type", "method", "event", "apiName", "name")).lower()
+    if "console" not in text:
+        return None
+    params = _coerce_plain_dict(record.get("params") or record.get("args"))
+    message = record.get("text") or record.get("message") or params.get("text") or params.get("message")
+    if message is None:
+        message = json.dumps(params or dict(record), default=str)
+    return {
+        "level": str(record.get("level") or params.get("type") or params.get("level") or "info"),
+        "message": str(message),
+        "source": "playwright_trace",
+    }
+
+
+def _playwright_network_log_from_record(record: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    text = " ".join(str(record.get(key, "")) for key in ("type", "method", "event", "apiName", "name")).lower()
+    if not any(token in text for token in ("request", "response", "resource", "network")):
+        return None
+    params = _coerce_plain_dict(record.get("params") or record.get("request") or record.get("response") or record.get("snapshot"))
+    url = record.get("url") or params.get("url") or params.get("requestUrl")
+    if not url:
+        return None
+    return {
+        "url": str(url),
+        "method": params.get("method") or record.get("method"),
+        "status": params.get("status") or record.get("status"),
+        "resource_type": params.get("resourceType") or record.get("resourceType"),
+        "source": "playwright_trace",
+    }
+
+
+def _playwright_video_artifacts_from_record(
+    record: Mapping[str, Any],
+    *,
+    resources: Mapping[str, str],
+) -> List[Dict[str, Any]]:
+    videos: List[Dict[str, Any]] = []
+    for attachment in _as_iterable(record.get("attachments", record.get("attachment"))):
+        item = _coerce_plain_dict(attachment)
+        name = str(item.get("name") or item.get("path") or item.get("sha1") or "")
+        content_type = str(item.get("contentType") or item.get("content_type") or "")
+        if "video" not in content_type and not name.lower().endswith((".webm", ".mp4", ".mov")):
+            continue
+        uri = item.get("uri") or item.get("url") or resources.get(name) or resources.get(os.path.basename(name))
+        videos.append(
+            {
+                "id": item.get("id") or os.path.basename(name) or "playwright_video",
+                "uri": uri,
+                "path": item.get("path") if not uri else None,
+                "mime_type": content_type or _browser_video_mime_type(name),
+                "source": "playwright_trace",
+            }
+        )
+    if str(record.get("type") or "").lower() == "video":
+        name = str(record.get("path") or record.get("sha1") or record.get("name") or "playwright_video")
+        videos.append(
+            {
+                "id": record.get("id") or os.path.basename(name),
+                "uri": record.get("uri") or resources.get(name) or resources.get(os.path.basename(name)),
+                "path": record.get("path") if not record.get("uri") else None,
+                "mime_type": record.get("mime_type") or _browser_video_mime_type(name),
+                "source": "playwright_trace",
+            }
+        )
+    return [video for video in videos if video.get("uri") or video.get("path")]
+
+
+def _playwright_perturbations_from_record(record: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    text = _stringify(record).lower() if "_stringify" in globals() else json.dumps(record, default=str).lower()
+    if "layout_shift" not in text and "layout-shift" not in text and "stale_screenshot" not in text and "stale screenshot" not in text:
+        return []
+    return [_normalize_browser_perturbation(record, index=0)]
+
+
+def _playwright_duration_ms(record: Mapping[str, Any]) -> Optional[int]:
+    start = _as_number(record.get("startTime") or record.get("start_time"))
+    end = _as_number(record.get("endTime") or record.get("end_time"))
+    if start is None or end is None or end < start:
+        return None
+    return int(end - start)
+
+
+def _normalize_browser_perturbations(
+    perturbations: Iterable[str | Mapping[str, Any]],
+) -> List[Dict[str, Any]]:
+    return [
+        _normalize_browser_perturbation(perturbation, index=index)
+        for index, perturbation in enumerate(perturbations)
+    ]
+
+
+def _normalize_browser_perturbation(
+    perturbation: str | Mapping[str, Any],
+    *,
+    index: int,
+) -> Dict[str, Any]:
+    item = copy.deepcopy(dict(perturbation)) if isinstance(perturbation, Mapping) else {"type": str(perturbation)}
+    text = _stringify(item).lower() if "_stringify" in globals() else json.dumps(item, default=str).lower()
+    kind = str(item.get("type") or item.get("kind") or item.get("name") or "")
+    if not kind:
+        if "stale" in text:
+            kind = "stale_screenshot"
+        elif "layout" in text and "shift" in text:
+            kind = "layout_shift"
+        else:
+            kind = "browser_perturbation"
+    kind = kind.strip().lower().replace("-", "_").replace(" ", "_")
+    item["type"] = "stale_screenshot" if "stale" in kind else ("layout_shift" if "layout" in kind and "shift" in kind else kind)
+    item.setdefault("id", f"{item['type']}_{index + 1}")
+    if item["type"] == "layout_shift":
+        item.setdefault("score", item.get("value", item.get("layout_shift_score", item.get("cls"))))
+        delta = _coerce_plain_dict(item.get("delta"))
+        dx = _as_number(item.get("dx", item.get("x_shift", delta.get("x", delta.get("dx", 0)))))
+        dy = _as_number(item.get("dy", item.get("y_shift", delta.get("y", delta.get("dy", 0)))))
+        item["delta"] = {"x": dx or 0.0, "y": dy or 0.0}
+    if "affected_regions" not in item:
+        regions = item.get("regions", item.get("region", item.get("target_region")))
+        if regions is not None:
+            item["affected_regions"] = [str(value) for value in _as_iterable(regions)]
+    return item
+
+
+def _apply_browser_perturbations_to_regions(
+    regions: Dict[str, Dict[str, Any]],
+    perturbations: Iterable[Mapping[str, Any]],
+) -> Dict[str, Dict[str, Any]]:
+    shifted = copy.deepcopy(regions)
+    for perturbation in perturbations:
+        if perturbation.get("type") != "layout_shift":
+            continue
+        delta = _coerce_plain_dict(perturbation.get("delta"))
+        dx = _as_number(delta.get("x", delta.get("dx"))) or 0.0
+        dy = _as_number(delta.get("y", delta.get("dy"))) or 0.0
+        targets = [str(item) for item in _as_iterable(perturbation.get("affected_regions", []))]
+        if not targets:
+            targets = list(shifted.keys())
+        for target in targets:
+            region = shifted.get(target)
+            if not region:
+                continue
+            region["x"] = float(region.get("x", 0.0)) + dx
+            region["y"] = float(region.get("y", 0.0)) + dy
+            region.setdefault("metadata", {})
+            region["metadata"]["layout_shift"] = copy.deepcopy(dict(perturbation))
+    return shifted
+
+
+def _apply_browser_perturbations_to_snapshots(
+    snapshots: List[Dict[str, Any]],
+    perturbations: Iterable[Mapping[str, Any]],
+) -> List[Dict[str, Any]]:
+    updated = copy.deepcopy(snapshots)
+    for perturbation in perturbations:
+        if perturbation.get("type") != "stale_screenshot":
+            continue
+        targets = {
+            str(value)
+            for value in _as_iterable(
+                perturbation.get("snapshot_id")
+                or perturbation.get("snapshot")
+                or perturbation.get("screenshot_id")
+                or perturbation.get("screenshot")
+            )
+            if value not in (None, "")
+        }
+        for index, snapshot in enumerate(updated):
+            candidates = {
+                str(snapshot.get("id", "")),
+                str(snapshot.get("screenshot_uri", "")),
+                str(snapshot.get("screenshot_path", "")),
+            }
+            if targets and not (targets & candidates):
+                continue
+            if not targets and index != 0:
+                continue
+            metadata = copy.deepcopy(dict(snapshot.get("metadata", {})))
+            metadata.update(
+                {
+                    "stale": True,
+                    "stale_screenshot": True,
+                    "stale_reason": perturbation.get("reason", "stale screenshot perturbation"),
+                    "perturbation_id": perturbation.get("id"),
+                }
+            )
+            snapshot["metadata"] = metadata
+    return updated
+
+
+def _browser_snapshot_perturbation_payload(
+    snapshot: Mapping[str, Any],
+    perturbations: Iterable[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    metadata = _as_mapping(snapshot.get("metadata"))
+    layout_shifts = [
+        copy.deepcopy(dict(perturbation))
+        for perturbation in perturbations
+        if perturbation.get("type") == "layout_shift"
+    ]
+    payload: Dict[str, Any] = {}
+    if metadata.get("stale") or metadata.get("stale_screenshot"):
+        payload["stale_screenshot"] = True
+        payload["stale_snapshot_id"] = snapshot.get("id")
+    if layout_shifts:
+        payload["layout_shifts"] = layout_shifts
+        payload["layout_shift_score"] = max(
+            [
+                _as_number(shift.get("score", shift.get("value"))) or 0.0
+                for shift in layout_shifts
+            ]
+        )
+    return payload
+
+
+def _normalize_browser_video_artifacts(
+    videos: Iterable[str | Mapping[str, Any]],
+) -> List[Dict[str, Any]]:
+    normalized: List[Dict[str, Any]] = []
+    for index, video in enumerate(videos):
+        item = copy.deepcopy(dict(video)) if isinstance(video, Mapping) else {"uri": str(video)}
+        item.setdefault("id", f"browser_video_{index + 1}")
+        if "mime_type" not in item:
+            item["mime_type"] = _browser_video_mime_type(str(item.get("uri") or item.get("path") or ""))
+        normalized.append(item)
+    return _dedupe_dicts(normalized)
+
+
+def _browser_video_mime_type(path: str) -> str:
+    lower = str(path).lower()
+    if lower.endswith(".mp4"):
+        return "video/mp4"
+    if lower.endswith(".mov"):
+        return "video/quicktime"
+    return "video/webm"
+
+
+def _dedupe_dicts(items: Iterable[Any]) -> List[Dict[str, Any]]:
+    deduped: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in items:
+        data = copy.deepcopy(dict(item)) if isinstance(item, Mapping) else {"value": item}
+        signature = json.dumps(data, sort_keys=True, default=str)
+        if signature in seen:
+            continue
+        seen.add(signature)
+        deduped.append(data)
+    return deduped
 
 
 def _normalize_browser_snapshots(
