@@ -271,8 +271,9 @@ See [`examples/local_multimodal_simulation.py`](examples/local_multimodal_simula
 Use environment adapters when the agent needs a world to act on: mocked APIs,
 transient tool/API faults, browser/CUA state, voice turns, image fixtures,
 files, framework traces, or multi-agent handoffs.
-Browser adapters can emit DOM snapshots, screenshots, action replay,
-console/network logs, and trace artifacts. Voice adapters can replay VAD/STT/TTS
+Browser adapters can emit DOM snapshots, screenshots, coordinate-region
+assertions, screenshot/action diff evidence, prompt-injection surfaces, action
+replay, console/network logs, and trace artifacts. Voice adapters can replay VAD/STT/TTS
 events, Pipecat-style frames, latency profiles, barge-in/overlap handling, call
 routing, noise metadata, audio artifacts, timelines, and voice trace artifacts.
 Framework trace adapters can replay native orchestration
@@ -414,7 +415,7 @@ environment = FrameworkTraceEnvironment(framework="traceai", events=trace_record
 ```
 
 See [`examples/local_environment_adapters.py`](examples/local_environment_adapters.py) for a full local world simulation with ai-evaluation scoring, and [`examples/local_voice_image_environments.py`](examples/local_voice_image_environments.py) for a voice + image artifact cookbook.
-See [`examples/local_browser_trace_replay.py`](examples/local_browser_trace_replay.py) for a browser/CUA trace replay cookbook with screenshots, DOM, selector-level action fixtures, mutable browser state, console/network logs, DOM mutation events, and action replay.
+See [`examples/local_browser_trace_replay.py`](examples/local_browser_trace_replay.py) for a browser/CUA trace replay cookbook with screenshots, DOM, selector and coordinate-region action fixtures, screenshot/action diff evidence, prompt-injection surfaces, mutable browser state, console/network logs, DOM mutation events, and action replay.
 See [`examples/local_voice_replay_routing.py`](examples/local_voice_replay_routing.py) for a voice replay cookbook with VAD/STT/TTS events, Pipecat-style frame replay, noise/overlap evidence, interruption handling, and call routing.
 See [`examples/local_framework_trace_replay.py`](examples/local_framework_trace_replay.py) for a framework trace replay cookbook with native spans/events from orchestration frameworks.
 See [`examples/local_retrieval_memory_attribution.py`](examples/local_retrieval_memory_attribution.py) for a retrieval/memory attribution cookbook with queries, ranked documents, retrieval scores, citations, memory reads/writes, and freshness evidence.
@@ -529,8 +530,13 @@ evaluation = evaluate_agent_report(
         "allowed_domains": ["shop.example.com"],
         "memory_allowed_keys": ["order_id", "status"],
         "required_artifact_types": ["image", "audio"],
-        "required_browser_trace": ["dom", "screenshot", "action", "dom_mutation", "state", "console", "network"],
+        "required_browser_trace": ["dom", "screenshot", "action", "coordinate_region", "screenshot_diff", "prompt_injection_surface", "dom_mutation", "state", "console", "network"],
         "expected_browser_actions": [{"selector": "#confirm", "success": True}],
+        "expected_browser_regions": [
+            {"name": "confirm_button", "bounds": {"x": 160, "y": 380, "width": 180, "height": 54}}
+        ],
+        "expected_browser_screenshot_diffs": ["confirm_visual_delta"],
+        "forbidden_browser_prompt_injection_targets": ["coupon_iframe"],
         "expected_browser_state": {"url": "https://shop.example.com/done"},
         "expected_browser_dom_contains": ["Done"],
         "required_voice_trace": ["audio", "vad", "stt", "tts", "interruption", "route", "frame", "noise", "overlap", "timeline"],
@@ -607,14 +613,14 @@ Traces from simulations flow into `Monitor`, scores flow into `Evaluate`, and fa
 - [x] OpenAI / Anthropic / Gemini / LangChain wrappers
 - [x] Generic framework adapter presets
 - [x] Multimodal artifacts + event trajectories
-- [x] Local environment adapters for mocked tools/APIs, framework trace replay, retrieval/memory attribution, autonomy-loop traces, multi-agent handoff traces, browser/CUA trace replay, voice frame replay/routing/noise/overlap, images, files, adversarial packs, and multi-agent rooms
+- [x] Local environment adapters for mocked tools/APIs, framework trace replay, retrieval/memory attribution, autonomy-loop traces, multi-agent handoff traces, browser/CUA trace replay with coordinate regions and screenshot diffs, voice frame replay/routing/noise/overlap, images, files, adversarial packs, and multi-agent rooms
 - [x] Deterministic synthetic data generator
 - [x] Self-contained synthetic tool-world generator with schemas, mocks, state expectations, and evaluator config
 - [x] Deterministic pentest scenario generator
 - [x] Per-speaker + combined audio capture
 - [x] Scenario auto-generation from a topic
 - [x] `evaluate_report` integration with `ai-evaluation`
-- [x] Local `evaluate_agent_report` scoring for trajectory, tools, memory, framework trace coverage, retrieval/memory attribution, autonomy-loop coverage, autonomy-loop quality, multi-agent trace coverage, multi-agent coordination quality, browser/CUA, browser trace coverage, voice trace coverage, voice interaction quality, environment injection, and pentest signals
+- [x] Local `evaluate_agent_report` scoring for trajectory, tools, memory, framework trace coverage, retrieval/memory attribution, autonomy-loop coverage, autonomy-loop quality, multi-agent trace coverage, multi-agent coordination quality, browser/CUA action outcome and grounding quality, browser trace coverage, voice trace coverage, voice interaction quality, environment injection, and pentest signals
 - [x] Tool-call capture in wrapper responses
 
 </td>

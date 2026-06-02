@@ -274,6 +274,7 @@ class BrowserEnvironment(EnvironmentAdapter):
         state: Optional[Dict[str, Any]] = None,
         snapshots: Optional[Iterable[Mapping[str, Any]]] = None,
         actions: Optional[Mapping[str, Any] | Iterable[Mapping[str, Any]]] = None,
+        regions: Optional[Mapping[str, Any] | Iterable[Mapping[str, Any]]] = None,
         console_logs: Optional[Iterable[str | Mapping[str, Any]]] = None,
         network_log: Optional[Iterable[Mapping[str, Any]]] = None,
         prompt_injections: Optional[Iterable[str | Mapping[str, Any]]] = None,
@@ -298,16 +299,20 @@ class BrowserEnvironment(EnvironmentAdapter):
         self.current_snapshot_index = 0
         self.initial_actions = _normalize_browser_actions(actions)
         self.actions = copy.deepcopy(self.initial_actions)
+        self.initial_regions = _normalize_browser_regions(regions)
+        self.regions = copy.deepcopy(self.initial_regions)
         self.initial_console_logs = [_normalize_browser_log(item) for item in console_logs or []]
         self.initial_network_log = [dict(item) for item in network_log or []]
         self.console_logs = copy.deepcopy(self.initial_console_logs)
         self.network_log = copy.deepcopy(self.initial_network_log)
-        self.prompt_injections = [
-            dict(item) if isinstance(item, Mapping) else {"content": str(item)}
-            for item in prompt_injections or []
-        ]
+        self.initial_prompt_injections = _normalize_browser_prompt_injections(
+            prompt_injections,
+            self.initial_regions,
+        )
+        self.prompt_injections = copy.deepcopy(self.initial_prompt_injections)
         self.action_replay: List[Dict[str, Any]] = []
         self.dom_mutations: List[Dict[str, Any]] = []
+        self.screenshot_diffs: List[Dict[str, Any]] = []
 
     def reset(self, **context: Any) -> EnvironmentSnapshot:
         self.url = self.initial_url
@@ -316,11 +321,14 @@ class BrowserEnvironment(EnvironmentAdapter):
         self.state = copy.deepcopy(self.initial_state)
         self.snapshots = copy.deepcopy(self.initial_snapshots)
         self.actions = copy.deepcopy(self.initial_actions)
+        self.regions = copy.deepcopy(self.initial_regions)
         self.console_logs = copy.deepcopy(self.initial_console_logs)
         self.network_log = copy.deepcopy(self.initial_network_log)
+        self.prompt_injections = copy.deepcopy(self.initial_prompt_injections)
         self.current_snapshot_index = 0
         self.action_replay = []
         self.dom_mutations = []
+        self.screenshot_diffs = []
         artifacts = self._snapshot_artifacts(self._current_snapshot())
         artifacts.append(self._trace_artifact())
         events = [
@@ -332,6 +340,7 @@ class BrowserEnvironment(EnvironmentAdapter):
                     "allowed_domains": sorted(self.allowed_domains),
                     "snapshots": len(self.snapshots),
                     "action_fixtures": len(self.actions),
+                    "regions": sorted(self.regions.keys()),
                     "console_logs": len(self.console_logs),
                     "network_log": len(self.network_log),
                 },
@@ -385,6 +394,9 @@ class BrowserEnvironment(EnvironmentAdapter):
                         "properties": {
                             "selector": {"type": "string"},
                             "locator": {"type": "string"},
+                            "x": {"type": "number"},
+                            "y": {"type": "number"},
+                            "coordinates": {"type": "object"},
                             "url": {"type": "string"},
                             "action": {"type": "string"},
                         },
@@ -410,6 +422,7 @@ class BrowserEnvironment(EnvironmentAdapter):
                 "browser_trace": {
                     "snapshots": len(self.snapshots),
                     "action_fixtures": len(self.actions),
+                    "regions": sorted(self.regions.keys()),
                     "console_logs": len(self.console_logs),
                     "network_log": len(self.network_log),
                 }
@@ -432,6 +445,7 @@ class BrowserEnvironment(EnvironmentAdapter):
         selector = _browser_action_selector(arguments)
         action = str(arguments.get("action") or arguments.get("selector") or name)
         matched_effect = self._matched_action_effect(name, arguments, action)
+        grounding = self._action_grounding_payload(arguments, matched_effect)
         requested_url = self._requested_action_url(arguments, matched_effect)
         allowed, reason = self._allowed_url(requested_url)
         if not allowed:
@@ -447,6 +461,7 @@ class BrowserEnvironment(EnvironmentAdapter):
                 "success": False,
                 "reason": reason,
                 "turn_index": context.get("turn_index"),
+                **copy.deepcopy(grounding),
             }
             self.action_replay.append(replay_event)
             return ToolExecutionResult(
@@ -480,6 +495,7 @@ class BrowserEnvironment(EnvironmentAdapter):
                 "success": False,
                 "reason": reason,
                 "turn_index": context.get("turn_index"),
+                **copy.deepcopy(grounding),
             }
             self.action_replay.append(replay_event)
             return ToolExecutionResult(
@@ -515,6 +531,7 @@ class BrowserEnvironment(EnvironmentAdapter):
                 "reason": actionability_error,
                 "actionability": _browser_actionability_payload(matched_effect),
                 "turn_index": context.get("turn_index"),
+                **copy.deepcopy(grounding),
             }
             self.action_replay.append(replay_event)
             return ToolExecutionResult(
@@ -550,6 +567,7 @@ class BrowserEnvironment(EnvironmentAdapter):
                 "success": False,
                 "reason": reason,
                 "turn_index": context.get("turn_index"),
+                **copy.deepcopy(grounding),
             }
             self.action_replay.append(replay_event)
             return ToolExecutionResult(
@@ -573,6 +591,10 @@ class BrowserEnvironment(EnvironmentAdapter):
         before_snapshot = self._snapshot_summary(self._current_snapshot())
         self.url = requested_url
         effect_updates = self._apply_action_effect(matched_effect, requested_url)
+        grounding = {
+            **grounding,
+            **_browser_screenshot_diff_grounding(effect_updates.get("screenshot_diff")),
+        }
         replay_event = {
             "tool": name,
             "url": self.url,
@@ -588,10 +610,13 @@ class BrowserEnvironment(EnvironmentAdapter):
             "after_snapshot": self._snapshot_summary(self._current_snapshot()),
             "actionability": _browser_actionability_payload(matched_effect),
             "turn_index": context.get("turn_index"),
+            **copy.deepcopy(grounding),
         }
         self.action_replay.append(replay_event)
         if effect_updates.get("dom_mutation"):
             self.dom_mutations.append(effect_updates["dom_mutation"])
+        if effect_updates.get("screenshot_diff"):
+            self.screenshot_diffs.append(effect_updates["screenshot_diff"])
         state_update = {"browser": self._state_payload(last_action=action)}
         events = [
             SimulationEvent(
@@ -611,6 +636,14 @@ class BrowserEnvironment(EnvironmentAdapter):
                     type="browser_dom_mutation",
                     name=str(matched_effect.get("id") if matched_effect else name),
                     payload=copy.deepcopy(effect_updates["dom_mutation"]),
+                )
+            )
+        if effect_updates.get("screenshot_diff"):
+            events.append(
+                SimulationEvent(
+                    type="browser_screenshot_diff",
+                    name=str(matched_effect.get("id") if matched_effect else name),
+                    payload=copy.deepcopy(effect_updates["screenshot_diff"]),
                 )
             )
         return ToolExecutionResult(
@@ -679,9 +712,40 @@ class BrowserEnvironment(EnvironmentAdapter):
                 arguments=arguments,
                 action=action,
                 current_url=self.url,
+                regions=self.regions,
             ):
                 return copy.deepcopy(effect)
         return None
+
+    def _action_grounding_payload(
+        self,
+        arguments: Mapping[str, Any],
+        effect: Optional[Mapping[str, Any]],
+    ) -> Dict[str, Any]:
+        coordinates = _browser_action_coordinates(arguments)
+        expected_regions = _browser_expected_regions(effect, self.regions) if effect else []
+        observed_region = _browser_observed_region(coordinates, self.regions)
+        region_matched = None
+        if expected_regions:
+            region_matched = bool(
+                coordinates
+                and any(_browser_region_contains(region, coordinates) for region in expected_regions)
+            )
+        touched_surfaces = _browser_prompt_injection_surfaces_for_action(
+            arguments,
+            self.prompt_injections,
+            self.regions,
+        )
+        payload: Dict[str, Any] = {
+            "coordinates": coordinates,
+            "region": copy.deepcopy(expected_regions[0]) if expected_regions else observed_region,
+            "expected_regions": copy.deepcopy(expected_regions),
+            "observed_region": copy.deepcopy(observed_region),
+            "region_matched": region_matched,
+            "prompt_injection_touched": bool(touched_surfaces),
+            "prompt_injection_surfaces": copy.deepcopy(touched_surfaces),
+        }
+        return {key: value for key, value in payload.items() if value not in (None, [], {})}
 
     def _requested_action_url(
         self,
@@ -718,6 +782,10 @@ class BrowserEnvironment(EnvironmentAdapter):
                 self.network_log.append(dict(request))
             else:
                 self.network_log.append({"url": str(request)})
+        screenshot_diff = _normalize_browser_screenshot_diff(
+            effect.get("screenshot_diff", effect.get("screenshot_delta")),
+            effect_id=str(effect.get("id") or ""),
+        )
 
         snapshot_id = effect.get("snapshot_id")
         if snapshot_id:
@@ -725,7 +793,10 @@ class BrowserEnvironment(EnvironmentAdapter):
             if index is not None:
                 self.current_snapshot_index = index
                 self.url = str(self.snapshots[index].get("url") or requested_url)
-                return {"state_updates": state_updates}
+                result = {"state_updates": state_updates}
+                if screenshot_diff:
+                    result["screenshot_diff"] = screenshot_diff
+                return result
 
         current = self._current_snapshot()
         dom_before = str(current.get("dom", self.dom) or "")
@@ -770,12 +841,18 @@ class BrowserEnvironment(EnvironmentAdapter):
                 "snapshot_id": new_snapshot["id"],
                 "dom_changed": dom_after != dom_before,
                 "state_updates": copy.deepcopy(state_updates),
-                "metadata": copy.deepcopy(dict(effect.get("metadata", {}))),
-            }
-            return {"state_updates": state_updates, "dom_mutation": dom_mutation}
+                    "metadata": copy.deepcopy(dict(effect.get("metadata", {}))),
+                }
+            result = {"state_updates": state_updates, "dom_mutation": dom_mutation}
+            if screenshot_diff:
+                result["screenshot_diff"] = screenshot_diff
+            return result
 
         self.current_snapshot_index = self._snapshot_index_for_url(self.url)
-        return {"state_updates": state_updates}
+        result = {"state_updates": state_updates}
+        if screenshot_diff:
+            result["screenshot_diff"] = screenshot_diff
+        return result
 
     def _snapshot_index_for_id(self, snapshot_id: str) -> Optional[int]:
         for index, snapshot in enumerate(self.snapshots):
@@ -823,6 +900,8 @@ class BrowserEnvironment(EnvironmentAdapter):
             "snapshots": copy.deepcopy(self.snapshots),
             "action_replay": copy.deepcopy(self.action_replay),
             "dom_mutations": copy.deepcopy(self.dom_mutations),
+            "screenshot_diffs": copy.deepcopy(self.screenshot_diffs),
+            "regions": copy.deepcopy(self.regions),
             "console_logs": copy.deepcopy(self.console_logs),
             "network_log": copy.deepcopy(self.network_log),
             "prompt_injections": copy.deepcopy(self.prompt_injections),
@@ -835,6 +914,8 @@ class BrowserEnvironment(EnvironmentAdapter):
             "url": self.url,
             "snapshot": self._snapshot_summary(self._current_snapshot()),
             "action_replay": copy.deepcopy(self.action_replay),
+            "screenshot_diffs": copy.deepcopy(self.screenshot_diffs),
+            "regions": copy.deepcopy(self.regions),
             "console_logs": copy.deepcopy(self.console_logs),
             "network_log": copy.deepcopy(self.network_log),
         }
@@ -3862,6 +3943,81 @@ def _normalize_browser_actions(
     return normalized
 
 
+def _normalize_browser_regions(
+    regions: Optional[Mapping[str, Any] | Iterable[Mapping[str, Any]]],
+) -> Dict[str, Dict[str, Any]]:
+    if regions is None:
+        return {}
+    raw_regions: List[Dict[str, Any]] = []
+    if isinstance(regions, Mapping):
+        for name, value in regions.items():
+            item = dict(value) if isinstance(value, Mapping) else {"bounds": value}
+            item.setdefault("name", str(name))
+            raw_regions.append(item)
+    else:
+        raw_regions = [dict(item) for item in regions]
+
+    normalized: Dict[str, Dict[str, Any]] = {}
+    for index, item in enumerate(raw_regions):
+        region = _normalize_browser_region(item, default_name=f"region_{index + 1}")
+        name = str(region.get("name") or region.get("id") or f"region_{index + 1}")
+        region["name"] = name
+        normalized[name] = region
+        if region.get("id"):
+            normalized.setdefault(str(region["id"]), region)
+    return normalized
+
+
+def _normalize_browser_region(
+    region: Mapping[str, Any],
+    *,
+    default_name: str,
+) -> Dict[str, Any]:
+    item = dict(region)
+    bounds = item.get("bounds") or item.get("bbox") or item.get("box")
+    if isinstance(bounds, Mapping):
+        item.setdefault("x", bounds.get("x", bounds.get("left")))
+        item.setdefault("y", bounds.get("y", bounds.get("top")))
+        item.setdefault("width", bounds.get("width", bounds.get("w")))
+        item.setdefault("height", bounds.get("height", bounds.get("h")))
+    elif isinstance(bounds, (list, tuple)) and len(bounds) >= 4:
+        item.setdefault("x", bounds[0])
+        item.setdefault("y", bounds[1])
+        item.setdefault("width", bounds[2])
+        item.setdefault("height", bounds[3])
+    item.setdefault("name", item.get("id") or default_name)
+    if "selectors" not in item:
+        selectors = []
+        for key in ("selector", "locator", "target", "element"):
+            if item.get(key):
+                selectors.append(str(item[key]))
+        if selectors:
+            item["selectors"] = selectors
+    for key in ("x", "y", "width", "height"):
+        value = _as_number(item.get(key))
+        if value is not None:
+            item[key] = value
+    return item
+
+
+def _normalize_browser_prompt_injections(
+    prompt_injections: Optional[Iterable[str | Mapping[str, Any]]],
+    regions: Mapping[str, Mapping[str, Any]],
+) -> List[Dict[str, Any]]:
+    normalized: List[Dict[str, Any]] = []
+    for index, item in enumerate(prompt_injections or []):
+        surface = dict(item) if isinstance(item, Mapping) else {"content": str(item)}
+        surface.setdefault("id", f"browser_prompt_injection_{index + 1}")
+        surface.setdefault("surface_type", surface.get("type") or "prompt_injection")
+        region = _browser_resolve_region(surface.get("region", surface.get("target_region")), regions)
+        if region:
+            surface["region"] = copy.deepcopy(region)
+        elif isinstance(surface.get("bounds"), (Mapping, list, tuple)):
+            surface["region"] = _normalize_browser_region(surface, default_name=str(surface["id"]))
+        normalized.append(surface)
+    return normalized
+
+
 def _normalize_browser_log(item: str | Mapping[str, Any]) -> Dict[str, Any]:
     if isinstance(item, Mapping):
         log = dict(item)
@@ -3886,6 +4042,7 @@ def _browser_action_effect_matches(
     arguments: Mapping[str, Any],
     action: str,
     current_url: str,
+    regions: Mapping[str, Mapping[str, Any]],
 ) -> bool:
     tools = {str(value).lower() for value in _as_iterable(effect.get("tool_names", effect.get("tool")))}
     if tools and tool_name.lower() not in tools:
@@ -3912,7 +4069,7 @@ def _browser_action_effect_matches(
     action_text = _normalize_browser_action_text(action)
     action_match = bool(expected_actions and action_text in expected_actions)
 
-    coordinate_match = _browser_coordinates_match(effect, arguments)
+    coordinate_match = _browser_coordinates_match(effect, arguments, regions)
 
     requested_url = arguments.get("url")
     expected_target_urls = {
@@ -3923,12 +4080,22 @@ def _browser_action_effect_matches(
     }
     url_match = bool(requested_url and str(requested_url) in expected_target_urls)
 
-    if selectors or expected_actions or _effect_has_coordinates(effect) or expected_target_urls:
+    if selectors or expected_actions or _effect_has_coordinates(effect) or _effect_has_regions(effect) or expected_target_urls:
         return selector_match or action_match or coordinate_match or url_match
     return False
 
 
-def _browser_coordinates_match(effect: Mapping[str, Any], arguments: Mapping[str, Any]) -> bool:
+def _browser_coordinates_match(
+    effect: Mapping[str, Any],
+    arguments: Mapping[str, Any],
+    regions: Mapping[str, Mapping[str, Any]],
+) -> bool:
+    coordinates = _browser_action_coordinates(arguments)
+    if coordinates:
+        expected_regions = _browser_expected_regions(effect, regions)
+        if expected_regions and any(_browser_region_contains(region, coordinates) for region in expected_regions):
+            return True
+
     expected = effect.get("coordinates")
     expected_x = effect.get("x")
     expected_y = effect.get("y")
@@ -3937,20 +4104,161 @@ def _browser_coordinates_match(effect: Mapping[str, Any], arguments: Mapping[str
         expected_y = expected.get("y", expected_y)
     if expected_x is None or expected_y is None:
         return False
-    actual_x = arguments.get("x")
-    actual_y = arguments.get("y")
-    if actual_x is None or actual_y is None:
-        point = arguments.get("coordinates") or arguments.get("point")
-        if isinstance(point, Mapping):
-            actual_x = point.get("x")
-            actual_y = point.get("y")
-    return str(actual_x) == str(expected_x) and str(actual_y) == str(expected_y)
+    if not coordinates:
+        return False
+    return coordinates.get("x") == _as_number(expected_x) and coordinates.get("y") == _as_number(expected_y)
 
 
 def _effect_has_coordinates(effect: Mapping[str, Any]) -> bool:
     return effect.get("coordinates") is not None or (
         effect.get("x") is not None and effect.get("y") is not None
     )
+
+
+def _effect_has_regions(effect: Mapping[str, Any]) -> bool:
+    return any(
+        effect.get(key) is not None
+        for key in ("region", "regions", "target_region", "bounds", "bbox", "box")
+    )
+
+
+def _browser_action_coordinates(arguments: Mapping[str, Any]) -> Optional[Dict[str, float]]:
+    actual_x = arguments.get("x")
+    actual_y = arguments.get("y")
+    if actual_x is None or actual_y is None:
+        point = (
+            arguments.get("coordinates")
+            or arguments.get("coordinate")
+            or arguments.get("point")
+            or arguments.get("position")
+        )
+        if isinstance(point, Mapping):
+            actual_x = point.get("x", point.get("left"))
+            actual_y = point.get("y", point.get("top"))
+        elif isinstance(point, (list, tuple)) and len(point) >= 2:
+            actual_x = point[0]
+            actual_y = point[1]
+    x = _as_number(actual_x)
+    y = _as_number(actual_y)
+    if x is None or y is None:
+        return None
+    return {"x": x, "y": y}
+
+
+def _browser_expected_regions(
+    effect: Optional[Mapping[str, Any]],
+    regions: Mapping[str, Mapping[str, Any]],
+) -> List[Dict[str, Any]]:
+    if not effect:
+        return []
+    expected: List[Dict[str, Any]] = []
+    for raw in _as_iterable(effect.get("regions", effect.get("region", effect.get("target_region")))):
+        region = _browser_resolve_region(raw, regions)
+        if region:
+            expected.append(region)
+    if not expected and any(effect.get(key) is not None for key in ("bounds", "bbox", "box")):
+        expected.append(_normalize_browser_region(effect, default_name=str(effect.get("id") or "target_region")))
+    return expected
+
+
+def _browser_resolve_region(
+    raw: Any,
+    regions: Mapping[str, Mapping[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        region = regions.get(raw)
+        if region:
+            return copy.deepcopy(dict(region))
+        return {"name": raw}
+    if isinstance(raw, Mapping):
+        if raw.get("name") in regions:
+            return copy.deepcopy(dict(regions[str(raw["name"])]))
+        if raw.get("id") in regions:
+            return copy.deepcopy(dict(regions[str(raw["id"])]))
+        return _normalize_browser_region(raw, default_name=str(raw.get("name") or raw.get("id") or "target_region"))
+    if isinstance(raw, (list, tuple)) and len(raw) >= 4:
+        return _normalize_browser_region({"bounds": raw}, default_name="target_region")
+    return None
+
+
+def _browser_observed_region(
+    coordinates: Optional[Mapping[str, float]],
+    regions: Mapping[str, Mapping[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    if not coordinates:
+        return None
+    for region in regions.values():
+        if _browser_region_contains(region, coordinates):
+            return copy.deepcopy(dict(region))
+    return None
+
+
+def _browser_region_contains(region: Mapping[str, Any], coordinates: Mapping[str, float]) -> bool:
+    x = _as_number(region.get("x"))
+    y = _as_number(region.get("y"))
+    width = _as_number(region.get("width"))
+    height = _as_number(region.get("height"))
+    actual_x = _as_number(coordinates.get("x"))
+    actual_y = _as_number(coordinates.get("y"))
+    if None in (x, y, width, height, actual_x, actual_y):
+        return False
+    return x <= actual_x <= x + width and y <= actual_y <= y + height
+
+
+def _browser_prompt_injection_surfaces_for_action(
+    arguments: Mapping[str, Any],
+    prompt_injections: Iterable[Mapping[str, Any]],
+    regions: Mapping[str, Mapping[str, Any]],
+) -> List[Dict[str, Any]]:
+    selector = _browser_action_selector(arguments)
+    coordinates = _browser_action_coordinates(arguments)
+    touched: List[Dict[str, Any]] = []
+    for surface in prompt_injections:
+        selectors = {str(value) for value in _as_iterable(surface.get("selectors", surface.get("selector")))}
+        selector_match = bool(selector and selector in selectors) if selectors else False
+        region = _browser_resolve_region(surface.get("region", surface.get("target_region")), regions)
+        region_match = bool(region and coordinates and _browser_region_contains(region, coordinates))
+        if selector_match or region_match:
+            touched.append(copy.deepcopy(dict(surface)))
+    return touched
+
+
+def _normalize_browser_screenshot_diff(
+    diff: Any,
+    *,
+    effect_id: str,
+) -> Optional[Dict[str, Any]]:
+    if diff is None:
+        return None
+    if isinstance(diff, Mapping):
+        item = copy.deepcopy(dict(diff))
+    else:
+        item = {"id": str(diff)}
+    item.setdefault("id", f"{effect_id}_screenshot_diff" if effect_id else "screenshot_diff")
+    if effect_id:
+        item.setdefault("source_action", effect_id)
+    return item
+
+
+def _browser_screenshot_diff_grounding(diff: Any) -> Dict[str, Any]:
+    if not diff:
+        return {}
+    return {"screenshot_diff": copy.deepcopy(diff)}
+
+
+def _as_number(value: Any) -> Optional[float]:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value.strip())
+        except ValueError:
+            return None
+    return None
 
 
 def _browser_actionability_error(effect: Optional[Mapping[str, Any]]) -> str:
