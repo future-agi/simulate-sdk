@@ -105,6 +105,8 @@ async def test_tool_mock_environment_seeds_tools_and_executes_calls():
     assert result.metadata["environment_state"]["order"]["status"] == "resolved"
     assert result.metadata["tools"][0]["parameters"]["required"] == ["order_id"]
     assert any(event.type == "tool_execution" for event in result.events)
+    tool_execution = next(event for event in result.events if event.type == "tool_execution")
+    assert tool_execution.payload["state_updates"]["order"]["status"] == "resolved"
 
 
 @pytest.mark.asyncio

@@ -278,8 +278,8 @@ spans from LangChain/LangGraph, OpenAI Agents, CrewAI, AutoGen, LiveKit,
 Pipecat, or custom runtimes. Adversarial packs add hostile retrieved context,
 file content, browser DOM, and memory-like context for indirect prompt-injection
 tests. The local engine exposes environment tools through `AgentInput.tools`,
-auto-executes matching tool calls, and records tool results, state updates,
-artifacts, and events in the report.
+auto-executes matching tool calls, and records tool results, per-call
+`state_updates`, final environment state, artifacts, and events in the report.
 
 ```python
 from fi.simulate import (

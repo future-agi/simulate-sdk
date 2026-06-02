@@ -135,6 +135,7 @@ class ToolMockEnvironment(EnvironmentAdapter):
                     "success": result.success,
                     "result": result.result,
                     "error": result.error,
+                    "state_updates": copy.deepcopy(result.state_updates),
                 },
             )
         )
