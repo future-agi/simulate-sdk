@@ -507,6 +507,7 @@ async def test_multi_agent_room_records_handoff_review_reconciliation_trace():
                     "arguments": {
                         "to": "policy_specialist",
                         "task": "Check refund eligibility.",
+                        "context": {"order_id": "123"},
                         "reason": "Requires policy expertise.",
                     },
                 },
@@ -553,7 +554,31 @@ async def test_multi_agent_room_records_handoff_review_reconciliation_trace():
                 "policy_specialist": {
                     "required_output": "eligibility decision with cited policy",
                     "sla_turns": 1,
+                    "require_reason": True,
+                    "required_context_keys": ["order_id"],
+                    "required_task_terms": ["refund", "eligibility"],
                 }
+            },
+            expected_handoffs=[
+                {
+                    "to": "policy_specialist",
+                    "task_contains": ["refund", "eligibility"],
+                    "reason_contains": ["policy"],
+                    "context_keys": ["order_id"],
+                    "contract_matched": True,
+                }
+            ],
+            expected_reviews=[
+                {
+                    "reviewer": "qa_reviewer",
+                    "target_contains": ["refund"],
+                    "criteria": ["policy", "tone"],
+                }
+            ],
+            expected_reconciliation={
+                "accepted_source": "policy_specialist",
+                "summary_contains": ["eligible"],
+                "conflicts_empty": True,
             },
         ),
         max_turns=1,
@@ -570,9 +595,12 @@ async def test_multi_agent_room_records_handoff_review_reconciliation_trace():
 
     assert {"handoff", "send_room_message", "request_review", "reconcile", "room_status"} <= set(seen_tools)
     assert room_state["handoffs"][-1]["to"] == "policy_specialist"
+    assert room_state["handoffs"][-1]["contract_status"]["matched"] is True
     assert room_state["reviews"][-1]["reviewer"] == "qa_reviewer"
     assert room_state["reconciliations"][-1]["accepted_source"] == "policy_specialist"
     assert traces and traces[-1]["reconciliations"]
+    assert traces[-1]["coordination_checks"]
+    assert all(check["match"] for check in traces[-1]["coordination_checks"])
     assert any(event.type == "multi_agent" and event.name == "review_requested" for event in result.events)
     assert any(event.type == "multi_agent" and event.name == "reconciled" for event in result.events)
 

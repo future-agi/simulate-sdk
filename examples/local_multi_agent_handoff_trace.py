@@ -2,8 +2,9 @@
 Run a local multi-agent handoff trace simulation.
 
 This models team evidence an orchestration framework should produce: roles,
-handoff contracts, delegated work, room messages, review requests, and final
-reconciliation. No agent framework, cloud service, or model key is required.
+handoff contracts, delegated work, room messages, review requests, final
+reconciliation, and contract-quality checks. No agent framework, cloud service,
+or model key is required.
 
 Requires:
     pip install agent-simulate ai-evaluation
@@ -35,6 +36,7 @@ async def coordinated_support_agent(input):
                 "arguments": {
                     "to": "policy_specialist",
                     "task": "Check refund eligibility for order 123.",
+                    "context": {"order_id": "123", "policy_version": "v2"},
                     "reason": "Refund policy expertise required.",
                 },
             },
@@ -90,11 +92,35 @@ async def main():
             "policy_specialist": {
                 "required_output": "eligibility decision with cited policy",
                 "sla_turns": 1,
+                "require_reason": True,
+                "required_context_keys": ["order_id", "policy_version"],
+                "required_task_terms": ["refund", "eligibility"],
             },
             "qa_reviewer": {
                 "required_output": "customer-safe final answer review",
                 "sla_turns": 1,
             },
+        },
+        expected_handoffs=[
+            {
+                "to": "policy_specialist",
+                "task_contains": ["refund", "eligibility"],
+                "reason_contains": ["policy"],
+                "context_keys": ["order_id", "policy_version"],
+                "contract_matched": True,
+            }
+        ],
+        expected_reviews=[
+            {
+                "reviewer": "qa_reviewer",
+                "target_contains": ["refund"],
+                "criteria": ["policy alignment", "customer-safe wording"],
+            }
+        ],
+        expected_reconciliation={
+            "accepted_source": "policy_specialist",
+            "summary_contains": ["eligible"],
+            "conflicts_empty": True,
         },
     )
 
@@ -131,6 +157,28 @@ async def main():
                 "review",
                 "reconciliation",
             ],
+            "required_multi_agent_roles": ["support_agent", "policy_specialist", "qa_reviewer"],
+            "expected_multi_agent_handoffs": [
+                {
+                    "to": "policy_specialist",
+                    "task_contains": ["refund", "eligibility"],
+                    "reason_contains": ["policy"],
+                    "context_keys": ["order_id", "policy_version"],
+                    "contract_matched": True,
+                }
+            ],
+            "expected_multi_agent_reviews": [
+                {
+                    "reviewer": "qa_reviewer",
+                    "target_contains": ["refund"],
+                    "criteria": ["policy alignment", "customer-safe wording"],
+                }
+            ],
+            "expected_multi_agent_reconciliation": {
+                "accepted_source": "policy_specialist",
+                "summary_contains": ["eligible"],
+                "conflicts_empty": True,
+            },
             "success_criteria": ["refund decision resolved through multi-agent coordination"],
         },
         threshold=0.85,
@@ -144,6 +192,10 @@ async def main():
     print("handoffs:", room_state["handoffs"])
     print("reviews:", room_state["reviews"])
     print("multi_agent_trace_coverage:", evaluation.summary["metric_averages"]["multi_agent_trace_coverage"])
+    print(
+        "multi_agent_coordination_quality:",
+        evaluation.summary["metric_averages"]["multi_agent_coordination_quality"],
+    )
 
 
 if __name__ == "__main__":

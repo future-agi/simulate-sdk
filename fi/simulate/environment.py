@@ -1893,11 +1893,17 @@ class MultiAgentRoomEnvironment(EnvironmentAdapter):
         participants: Iterable[str | Mapping[str, Any]] | Mapping[str, Any],
         *,
         handoff_contracts: Optional[Mapping[str, Any] | Iterable[Mapping[str, Any]]] = None,
+        expected_handoffs: Optional[Iterable[Mapping[str, Any]]] = None,
+        expected_reviews: Optional[Iterable[Mapping[str, Any]]] = None,
+        expected_reconciliation: Optional[Mapping[str, Any]] = None,
         state: Optional[Mapping[str, Any]] = None,
         allow_unknown_roles: bool = True,
     ) -> None:
         self.participants = _normalize_participants(participants)
         self.handoff_contracts = _normalize_handoff_contracts(handoff_contracts)
+        self.expected_handoffs = [copy.deepcopy(dict(item)) for item in expected_handoffs or []]
+        self.expected_reviews = [copy.deepcopy(dict(item)) for item in expected_reviews or []]
+        self.expected_reconciliation = copy.deepcopy(dict(expected_reconciliation or {}))
         self.initial_state = copy.deepcopy(dict(state or {}))
         self.allow_unknown_roles = allow_unknown_roles
         self.messages: List[Dict[str, Any]] = []
@@ -1945,6 +1951,9 @@ class MultiAgentRoomEnvironment(EnvironmentAdapter):
                         "participants": list(self.participants.keys()),
                         "roles": copy.deepcopy(self.participants),
                         "handoff_contracts": copy.deepcopy(self.handoff_contracts),
+                        "expected_handoffs": copy.deepcopy(self.expected_handoffs),
+                        "expected_reviews": copy.deepcopy(self.expected_reviews),
+                        "expected_reconciliation": copy.deepcopy(self.expected_reconciliation),
                     },
                 )
             ],
@@ -1952,6 +1961,8 @@ class MultiAgentRoomEnvironment(EnvironmentAdapter):
                 "multi_agent_trace": {
                     "participants": list(self.participants.keys()),
                     "handoff_contracts": len(self.handoff_contracts),
+                    "expected_handoffs": len(self.expected_handoffs),
+                    "expected_reviews": len(self.expected_reviews),
                 }
             },
         )
@@ -2025,6 +2036,7 @@ class MultiAgentRoomEnvironment(EnvironmentAdapter):
                 "known_role": recipient in self.participants,
                 "turn_index": context.get("turn_index"),
             }
+            record["contract_status"] = _multi_agent_contract_status(record, record["contract"])
             if not record["known_role"] and not self.allow_unknown_roles:
                 return self._unknown_role_result(call_id, name, recipient, arguments)
             self.handoffs.append(record)
@@ -2109,6 +2121,18 @@ class MultiAgentRoomEnvironment(EnvironmentAdapter):
             "handoffs": copy.deepcopy(self.handoffs),
             "reviews": copy.deepcopy(self.reviews),
             "reconciliations": copy.deepcopy(self.reconciliations),
+            "expected_handoffs": copy.deepcopy(self.expected_handoffs),
+            "expected_reviews": copy.deepcopy(self.expected_reviews),
+            "expected_reconciliation": copy.deepcopy(self.expected_reconciliation),
+            "coordination_checks": _multi_agent_coordination_checks(
+                participants=self.participants,
+                handoffs=self.handoffs,
+                reviews=self.reviews,
+                reconciliations=self.reconciliations,
+                expected_handoffs=self.expected_handoffs,
+                expected_reviews=self.expected_reviews,
+                expected_reconciliation=self.expected_reconciliation,
+            ),
             "state": copy.deepcopy(self.state),
         }
 
@@ -2660,6 +2684,244 @@ def _normalize_handoff_contracts(
         name = str(item.get("to") or item.get("role") or item.get("agent") or item.get("name") or f"contract_{index + 1}")
         normalized[name] = item
     return normalized
+
+
+def _multi_agent_contract_status(
+    handoff: Mapping[str, Any],
+    contract: Mapping[str, Any],
+) -> Dict[str, Any]:
+    checks: List[Dict[str, Any]] = []
+    if not contract:
+        return {"matched": True, "checks": checks}
+
+    if contract.get("require_reason"):
+        checks.append(
+            {
+                "check": "reason",
+                "expected": "present",
+                "actual": bool(handoff.get("reason")),
+                "match": bool(handoff.get("reason")),
+            }
+        )
+
+    required_context_keys = _multi_agent_string_list(
+        contract.get("required_context_keys") or contract.get("context_keys")
+    )
+    if required_context_keys:
+        context = handoff.get("context")
+        actual_keys = sorted(context.keys()) if isinstance(context, Mapping) else []
+        missing = sorted(set(required_context_keys) - set(actual_keys))
+        checks.append(
+            {
+                "check": "context_keys",
+                "expected": required_context_keys,
+                "actual": actual_keys,
+                "match": not missing,
+                "missing": missing,
+            }
+        )
+
+    required_task_terms = _multi_agent_string_list(
+        contract.get("required_task_terms") or contract.get("task_contains")
+    )
+    if required_task_terms:
+        text = _multi_agent_record_text(handoff)
+        missing = [term for term in required_task_terms if term.lower() not in text]
+        checks.append(
+            {
+                "check": "task_contains",
+                "expected": required_task_terms,
+                "actual": handoff.get("task"),
+                "match": not missing,
+                "missing": missing,
+            }
+        )
+
+    forbidden_terms = _multi_agent_string_list(contract.get("forbidden_terms"))
+    if forbidden_terms:
+        text = _multi_agent_record_text(handoff)
+        present = [term for term in forbidden_terms if term.lower() in text]
+        checks.append(
+            {
+                "check": "forbidden_terms",
+                "expected": [],
+                "actual": present,
+                "match": not present,
+            }
+        )
+
+    return {
+        "matched": all(check["match"] for check in checks),
+        "checks": checks,
+    }
+
+
+def _multi_agent_coordination_checks(
+    *,
+    participants: Mapping[str, Any],
+    handoffs: Iterable[Mapping[str, Any]],
+    reviews: Iterable[Mapping[str, Any]],
+    reconciliations: Iterable[Mapping[str, Any]],
+    expected_handoffs: Iterable[Mapping[str, Any]],
+    expected_reviews: Iterable[Mapping[str, Any]],
+    expected_reconciliation: Mapping[str, Any],
+) -> List[Dict[str, Any]]:
+    handoff_list = [dict(item) for item in handoffs]
+    review_list = [dict(item) for item in reviews]
+    reconciliation_list = [dict(item) for item in reconciliations]
+    checks: List[Dict[str, Any]] = []
+
+    for handoff in handoff_list:
+        checks.append(
+            {
+                "check": "known_handoff_role",
+                "expected": sorted(participants.keys()),
+                "actual": handoff.get("to"),
+                "match": bool(handoff.get("known_role", handoff.get("to") in participants)),
+            }
+        )
+        contract_status = dict(handoff.get("contract_status", {}))
+        if contract_status.get("checks"):
+            checks.append(
+                {
+                    "check": "handoff_contract",
+                    "expected": handoff.get("contract", {}),
+                    "actual": contract_status,
+                    "match": bool(contract_status.get("matched")),
+                    "to": handoff.get("to"),
+                }
+            )
+
+    for review in review_list:
+        checks.append(
+            {
+                "check": "known_review_role",
+                "expected": sorted(participants.keys()),
+                "actual": review.get("reviewer"),
+                "match": bool(review.get("known_role", review.get("reviewer") in participants)),
+            }
+        )
+
+    for index, expected in enumerate(expected_handoffs):
+        expected_dict = dict(expected)
+        matched = any(_multi_agent_handoff_matches(handoff, expected_dict) for handoff in handoff_list)
+        checks.append(
+            {
+                "check": "expected_handoff",
+                "index": index,
+                "expected": copy.deepcopy(expected_dict),
+                "actual": copy.deepcopy(handoff_list),
+                "match": matched,
+            }
+        )
+
+    for index, expected in enumerate(expected_reviews):
+        expected_dict = dict(expected)
+        matched = any(_multi_agent_review_matches(review, expected_dict) for review in review_list)
+        checks.append(
+            {
+                "check": "expected_review",
+                "index": index,
+                "expected": copy.deepcopy(expected_dict),
+                "actual": copy.deepcopy(review_list),
+                "match": matched,
+            }
+        )
+
+    if expected_reconciliation:
+        matched = any(
+            _multi_agent_reconciliation_matches(item, expected_reconciliation)
+            for item in reconciliation_list
+        )
+        checks.append(
+            {
+                "check": "expected_reconciliation",
+                "expected": copy.deepcopy(dict(expected_reconciliation)),
+                "actual": copy.deepcopy(reconciliation_list),
+                "match": matched,
+            }
+        )
+
+    return checks
+
+
+def _multi_agent_handoff_matches(record: Mapping[str, Any], expected: Mapping[str, Any]) -> bool:
+    if expected.get("to") and str(record.get("to")) != str(expected.get("to")):
+        return False
+    if expected.get("known_role") is not None and bool(record.get("known_role")) != bool(expected.get("known_role")):
+        return False
+    if not _multi_agent_text_contains(record.get("task"), expected.get("task_contains")):
+        return False
+    if not _multi_agent_text_contains(record.get("reason"), expected.get("reason_contains")):
+        return False
+    if not _multi_agent_context_matches(record.get("context"), expected.get("context_keys")):
+        return False
+    if expected.get("contract_matched") is not None:
+        status = dict(record.get("contract_status", {}))
+        if bool(status.get("matched")) != bool(expected.get("contract_matched")):
+            return False
+    return True
+
+
+def _multi_agent_review_matches(record: Mapping[str, Any], expected: Mapping[str, Any]) -> bool:
+    if expected.get("reviewer") and str(record.get("reviewer")) != str(expected.get("reviewer")):
+        return False
+    if not _multi_agent_text_contains(record.get("target"), expected.get("target_contains")):
+        return False
+    expected_criteria = set(_multi_agent_string_list(expected.get("criteria")))
+    actual_criteria = set(_multi_agent_string_list(record.get("criteria")))
+    if expected_criteria and not expected_criteria <= actual_criteria:
+        return False
+    return True
+
+
+def _multi_agent_reconciliation_matches(record: Mapping[str, Any], expected: Mapping[str, Any]) -> bool:
+    if expected.get("accepted_source") and str(record.get("accepted_source")) != str(expected.get("accepted_source")):
+        return False
+    if not _multi_agent_text_contains(record.get("summary") or record.get("decision"), expected.get("summary_contains")):
+        return False
+    if expected.get("conflicts_empty") is not None:
+        conflicts = record.get("conflicts", [])
+        if bool(conflicts) == bool(expected.get("conflicts_empty")):
+            return False
+    return True
+
+
+def _multi_agent_context_matches(context: Any, expected_keys: Any) -> bool:
+    keys = _multi_agent_string_list(expected_keys)
+    if not keys:
+        return True
+    if not isinstance(context, Mapping):
+        return False
+    return set(keys) <= {str(key) for key in context.keys()}
+
+
+def _multi_agent_text_contains(value: Any, expected_terms: Any) -> bool:
+    terms = _multi_agent_string_list(expected_terms)
+    if not terms:
+        return True
+    text = str(value or "").lower()
+    return all(term.lower() in text for term in terms)
+
+
+def _multi_agent_record_text(record: Mapping[str, Any]) -> str:
+    return " ".join(
+        [
+            str(record.get("task") or ""),
+            str(record.get("reason") or ""),
+            _stringify_dict(record.get("context") or {}),
+        ]
+    ).lower()
+
+
+def _multi_agent_string_list(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, Iterable) and not isinstance(value, (bytes, bytearray, Mapping)):
+        return [str(item) for item in value if item not in (None, "")]
+    return [str(value)]
 
 
 def _normalize_retrieval_documents(

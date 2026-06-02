@@ -282,6 +282,9 @@ file content, browser DOM, and memory-like context for indirect prompt-injection
 tests. The local engine exposes environment tools through `AgentInput.tools`,
 auto-executes matching tool calls, and records tool results, per-call
 `state_updates`, final environment state, artifacts, and events in the report.
+Multi-agent rooms can also carry expected handoffs, review requirements, and
+reconciliation requirements so evaluators can score contract correctness instead
+of only checking that a handoff trace exists.
 
 ```python
 from fi.simulate import (
@@ -360,6 +363,10 @@ report = await TestRunner().run_test(
             handoff_contracts={
                 "policy_specialist": {"required_output": "policy decision"}
             },
+            expected_handoffs=[
+                {"to": "policy_specialist", "context_keys": ["order_id"]}
+            ],
+            expected_reconciliation={"accepted_source": "policy_specialist"},
         ),
     ],
     max_turns=1,
@@ -406,7 +413,7 @@ See [`examples/local_voice_replay_routing.py`](examples/local_voice_replay_routi
 See [`examples/local_framework_trace_replay.py`](examples/local_framework_trace_replay.py) for a framework trace replay cookbook with native spans/events from orchestration frameworks.
 See [`examples/local_retrieval_memory_attribution.py`](examples/local_retrieval_memory_attribution.py) for a retrieval/memory attribution cookbook with queries, ranked documents, retrieval scores, citations, memory reads/writes, and freshness evidence.
 See [`examples/local_autonomy_loop_trace.py`](examples/local_autonomy_loop_trace.py) for an autonomy-loop cookbook with observe/orient/plan/act/verify/reflect, feedback, memory, and skill-library evidence.
-See [`examples/local_multi_agent_handoff_trace.py`](examples/local_multi_agent_handoff_trace.py) for a multi-agent handoff cookbook with roles, contracts, delegated work, review, reconciliation, and trace coverage.
+See [`examples/local_multi_agent_handoff_trace.py`](examples/local_multi_agent_handoff_trace.py) for a multi-agent handoff cookbook with roles, contracts, delegated work, review, reconciliation, trace coverage, and coordination-quality scoring.
 See [`examples/local_adversarial_environment_pack.py`](examples/local_adversarial_environment_pack.py) for an indirect prompt-injection pentest using hostile tool, file, browser, and memory surfaces.
 
 ### Local pentest scenarios
@@ -502,7 +509,7 @@ safety, browser action outcome/state success, browser trace coverage, voice
 turn-taking, voice interaction quality, voice trace coverage, framework trace
 coverage, tool argument schema validation, retrieval context quality, source grounding,
 retrieval/memory attribution, autonomy-loop coverage, multi-agent trace
-coverage, artifact coverage, and expected state.
+coverage, multi-agent coordination quality, artifact coverage, and expected state.
 
 ```python
 from fi.simulate import evaluate_agent_report
@@ -533,6 +540,10 @@ evaluation = evaluate_agent_report(
         "require_source_grounding": True,
         "required_autonomy_loop": ["observe", "orient", "plan", "act", "verify", "reflect"],
         "required_multi_agent_trace": ["role", "contract", "handoff", "review", "reconciliation"],
+        "required_multi_agent_roles": ["support_agent", "policy_specialist", "qa_reviewer"],
+        "expected_multi_agent_handoffs": [{"to": "policy_specialist", "context_keys": ["order_id"]}],
+        "expected_multi_agent_reviews": [{"reviewer": "qa_reviewer", "criteria": ["policy"]}],
+        "expected_multi_agent_reconciliation": {"accepted_source": "policy_specialist"},
         "expected_state": {"case": {"resolved": True}},
     },
 )
@@ -590,7 +601,7 @@ Traces from simulations flow into `Monitor`, scores flow into `Evaluate`, and fa
 - [x] Per-speaker + combined audio capture
 - [x] Scenario auto-generation from a topic
 - [x] `evaluate_report` integration with `ai-evaluation`
-- [x] Local `evaluate_agent_report` scoring for trajectory, tools, memory, framework trace coverage, retrieval/memory attribution, autonomy-loop coverage, multi-agent trace coverage, browser/CUA, browser trace coverage, voice trace coverage, voice interaction quality, environment injection, and pentest signals
+- [x] Local `evaluate_agent_report` scoring for trajectory, tools, memory, framework trace coverage, retrieval/memory attribution, autonomy-loop coverage, multi-agent trace coverage, multi-agent coordination quality, browser/CUA, browser trace coverage, voice trace coverage, voice interaction quality, environment injection, and pentest signals
 - [x] Tool-call capture in wrapper responses
 
 </td>
