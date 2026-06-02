@@ -296,6 +296,7 @@ from fi.simulate import (
     ToolMockEnvironment,
     TestRunner,
     VoiceEnvironment,
+    normalize_framework_trace_events,
 )
 
 report = await TestRunner().run_test(
@@ -359,6 +360,35 @@ Put `ToolFaultInjectionEnvironment` before the real or mocked tool adapter to
 fail the first N matching calls, emit structured `tool_fault` and
 `tool_execution` events, and then allow later retries to fall through to the
 next environment adapter.
+
+For production trace capture, use TraceAI/OpenTelemetry and store/export those
+spans through Future AGI or another OTel-compatible backend. The local
+`FrameworkTraceEnvironment` can ingest raw TraceAI/OpenTelemetry-style span
+records directly, or you can normalize them first:
+
+```python
+trace_records = normalize_framework_trace_events(
+    "traceai",
+    [
+        {
+            "name": "langgraph node support_agent",
+            "attributes": {
+                "gen_ai.span.kind": "CHAIN",
+                "langgraph.state.updates": {"step": "planned"},
+            },
+        },
+        {
+            "name": "search_order",
+            "attributes": {
+                "gen_ai.span.kind": "TOOL",
+                "gen_ai.tool.name": "search_order",
+            },
+        },
+    ],
+)
+
+environment = FrameworkTraceEnvironment(framework="traceai", events=trace_records)
+```
 
 See [`examples/local_environment_adapters.py`](examples/local_environment_adapters.py) for a full local world simulation with ai-evaluation scoring, and [`examples/local_voice_image_environments.py`](examples/local_voice_image_environments.py) for a voice + image artifact cookbook.
 See [`examples/local_browser_trace_replay.py`](examples/local_browser_trace_replay.py) for a browser/CUA trace replay cookbook with screenshots, DOM, console/network logs, and action replay.

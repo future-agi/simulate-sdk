@@ -13,6 +13,7 @@ from fi.simulate import (
     ToolFaultInjectionEnvironment,
     ToolMockEnvironment,
     VoiceEnvironment,
+    normalize_framework_trace_events,
 )
 from fi.simulate.simulation.engines.local_text import LocalTextEngine
 from fi.simulate.simulation.models import Persona, Scenario
@@ -560,6 +561,95 @@ async def test_framework_trace_environment_replays_and_inspects_framework_spans(
     assert {"agent", "model", "tool", "handoff", "guardrail", "latency", "cost"} <= set(trace_state["signals"])
     assert traces and traces[-1]["spans"]
     assert any(event.type == "framework_span" and event.name == "handoff_span policy_specialist" for event in result.events)
+
+
+def test_normalize_framework_trace_events_accepts_traceai_and_native_records():
+    records = [
+        {
+            "name": "langgraph node support_agent",
+            "span_id": "traceai_chain",
+            "attributes": {
+                "gen_ai.span.kind": "CHAIN",
+                "input.value": "order 123",
+                "output.value": "planned tool call",
+                "gen_ai.usage": {"tokens": 7},
+                "langgraph.state.updates": {"step": "planned"},
+            },
+        },
+        {
+            "span_id": "openai_model",
+            "span_data": {"type": "generation", "input": "hi", "output": "hello"},
+        },
+        {
+            "event": "on_tool_start",
+            "name": "search_order",
+            "run_id": "lc_tool",
+            "data": {"input": {"order_id": "123"}},
+        },
+        {
+            "type": "updates",
+            "ns": ["support_graph", "policy_node"],
+            "data": {"support_agent": {"status": "checking_policy"}},
+        },
+        {
+            "event": "agent_state_changed",
+            "payload": {"old_state": "listening", "new_state": "thinking"},
+        },
+        {"frame_type": "TTSSpeakFrame", "text": "I found the order."},
+    ]
+
+    normalized = normalize_framework_trace_events("traceai", records)
+    signals = {signal for span in normalized for signal in span["signals"]}
+
+    assert {"agent", "model", "tool", "state", "voice", "cost", "span"} <= signals
+    assert normalized[0]["input"] == "order 123"
+    assert normalized[0]["output"] == "planned tool call"
+    assert normalized[2]["id"] == "lc_tool"
+
+
+@pytest.mark.asyncio
+async def test_framework_trace_environment_ingests_raw_traceai_records():
+    async def agent(input):
+        return AgentResponse(
+            content="TraceAI framework trace inspected with model, tool, state, and voice signals.",
+            tool_calls=[
+                {"id": "status", "name": "framework_trace_status", "arguments": {}},
+                {"id": "voice", "name": "list_framework_spans", "arguments": {"signal": "voice"}},
+            ],
+        )
+
+    report = await LocalTextEngine().run(
+        scenario=_scenario(),
+        agent_callback=agent,
+        environment=FrameworkTraceEnvironment(
+            framework="traceai",
+            events=[
+                {
+                    "name": "langgraph node support_agent",
+                    "attributes": {
+                        "gen_ai.span.kind": "CHAIN",
+                        "langgraph.state.updates": {"step": "planned"},
+                    },
+                },
+                {
+                    "name": "openai response gpt-4o-mini",
+                    "attributes": {"gen_ai.span.kind": "LLM", "gen_ai.usage": {"tokens": 42}},
+                },
+                {
+                    "name": "search_order",
+                    "attributes": {"gen_ai.span.kind": "TOOL", "gen_ai.tool.name": "search_order"},
+                },
+                {"event": "agent_state_changed", "framework": "livekit", "payload": {"new_state": "speaking"}},
+            ],
+        ),
+        max_turns=1,
+        min_turns=1,
+    )
+
+    result = report.results[0]
+    trace_state = result.metadata["environment_state"]["framework_trace"]
+    assert {"agent", "model", "tool", "state", "voice", "cost"} <= set(trace_state["signals"])
+    assert any(event.type == "framework_span" and "voice" in event.metadata["signals"] for event in result.events)
 
 
 @pytest.mark.asyncio

@@ -1814,14 +1814,16 @@ class FrameworkTraceEnvironment(EnvironmentAdapter):
         metadata: Optional[Mapping[str, Any]] = None,
     ) -> None:
         self.framework = str(framework)
-        self.initial_spans = [
-            _normalize_framework_span(span, framework=self.framework)
-            for span in (spans or [])
-        ]
-        self.initial_events = [
-            _normalize_framework_span(event, framework=self.framework)
-            for event in (events or [])
-        ]
+        self.initial_spans = normalize_framework_trace_events(
+            self.framework,
+            spans or [],
+            category="span",
+        )
+        self.initial_events = normalize_framework_trace_events(
+            self.framework,
+            events or [],
+            category="event",
+        )
         self.initial_state = copy.deepcopy(dict(state or {}))
         self.metadata = copy.deepcopy(dict(metadata or {}))
         self.spans: List[Dict[str, Any]] = []
@@ -1973,6 +1975,27 @@ class FrameworkTraceEnvironment(EnvironmentAdapter):
         for span in [*self.spans, *self.events]:
             signals.update(span.get("signals", []))
         return signals
+
+
+def normalize_framework_trace_events(
+    framework: str,
+    records: Iterable[Any],
+    *,
+    category: str = "event",
+) -> List[Dict[str, Any]]:
+    """
+    Normalize framework-native trace/event records into framework trace spans.
+
+    This accepts dictionary-like records from LangChain/LangGraph stream events,
+    OpenAI Agents spans, CrewAI traces/events, OpenTelemetry spans, LiveKit
+    AgentSession events, Pipecat frames/events, or custom runtimes. Unknown
+    shapes are preserved as attributes while best-effort signals are inferred.
+    """
+
+    return [
+        _normalize_framework_span(record, framework=str(framework), category=category)
+        for record in records
+    ]
 
 
 class AutonomyLoopEnvironment(EnvironmentAdapter):
@@ -2417,44 +2440,162 @@ def _normalize_framework_trace_key(value: Any) -> str:
     return FRAMEWORK_TRACE_ALIASES.get(normalized, normalized)
 
 
-def _normalize_framework_span(value: str | Mapping[str, Any], *, framework: str) -> Dict[str, Any]:
-    raw = {"name": value} if isinstance(value, str) else copy.deepcopy(dict(value))
-    attributes = _nested_dict(raw, ("attributes", "attrs", "metadata", "data", "payload"))
-    name = str(
-        raw.get("name")
-        or raw.get("event")
-        or raw.get("span_name")
-        or raw.get("operation")
-        or raw.get("type")
-        or "framework_event"
+def _normalize_framework_span(
+    value: Any,
+    *,
+    framework: str,
+    category: str = "span",
+) -> Dict[str, Any]:
+    raw = _framework_record_to_dict(value)
+    raw.setdefault("framework", framework)
+    span_data = _coerce_plain_dict(raw.get("span_data") or raw.get("span"))
+    data = _coerce_plain_dict(raw.get("data"))
+    payload = _coerce_plain_dict(raw.get("payload"))
+    attributes = _nested_dict(raw, ("attributes", "attrs", "metadata", "data", "payload", "span_data", "resource"))
+    attributes.setdefault("source_category", category)
+    if raw.get("ns") is not None:
+        attributes.setdefault("namespace", raw.get("ns"))
+
+    name = _framework_record_name(raw, span_data=span_data, data=data, payload=payload)
+    span_id = str(
+        raw.get("id")
+        or raw.get("span_id")
+        or raw.get("run_id")
+        or raw.get("trace_id")
+        or data.get("run_id")
+        or name
     )
-    span_id = str(raw.get("id") or raw.get("span_id") or raw.get("run_id") or name)
-    signals = _framework_signals(raw, attributes, name)
+    signals = _framework_signals(raw, attributes, name, span_data=span_data, data=data, payload=payload)
     normalized = {
         "id": span_id,
         "name": name,
         "framework": str(raw.get("framework") or framework),
-        "type": str(raw.get("type") or raw.get("kind") or raw.get("span_type") or ""),
+        "type": str(
+            raw.get("type")
+            or raw.get("kind")
+            or raw.get("span_type")
+            or raw.get("event")
+            or span_data.get("type")
+            or category
+        ),
         "signals": sorted(signals),
-        "parent_id": raw.get("parent_id") or raw.get("parent_span_id") or raw.get("parent_run_id"),
-        "input": raw.get("input") or attributes.get("input"),
-        "output": raw.get("output") or attributes.get("output"),
-        "error": raw.get("error") or raw.get("exception") or attributes.get("error"),
-        "latency_ms": _first_number(raw, attributes, ("latency_ms", "duration_ms", "elapsed_ms")),
-        "cost": raw.get("cost") or attributes.get("cost") or attributes.get("usage"),
+        "parent_id": _framework_parent_id(raw, data=data),
+        "input": (
+            raw.get("input")
+            or span_data.get("input")
+            or data.get("input")
+            or payload.get("input")
+            or attributes.get("input")
+            or attributes.get("input.value")
+        ),
+        "output": (
+            raw.get("output")
+            or span_data.get("output")
+            or data.get("output")
+            or data.get("chunk")
+            or payload.get("output")
+            or attributes.get("output")
+            or attributes.get("output.value")
+        ),
+        "error": raw.get("error") or raw.get("exception") or data.get("error") or payload.get("error") or attributes.get("error"),
+        "latency_ms": _first_number(raw, attributes, ("latency_ms", "duration_ms", "elapsed_ms", "duration")),
+        "cost": (
+            raw.get("cost")
+            or raw.get("usage")
+            or raw.get("usage_metadata")
+            or span_data.get("usage")
+            or data.get("usage")
+            or data.get("usage_metadata")
+            or attributes.get("cost")
+            or attributes.get("usage")
+            or attributes.get("gen_ai.usage")
+        ),
         "attributes": attributes,
     }
-    for key in ("start_time", "end_time", "timestamp_ms"):
+    for key in ("start_time", "end_time", "timestamp_ms", "started_at", "ended_at"):
         if raw.get(key) is not None:
             normalized[key] = raw.get(key)
     return {key: value for key, value in normalized.items() if value is not None and value != ""}
+
+
+def _framework_record_to_dict(value: Any) -> Dict[str, Any]:
+    if isinstance(value, str):
+        return {"name": value}
+    if isinstance(value, Mapping):
+        raw = copy.deepcopy(dict(value))
+    elif hasattr(value, "model_dump"):
+        raw = copy.deepcopy(dict(value.model_dump()))
+    elif hasattr(value, "dict"):
+        raw = copy.deepcopy(dict(value.dict()))
+    elif hasattr(value, "__dict__"):
+        raw = copy.deepcopy(dict(vars(value)))
+    else:
+        raw = {"name": value.__class__.__name__, "value": str(value)}
+    if not isinstance(value, Mapping):
+        raw.setdefault("class_name", value.__class__.__name__)
+    return raw
+
+
+def _coerce_plain_dict(value: Any) -> Dict[str, Any]:
+    if isinstance(value, Mapping):
+        return copy.deepcopy(dict(value))
+    if hasattr(value, "model_dump"):
+        return copy.deepcopy(dict(value.model_dump()))
+    if hasattr(value, "dict"):
+        return copy.deepcopy(dict(value.dict()))
+    if hasattr(value, "__dict__"):
+        return copy.deepcopy(dict(vars(value)))
+    return {}
+
+
+def _framework_record_name(
+    raw: Mapping[str, Any],
+    *,
+    span_data: Mapping[str, Any],
+    data: Mapping[str, Any],
+    payload: Mapping[str, Any],
+) -> str:
+    event = raw.get("event") or data.get("event") or payload.get("event")
+    base = (
+        raw.get("name")
+        or raw.get("span_name")
+        or raw.get("operation")
+        or raw.get("frame_type")
+        or raw.get("frame")
+        or span_data.get("name")
+        or span_data.get("type")
+        or data.get("name")
+        or payload.get("name")
+        or raw.get("type")
+        or raw.get("class_name")
+    )
+    if not base and event:
+        return str(event)
+    base = base or "framework_event"
+    if event and str(event) not in str(base):
+        return f"{event} {base}"
+    return str(base)
+
+
+def _framework_parent_id(raw: Mapping[str, Any], *, data: Mapping[str, Any]) -> Any:
+    parent_ids = raw.get("parent_ids") or data.get("parent_ids")
+    if isinstance(parent_ids, (list, tuple)) and parent_ids:
+        return parent_ids[-1]
+    return raw.get("parent_id") or raw.get("parent_span_id") or raw.get("parent_run_id")
 
 
 def _framework_signals(
     raw: Mapping[str, Any],
     attributes: Mapping[str, Any],
     name: str,
+    *,
+    span_data: Optional[Mapping[str, Any]] = None,
+    data: Optional[Mapping[str, Any]] = None,
+    payload: Optional[Mapping[str, Any]] = None,
 ) -> set[str]:
+    span_data = span_data or {}
+    data = data or {}
+    payload = payload or {}
     text = " ".join(
         [
             name,
@@ -2462,8 +2603,26 @@ def _framework_signals(
             str(raw.get("kind", "")),
             str(raw.get("span_type", "")),
             str(raw.get("event", "")),
+            str(raw.get("frame_type", "")),
+            str(raw.get("class_name", "")),
+            str(span_data.get("type", "")),
+            str(data.get("type", "")),
+            str(payload.get("type", "")),
             " ".join(str(key) for key in raw.keys()),
+            " ".join(
+                str(item)
+                for item in raw.values()
+                if isinstance(item, (str, int, float, bool))
+            ),
             " ".join(str(key) for key in attributes.keys()),
+            " ".join(
+                str(value)
+                for value in attributes.values()
+                if isinstance(value, (str, int, float, bool))
+            ),
+            " ".join(str(key) for key in span_data.keys()),
+            " ".join(str(key) for key in data.keys()),
+            " ".join(str(key) for key in payload.keys()),
         ]
     ).lower()
     signals = {"span"}
@@ -2479,6 +2638,10 @@ def _framework_signals(
         "generation": "model",
         "tool": "tool",
         "function": "tool",
+        "mcp": "tool",
+        "task": "agent",
+        "crew": "agent",
+        "flow": "agent",
         "handoff": "handoff",
         "transfer": "handoff",
         "guardrail": "guardrail",
@@ -2490,13 +2653,22 @@ def _framework_signals(
         "computer": "browser",
         "cua": "browser",
         "voice": "voice",
+        "livekit": "voice",
+        "pipecat": "voice",
         "audio": "voice",
         "speech": "voice",
         "transcri": "voice",
+        "tts": "voice",
+        "stt": "voice",
         "image": "image",
         "vision": "image",
         "state": "state",
         "checkpoint": "state",
+        "updates": "state",
+        "values": "state",
+        "interrupt": "interrupt",
+        "barge": "interrupt",
+        "frame": "frame",
         "error": "error",
         "exception": "error",
         "latency": "latency",
@@ -2504,6 +2676,9 @@ def _framework_signals(
         "token": "cost",
         "cost": "cost",
         "usage": "cost",
+        "span_kind": "span",
+        "retriever": "retrieval",
+        "retrieval_documents": "retrieval",
     }
     for token, signal in keyword_signals.items():
         if token in text:
@@ -2512,7 +2687,14 @@ def _framework_signals(
         signals.add("latency")
     if raw.get("error") or raw.get("exception") or attributes.get("error"):
         signals.add("error")
-    if raw.get("cost") or attributes.get("cost") or attributes.get("usage"):
+    if (
+        raw.get("cost")
+        or attributes.get("cost")
+        or attributes.get("usage")
+        or attributes.get("gen_ai.usage")
+        or data.get("usage")
+        or data.get("usage_metadata")
+    ):
         signals.add("cost")
     return {_normalize_framework_trace_key(signal) for signal in signals if signal}
 
