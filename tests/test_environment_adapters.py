@@ -1,5 +1,7 @@
 import json
+import struct
 import zipfile
+import zlib
 
 import pytest
 
@@ -40,6 +42,27 @@ def _scenario():
                 outcome="The environment-backed task is resolved.",
             )
         ],
+    )
+
+
+def _write_png(path, width, height, pixels):
+    rows = []
+    for y in range(height):
+        row = bytearray()
+        for x in range(width):
+            row.extend(pixels[y][x])
+        rows.append(b"\x00" + bytes(row))
+    raw = b"".join(rows)
+
+    def chunk(kind, payload):
+        checksum = zlib.crc32(kind + payload) & 0xFFFFFFFF
+        return struct.pack(">I", len(payload)) + kind + payload + struct.pack(">I", checksum)
+
+    path.write_bytes(
+        b"\x89PNG\r\n\x1a\n"
+        + chunk("IHDR".encode(), struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0))
+        + chunk("IDAT".encode(), zlib.compress(raw))
+        + chunk("IEND".encode(), b"")
     )
 
 
@@ -449,6 +472,89 @@ async def test_browser_environment_records_coordinate_regions_and_screenshot_dif
     assert trace["regions"]["confirm_button"]["width"] == 180.0
     assert trace["screenshot_diffs"][-1]["changed_regions"] == ["confirm_button", "status_banner"]
     assert any(event.type == "browser_screenshot_diff" for event in result.events)
+
+
+@pytest.mark.asyncio
+async def test_browser_environment_extracts_pixel_screenshot_diff_and_layout_distribution(tmp_path):
+    before_path = tmp_path / "checkout-before.png"
+    after_path = tmp_path / "checkout-after.png"
+    white = (255, 255, 255, 255)
+    green = (20, 180, 80, 255)
+    before_pixels = [[white for _ in range(4)] for _ in range(4)]
+    after_pixels = [[white for _ in range(4)] for _ in range(4)]
+    for y in (1, 2):
+        for x in (1, 2):
+            after_pixels[y][x] = green
+    _write_png(before_path, 4, 4, before_pixels)
+    _write_png(after_path, 4, 4, after_pixels)
+
+    async def agent(input):
+        return AgentResponse(
+            content="I clicked confirm and captured the visual change.",
+            tool_calls=[
+                {
+                    "id": "click",
+                    "name": "browser_click",
+                    "arguments": {"selector": "#confirm", "action": "click confirm"},
+                }
+            ],
+        )
+
+    report = await LocalTextEngine().run(
+        scenario=_scenario(),
+        agent_callback=agent,
+        environment=BrowserEnvironment(
+            url="https://shop.example.com/checkout",
+            dom="<button id='confirm'>Confirm</button>",
+            screenshot_uri=f"file://{before_path}",
+            allowed_domains=["shop.example.com"],
+            regions={
+                "confirm_button": {"x": 0, "y": 0, "width": 1, "height": 1, "selector": "#confirm"},
+                "status_banner": {"x": 1, "y": 1, "width": 2, "height": 2},
+                "layout_target": {"x": 3, "y": 3, "width": 1, "height": 1},
+            },
+            actions=[
+                {
+                    "id": "confirm_pixel_change",
+                    "tool_names": ["browser_click"],
+                    "selector": "#confirm",
+                    "screenshot_path": str(after_path),
+                    "screenshot_diff": {"id": "confirm_pixel_delta", "threshold": 0},
+                }
+            ],
+            perturbations=[
+                {
+                    "id": "layout_shift_samples",
+                    "type": "layout_shift",
+                    "scores": [0.01, 0.08, 0.12, 0.16],
+                    "affected_regions": ["layout_target"],
+                    "delta": {"y": 2},
+                }
+            ],
+        ),
+        max_turns=1,
+        min_turns=1,
+        modality="cua",
+    )
+
+    result = report.results[0]
+    browser = result.metadata["environment_state"]["browser"]
+    diff = browser["screenshot_diffs"][-1]
+    trace = [
+        artifact.data
+        for artifact in result.artifacts
+        if artifact.type == "trace" and artifact.metadata.get("kind") == "browser_trace"
+    ][-1]
+
+    assert diff["source"] == "pixel_diff"
+    assert diff["changed_pixels"] == 4
+    assert diff["changed_ratio"] == 0.25
+    assert diff["bounding_box"] == {"x": 1.0, "y": 1.0, "width": 2.0, "height": 2.0}
+    assert diff["changed_regions"] == ["status_banner"]
+    assert diff["pixel_diff"]["changed_percent"] == 25.0
+    assert trace["layout_shift_distribution"]["count"] == 4
+    assert trace["layout_shift_distribution"]["p95"] > 0.15
+    assert trace["perturbations"][0]["distribution"]["max"] == 0.16
 
 
 def test_normalize_playwright_trace_export_extracts_trace_zip(tmp_path):

@@ -274,7 +274,8 @@ files, framework traces, or multi-agent handoffs.
 Browser adapters can emit DOM snapshots, screenshots, coordinate-region
 assertions, screenshot/action diff evidence, prompt-injection surfaces, action
 replay, console/network logs, HAR/resource-body replay, OpenAI Computer Use and
-Browser Use trace imports, imported actionability timelines, and trace artifacts.
+Browser Use trace imports, imported actionability timelines, image-derived
+pixel screenshot diffs, layout-shift distributions, and trace artifacts.
 Voice adapters can replay VAD/STT/TTS
 events, Pipecat-style frames, latency profiles, barge-in/overlap handling, call
 routing, noise metadata, LiveKit/Pipecat-style export JSON, waveform fixtures,
@@ -429,6 +430,7 @@ See [`examples/local_environment_adapters.py`](examples/local_environment_adapte
 See [`examples/local_browser_trace_replay.py`](examples/local_browser_trace_replay.py) for a browser/CUA trace replay cookbook with screenshots, DOM, selector and coordinate-region action fixtures, screenshot/action diff evidence, prompt-injection surfaces, mutable browser state, console/network logs, DOM mutation events, and action replay.
 See [`examples/local_playwright_trace_replay.py`](examples/local_playwright_trace_replay.py) for a Playwright trace.zip replay cookbook with imported DOM snapshots, screenshots, video artifacts, stale-screenshot refresh, and layout-shift perturbations.
 See [`examples/local_browser_cua_trace_replay.py`](examples/local_browser_cua_trace_replay.py) for a HAR + OpenAI Computer Use + Browser Use trace replay cookbook with resource bodies, batched `computer_call.actions[]`, screenshots, safety checks, and imported actionability timeline evidence.
+See [`examples/local_browser_visual_fidelity_replay.py`](examples/local_browser_visual_fidelity_replay.py) for a browser/CUA visual-fidelity cookbook with generated PNG fixtures, image-derived pixel diffs, changed-pixel metrics, changed regions, and layout-shift distribution evidence.
 See [`examples/local_voice_replay_routing.py`](examples/local_voice_replay_routing.py) for a voice replay cookbook with VAD/STT/TTS events, Pipecat-style frame replay, noise/overlap evidence, interruption handling, and call routing.
 See [`examples/local_voice_export_replay.py`](examples/local_voice_export_replay.py) for a voice export replay cookbook with LiveKit-style events, Pipecat-style frames, waveform fixtures, diarization, MOS/SNR/clipping/jitter/packet-loss checks, and `load_voice_export`.
 See [`examples/local_framework_trace_replay.py`](examples/local_framework_trace_replay.py) for a framework trace replay cookbook with native spans/events and TraceAI/OpenTelemetry export payloads from orchestration frameworks.
@@ -544,12 +546,15 @@ evaluation = evaluate_agent_report(
         "allowed_domains": ["shop.example.com"],
         "memory_allowed_keys": ["order_id", "status"],
         "required_artifact_types": ["image", "audio"],
-        "required_browser_trace": ["dom", "screenshot", "action", "coordinate_region", "screenshot_diff", "prompt_injection_surface", "dom_mutation", "state", "console", "network"],
+        "required_browser_trace": ["dom", "screenshot", "action", "coordinate_region", "screenshot_diff", "pixel_screenshot_diff", "layout_shift_distribution", "prompt_injection_surface", "dom_mutation", "state", "console", "network"],
         "expected_browser_actions": [{"selector": "#confirm", "success": True}],
         "expected_browser_regions": [
             {"name": "confirm_button", "bounds": {"x": 160, "y": 380, "width": 180, "height": 54}}
         ],
-        "expected_browser_screenshot_diffs": ["confirm_visual_delta"],
+        "expected_browser_screenshot_diffs": [
+            {"id": "confirm_visual_delta"},
+            {"id": "confirm_pixel_delta", "min_changed_pixels": 4, "min_changed_ratio": 0.2},
+        ],
         "forbidden_browser_prompt_injection_targets": ["coupon_iframe"],
         "expected_browser_state": {"url": "https://shop.example.com/done"},
         "expected_browser_dom_contains": ["Done"],
@@ -633,7 +638,7 @@ Traces from simulations flow into `Monitor`, scores flow into `Evaluate`, and fa
 - [x] OpenAI / Anthropic / Gemini / LangChain wrappers
 - [x] Generic framework adapter presets
 - [x] Multimodal artifacts + event trajectories
-- [x] Local environment adapters for mocked tools/APIs, framework trace replay with TraceAI/OpenTelemetry export ingestion, retrieval/memory attribution, autonomy-loop traces, multi-agent handoff traces, browser/CUA trace replay with Playwright trace/video import, HAR/resource bodies, OpenAI Computer Use and Browser Use trace import, actionability timelines, coordinate regions, screenshot diffs, stale-screenshot and layout-shift perturbations, voice frame replay/routing/noise/overlap/export replay/waveform/diarization/perceptual metrics, images, files, adversarial packs, and multi-agent rooms
+- [x] Local environment adapters for mocked tools/APIs, framework trace replay with TraceAI/OpenTelemetry export ingestion, retrieval/memory attribution, autonomy-loop traces, multi-agent handoff traces, browser/CUA trace replay with Playwright trace/video import, HAR/resource bodies, OpenAI Computer Use and Browser Use trace import, actionability timelines, coordinate regions, image-derived pixel screenshot diffs, layout-shift distributions, stale-screenshot and layout-shift perturbations, voice frame replay/routing/noise/overlap/export replay/waveform/diarization/perceptual metrics, images, files, adversarial packs, and multi-agent rooms
 - [x] Deterministic synthetic data generator
 - [x] Self-contained synthetic tool-world generator with schemas, mocks, state expectations, and evaluator config
 - [x] Deterministic pentest scenario generator

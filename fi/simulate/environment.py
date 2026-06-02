@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import base64
 import copy
 import json
 import os
+import struct
 import urllib.request
 import zipfile
+import zlib
 from abc import ABC
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional
 from urllib.parse import urlparse
@@ -405,6 +408,7 @@ class BrowserEnvironment(EnvironmentAdapter):
                     "network_log": len(self.network_log),
                     "resource_bodies": len(self.resource_bodies),
                     "actionability_timeline": len(self.actionability_timeline),
+                    "layout_shift_distribution": bool(_browser_layout_shift_distribution(self.perturbations)),
                     "video_artifacts": len(self.video_artifacts),
                     "perturbations": len(self.perturbations),
                     "trace_import": copy.deepcopy(self.trace_import_metadata),
@@ -929,6 +933,14 @@ class BrowserEnvironment(EnvironmentAdapter):
             screenshot_uri = effect.get("uri")
         if "path" in effect and screenshot_path is None:
             screenshot_path = effect.get("path")
+        computed_screenshot_diff = _compute_browser_screenshot_diff(
+            current,
+            effect,
+            after_uri=screenshot_uri,
+            after_path=screenshot_path,
+            regions=self.regions,
+        )
+        screenshot_diff = _merge_browser_screenshot_diff(screenshot_diff, computed_screenshot_diff)
 
         if (
             requested_url != current.get("url")
@@ -1043,6 +1055,7 @@ class BrowserEnvironment(EnvironmentAdapter):
             "prompt_injections": copy.deepcopy(self.prompt_injections),
             "video_artifacts": copy.deepcopy(self.video_artifacts),
             "perturbations": copy.deepcopy(self.perturbations),
+            "layout_shift_distribution": _browser_layout_shift_distribution(self.perturbations),
             "trace_import": copy.deepcopy(self.trace_import_metadata),
             "final_state": {"browser": self._state_payload()},
         }
@@ -1061,6 +1074,7 @@ class BrowserEnvironment(EnvironmentAdapter):
             "actionability_timeline": copy.deepcopy(self.actionability_timeline),
             "video_artifacts": copy.deepcopy(self.video_artifacts),
             "perturbations": copy.deepcopy(self.perturbations),
+            "layout_shift_distribution": _browser_layout_shift_distribution(self.perturbations),
         }
         if last_action is not None:
             payload["last_action"] = last_action
@@ -5938,7 +5952,12 @@ def _normalize_browser_perturbation(
     item["type"] = "stale_screenshot" if "stale" in kind else ("layout_shift" if "layout" in kind and "shift" in kind else kind)
     item.setdefault("id", f"{item['type']}_{index + 1}")
     if item["type"] == "layout_shift":
+        score_samples = _browser_layout_shift_samples(item)
+        if len(score_samples) > 1:
+            item["distribution"] = _browser_score_distribution(score_samples)
         item.setdefault("score", item.get("value", item.get("layout_shift_score", item.get("cls"))))
+        if item.get("score") is None and score_samples:
+            item["score"] = max(score_samples)
         delta = _coerce_plain_dict(item.get("delta"))
         dx = _as_number(item.get("dx", item.get("x_shift", delta.get("x", delta.get("dx", 0)))))
         dy = _as_number(item.get("dy", item.get("y_shift", delta.get("y", delta.get("dy", 0)))))
@@ -5948,6 +5967,70 @@ def _normalize_browser_perturbation(
         if regions is not None:
             item["affected_regions"] = [str(value) for value in _as_iterable(regions)]
     return item
+
+
+def _browser_layout_shift_samples(source: Mapping[str, Any]) -> List[float]:
+    samples: List[float] = []
+    saw_series = False
+    for key in ("scores", "samples", "values", "layout_shift_scores", "cls_values"):
+        for value in _as_iterable(source.get(key, [])):
+            score = _as_number(value)
+            if score is not None:
+                saw_series = True
+                samples.append(score)
+    distribution = _coerce_plain_dict(source.get("distribution"))
+    if not saw_series:
+        for key in ("scores", "samples", "values"):
+            for value in _as_iterable(distribution.get(key, [])):
+                score = _as_number(value)
+                if score is not None:
+                    saw_series = True
+                    samples.append(score)
+    score = _as_number(source.get("score", source.get("value", source.get("layout_shift_score", source.get("cls")))))
+    if score is not None and not saw_series:
+        samples.append(score)
+    return samples
+
+
+def _browser_layout_shift_distribution(perturbations: Iterable[Mapping[str, Any]]) -> Dict[str, Any]:
+    scores: List[float] = []
+    for perturbation in perturbations:
+        if perturbation.get("type") != "layout_shift":
+            continue
+        scores.extend(_browser_layout_shift_samples(perturbation))
+    if len(scores) <= 1:
+        return {}
+    return _browser_score_distribution(scores)
+
+
+def _browser_score_distribution(values: Iterable[Any]) -> Dict[str, Any]:
+    scores = sorted(float(score) for score in (_as_number(value) for value in values) if score is not None)
+    if not scores:
+        return {}
+    count = len(scores)
+    return {
+        "count": count,
+        "min": round(scores[0], 6),
+        "max": round(scores[-1], 6),
+        "mean": round(sum(scores) / count, 6),
+        "p50": round(_percentile(scores, 0.50), 6),
+        "p75": round(_percentile(scores, 0.75), 6),
+        "p95": round(_percentile(scores, 0.95), 6),
+        "p99": round(_percentile(scores, 0.99), 6),
+        "scores": [round(score, 6) for score in scores],
+    }
+
+
+def _percentile(sorted_values: List[float], percentile: float) -> float:
+    if not sorted_values:
+        return 0.0
+    if len(sorted_values) == 1:
+        return sorted_values[0]
+    position = (len(sorted_values) - 1) * percentile
+    lower = int(position)
+    upper = min(lower + 1, len(sorted_values) - 1)
+    weight = position - lower
+    return sorted_values[lower] * (1 - weight) + sorted_values[upper] * weight
 
 
 def _apply_browser_perturbations_to_regions(
@@ -6448,6 +6531,356 @@ def _normalize_browser_screenshot_diff(
     if effect_id:
         item.setdefault("source_action", effect_id)
     return item
+
+
+def _merge_browser_screenshot_diff(
+    explicit: Optional[Dict[str, Any]],
+    computed: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    if explicit and computed:
+        merged = copy.deepcopy(computed)
+        merged.update(copy.deepcopy(explicit))
+        for key in ("changed_regions", "regions"):
+            explicit_values = [str(value) for value in _as_iterable(explicit.get(key, []))]
+            computed_values = [str(value) for value in _as_iterable(computed.get(key, []))]
+            values = list(dict.fromkeys([*explicit_values, *computed_values]))
+            if values:
+                merged[key] = values
+        merged.setdefault("pixel_diff", copy.deepcopy(computed.get("pixel_diff", computed)))
+        return merged
+    return explicit or computed
+
+
+def _compute_browser_screenshot_diff(
+    before_snapshot: Mapping[str, Any],
+    effect: Mapping[str, Any],
+    *,
+    after_uri: Any,
+    after_path: Any,
+    regions: Mapping[str, Mapping[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    diff_spec = _coerce_plain_dict(effect.get("screenshot_diff", effect.get("screenshot_delta")))
+    before_ref = (
+        diff_spec.get("before_uri")
+        or diff_spec.get("before_path")
+        or diff_spec.get("before")
+        or before_snapshot.get("screenshot_uri")
+        or before_snapshot.get("screenshot_path")
+    )
+    after_ref = (
+        diff_spec.get("after_uri")
+        or diff_spec.get("after_path")
+        or diff_spec.get("after")
+        or effect.get("screenshot_uri")
+        or effect.get("screenshot_path")
+        or effect.get("uri")
+        or effect.get("path")
+        or after_uri
+        or after_path
+    )
+    before_image = _load_browser_image_pixels(before_ref)
+    after_image = _load_browser_image_pixels(after_ref)
+    if not before_image or not after_image:
+        return None
+    threshold = _browser_pixel_threshold(diff_spec.get("threshold", diff_spec.get("pixel_threshold", 0)))
+    diff = _browser_pixel_diff(
+        before_image,
+        after_image,
+        threshold=threshold,
+        regions=regions,
+    )
+    if not diff:
+        return None
+    effect_id = str(effect.get("id") or "")
+    diff.setdefault("id", f"{effect_id}_pixel_diff" if effect_id else "browser_pixel_diff")
+    if effect_id:
+        diff.setdefault("source_action", effect_id)
+    diff["before"] = str(before_ref)
+    diff["after"] = str(after_ref)
+    diff["source"] = "pixel_diff"
+    diff["algorithm"] = "pixel_absdiff_v1"
+    diff["pixel_diff"] = {
+        key: copy.deepcopy(value)
+        for key, value in diff.items()
+        if key
+        in {
+            "width",
+            "height",
+            "compared_pixels",
+            "changed_pixels",
+            "changed_ratio",
+            "changed_percent",
+            "max_channel_delta",
+            "mean_channel_delta",
+            "threshold",
+            "bounding_box",
+            "changed_regions",
+        }
+    }
+    return diff
+
+
+def _browser_pixel_threshold(value: Any) -> int:
+    threshold = _as_number(value)
+    if threshold is None:
+        return 0
+    return max(0, min(255, int(threshold)))
+
+
+def _load_browser_image_pixels(ref: Any) -> Optional[Dict[str, Any]]:
+    data = _load_browser_image_bytes(ref)
+    if not data:
+        return None
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return _decode_browser_png(data)
+    if data.startswith(b"P6") or data.startswith(b"P3"):
+        return _decode_browser_ppm(data)
+    return None
+
+
+def _load_browser_image_bytes(ref: Any) -> Optional[bytes]:
+    if not ref:
+        return None
+    if isinstance(ref, bytes):
+        return ref
+    text = str(ref)
+    if text.startswith("data:image/"):
+        _, _, payload = text.partition(",")
+        if ";base64" not in text[: text.find(",") if "," in text else len(text)]:
+            return None
+        try:
+            return base64.b64decode(payload)
+        except (ValueError, TypeError):
+            return None
+    if text.startswith("file://"):
+        text = urlparse(text).path
+    if text.startswith("zip://") and "#" in text:
+        archive_path, _, member = text[len("zip://") :].partition("#")
+        try:
+            with zipfile.ZipFile(archive_path) as archive:
+                return archive.read(member)
+        except (OSError, KeyError, zipfile.BadZipFile):
+            return None
+    if text.startswith(("http://", "https://")):
+        return None
+    try:
+        with open(text, "rb") as handle:
+            return handle.read()
+    except OSError:
+        return None
+
+
+def _decode_browser_png(data: bytes) -> Optional[Dict[str, Any]]:
+    try:
+        offset = 8
+        width = height = bit_depth = color_type = None
+        compressed = bytearray()
+        while offset + 8 <= len(data):
+            length = struct.unpack(">I", data[offset : offset + 4])[0]
+            chunk_type = data[offset + 4 : offset + 8]
+            chunk = data[offset + 8 : offset + 8 + length]
+            offset += 12 + length
+            if chunk_type == b"IHDR":
+                width, height, bit_depth, color_type, _, _, interlace = struct.unpack(">IIBBBBB", chunk)
+                if bit_depth != 8 or interlace != 0 or color_type not in {0, 2, 6}:
+                    return None
+            elif chunk_type == b"IDAT":
+                compressed.extend(chunk)
+            elif chunk_type == b"IEND":
+                break
+        if width is None or height is None or bit_depth is None or color_type is None:
+            return None
+        channels = {0: 1, 2: 3, 6: 4}[color_type]
+        row_bytes = int(width) * channels
+        raw = zlib.decompress(bytes(compressed))
+        rows: List[bytearray] = []
+        cursor = 0
+        previous = bytearray(row_bytes)
+        for _ in range(int(height)):
+            filter_type = raw[cursor]
+            cursor += 1
+            row = bytearray(raw[cursor : cursor + row_bytes])
+            cursor += row_bytes
+            _unfilter_png_row(row, previous, channels, filter_type)
+            rows.append(row)
+            previous = row
+        pixels = []
+        for row in rows:
+            for x in range(int(width)):
+                index = x * channels
+                if color_type == 0:
+                    gray = row[index]
+                    pixels.append((gray, gray, gray, 255))
+                elif color_type == 2:
+                    pixels.append((row[index], row[index + 1], row[index + 2], 255))
+                else:
+                    pixels.append((row[index], row[index + 1], row[index + 2], row[index + 3]))
+        return {"width": int(width), "height": int(height), "pixels": pixels}
+    except (IndexError, KeyError, struct.error, ValueError, zlib.error):
+        return None
+
+
+def _unfilter_png_row(row: bytearray, previous: bytearray, channels: int, filter_type: int) -> None:
+    for index, value in enumerate(row):
+        left = row[index - channels] if index >= channels else 0
+        up = previous[index] if previous else 0
+        up_left = previous[index - channels] if previous and index >= channels else 0
+        if filter_type == 0:
+            continue
+        if filter_type == 1:
+            row[index] = (value + left) & 0xFF
+        elif filter_type == 2:
+            row[index] = (value + up) & 0xFF
+        elif filter_type == 3:
+            row[index] = (value + ((left + up) // 2)) & 0xFF
+        elif filter_type == 4:
+            row[index] = (value + _png_paeth(left, up, up_left)) & 0xFF
+        else:
+            raise ValueError("unsupported png filter")
+
+
+def _png_paeth(left: int, up: int, up_left: int) -> int:
+    estimate = left + up - up_left
+    distances = (abs(estimate - left), abs(estimate - up), abs(estimate - up_left))
+    if distances[0] <= distances[1] and distances[0] <= distances[2]:
+        return left
+    if distances[1] <= distances[2]:
+        return up
+    return up_left
+
+
+def _decode_browser_ppm(data: bytes) -> Optional[Dict[str, Any]]:
+    try:
+        tokens: List[bytes] = []
+        index = 0
+        while len(tokens) < 4 and index < len(data):
+            if data[index : index + 1] == b"#":
+                while index < len(data) and data[index : index + 1] not in {b"\n", b"\r"}:
+                    index += 1
+                continue
+            if data[index : index + 1].isspace():
+                index += 1
+                continue
+            start = index
+            while index < len(data) and not data[index : index + 1].isspace():
+                index += 1
+            tokens.append(data[start:index])
+        if len(tokens) < 4:
+            return None
+        magic, width_raw, height_raw, max_raw = tokens
+        width, height, max_value = int(width_raw), int(height_raw), int(max_raw)
+        if max_value <= 0 or max_value > 255:
+            return None
+        while index < len(data) and data[index : index + 1].isspace():
+            index += 1
+        pixels = []
+        if magic == b"P6":
+            payload = data[index : index + width * height * 3]
+            if len(payload) < width * height * 3:
+                return None
+            for offset in range(0, len(payload), 3):
+                pixels.append((payload[offset], payload[offset + 1], payload[offset + 2], 255))
+        elif magic == b"P3":
+            values = [int(token) for token in data[index:].split()]
+            if len(values) < width * height * 3:
+                return None
+            for offset in range(0, width * height * 3, 3):
+                pixels.append((values[offset], values[offset + 1], values[offset + 2], 255))
+        else:
+            return None
+        return {"width": width, "height": height, "pixels": pixels}
+    except (ValueError, IndexError):
+        return None
+
+
+def _browser_pixel_diff(
+    before: Mapping[str, Any],
+    after: Mapping[str, Any],
+    *,
+    threshold: int,
+    regions: Mapping[str, Mapping[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    width = min(int(before.get("width", 0)), int(after.get("width", 0)))
+    height = min(int(before.get("height", 0)), int(after.get("height", 0)))
+    if width <= 0 or height <= 0:
+        return None
+    before_pixels = list(before.get("pixels", []))
+    after_pixels = list(after.get("pixels", []))
+    before_width = int(before.get("width", width))
+    after_width = int(after.get("width", width))
+    changed_pixels = 0
+    channel_delta_sum = 0
+    max_delta = 0
+    min_x = min_y = None
+    max_x = max_y = None
+    for y in range(height):
+        for x in range(width):
+            before_pixel = before_pixels[(y * before_width) + x]
+            after_pixel = after_pixels[(y * after_width) + x]
+            deltas = [abs(int(a) - int(b)) for a, b in zip(before_pixel, after_pixel)]
+            delta = max(deltas)
+            if delta <= threshold:
+                continue
+            changed_pixels += 1
+            channel_delta_sum += sum(deltas[:3]) / 3
+            max_delta = max(max_delta, delta)
+            min_x = x if min_x is None else min(min_x, x)
+            min_y = y if min_y is None else min(min_y, y)
+            max_x = x if max_x is None else max(max_x, x)
+            max_y = y if max_y is None else max(max_y, y)
+    compared = width * height
+    changed_ratio = changed_pixels / compared if compared else 0.0
+    bounding_box = None
+    changed_regions: List[str] = []
+    if min_x is not None and min_y is not None and max_x is not None and max_y is not None:
+        bounding_box = {
+            "x": float(min_x),
+            "y": float(min_y),
+            "width": float(max_x - min_x + 1),
+            "height": float(max_y - min_y + 1),
+        }
+        changed_regions = _browser_regions_intersecting_box(bounding_box, regions)
+    return {
+        "width": width,
+        "height": height,
+        "compared_pixels": compared,
+        "changed_pixels": changed_pixels,
+        "changed_ratio": round(changed_ratio, 6),
+        "changed_percent": round(changed_ratio * 100, 4),
+        "max_channel_delta": max_delta,
+        "mean_channel_delta": round(channel_delta_sum / changed_pixels, 4) if changed_pixels else 0.0,
+        "threshold": threshold,
+        "bounding_box": bounding_box,
+        "changed_regions": changed_regions,
+    }
+
+
+def _browser_regions_intersecting_box(
+    box: Mapping[str, Any],
+    regions: Mapping[str, Mapping[str, Any]],
+) -> List[str]:
+    names: List[str] = []
+    for name, region in regions.items():
+        if _browser_boxes_intersect(box, region):
+            names.append(str(region.get("name") or name))
+    return list(dict.fromkeys(names))
+
+
+def _browser_boxes_intersect(first: Mapping[str, Any], second: Mapping[str, Any]) -> bool:
+    first_x = _as_number(first.get("x")) or 0.0
+    first_y = _as_number(first.get("y")) or 0.0
+    first_w = _as_number(first.get("width")) or 0.0
+    first_h = _as_number(first.get("height")) or 0.0
+    second_x = _as_number(second.get("x")) or 0.0
+    second_y = _as_number(second.get("y")) or 0.0
+    second_w = _as_number(second.get("width")) or 0.0
+    second_h = _as_number(second.get("height")) or 0.0
+    return (
+        first_x < second_x + second_w
+        and first_x + first_w > second_x
+        and first_y < second_y + second_h
+        and first_y + first_h > second_y
+    )
 
 
 def _browser_screenshot_diff_grounding(diff: Any) -> Dict[str, Any]:
