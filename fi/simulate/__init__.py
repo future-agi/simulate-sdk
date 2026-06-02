@@ -34,7 +34,7 @@ from .simulation import (
     SyntheticDataGenerator,
     SyntheticScenarioConfig,
 )
-from .evaluation import evaluate_report
+from .evaluation import evaluate_agent_report, evaluate_report
 
 __all__ = [
     "AgentDefinition",
@@ -70,4 +70,5 @@ __all__ = [
     "SyntheticDataGenerator",
     "SyntheticScenarioConfig",
     "evaluate_report",
+    "evaluate_agent_report",
 ]

@@ -1,11 +1,45 @@
 from __future__ import annotations
 
-from typing import Iterable, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 import os
 import base64
 import json
 
 from fi.simulate.simulation.models import TestReport
+
+
+def evaluate_agent_report(
+    report: TestReport,
+    *,
+    config: Mapping[str, Any] | None = None,
+    threshold: float = 0.7,
+    attach: bool = True,
+) -> Any:
+    """
+    Evaluate a simulation report locally with ai-evaluation agent metrics.
+
+    This is the no-cloud path for the trinity loop:
+    simulate-sdk captures messages/tool calls/events/artifacts, ai-evaluation
+    scores the agent trajectory and pentest signals, and agent-opt can optimize
+    against the attached numeric scores.
+
+    Returns the ai-evaluation AgentReportEvaluation object. When `attach=True`,
+    each TestCaseResult receives an `evaluation["agent_report"]` payload and
+    aggregate summary is copied into `result.metadata["agent_report_summary"]`.
+    """
+
+    try:
+        from fi.evals.metrics.agents import evaluate_agent_report as evaluate
+    except Exception as e:  # pragma: no cover - import error clarity
+        raise RuntimeError(
+            "ai-evaluation>=1.1 with agent report metrics is required. "
+            "Install with `pip install ai-evaluation`."
+        ) from e
+
+    evaluation = evaluate(report, config=dict(config or {}), threshold=threshold)
+    if attach:
+        _attach_agent_report_evaluation(report, evaluation)
+    return evaluation
 
 
 def evaluate_report(
@@ -158,5 +192,37 @@ def _model_to_dict(value):
         return value.model_dump()
     if hasattr(value, "dict"):
         return value.dict()
+    if isinstance(value, list):
+        return [_model_to_dict(item) for item in value]
+    if isinstance(value, tuple):
+        return [_model_to_dict(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _model_to_dict(item) for key, item in value.items()}
+    if hasattr(value, "__dict__"):
+        return {key: _model_to_dict(item) for key, item in vars(value).items()}
     return value
 
+
+def _attach_agent_report_evaluation(report: TestReport, evaluation: Any) -> None:
+    cases = getattr(evaluation, "cases", []) or []
+    summary = _model_to_dict(getattr(evaluation, "summary", {}))
+    aggregate = {
+        "score": getattr(evaluation, "score", None),
+        "passed": getattr(evaluation, "passed", None),
+        "threshold": getattr(evaluation, "threshold", None),
+        "summary": summary,
+    }
+    for index, result in enumerate(report.results):
+        case = cases[index] if index < len(cases) else None
+        metrics = getattr(case, "metrics", []) if case is not None else []
+        payload = {
+            **aggregate,
+            "case_score": getattr(case, "score", None) if case is not None else None,
+            "case_passed": getattr(case, "passed", None) if case is not None else None,
+            "metrics": [_model_to_dict(metric) for metric in metrics],
+            "findings": _model_to_dict(getattr(case, "findings", [])) if case is not None else [],
+        }
+        result.evaluation = dict(result.evaluation or {})
+        result.evaluation["agent_report"] = payload
+        result.metadata = dict(result.metadata or {})
+        result.metadata["agent_report_summary"] = aggregate

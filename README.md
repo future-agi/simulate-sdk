@@ -292,6 +292,31 @@ evaluate_report(
 )
 ```
 
+For fully local agent scoring, use `evaluate_agent_report`. It scores the
+normalized simulation trace directly: trajectory, tool use, prompt-injection
+resistance, memory integrity, browser/CUA safety, voice turn-taking, and
+expected state.
+
+```python
+from fi.simulate import evaluate_agent_report
+
+evaluation = evaluate_agent_report(
+    report,
+    config={
+        "required_tools": ["search_order"],
+        "available_tools": ["search_order"],
+        "allowed_domains": ["shop.example.com"],
+        "memory_allowed_keys": ["order_id", "status"],
+        "expected_state": {"case": {"resolved": True}},
+    },
+)
+
+print(evaluation.score)
+print(report.results[0].evaluation["agent_report"]["case_score"])
+```
+
+See [`examples/local_agent_report_evaluation.py`](examples/local_agent_report_evaluation.py) for a full local simulate -> evaluate cookbook.
+
 50+ metrics are available out of the box — groundedness, faithfulness, tool-use correctness, RAG context relevance, hallucination, PII, toxicity, bias, audio quality, and custom rubrics. See the [evaluation docs](https://docs.futureagi.com/docs/evaluation) for the full catalog.
 
 ---
@@ -336,6 +361,7 @@ Traces from simulations flow into `Monitor`, scores flow into `Evaluate`, and fa
 - [x] Per-speaker + combined audio capture
 - [x] Scenario auto-generation from a topic
 - [x] `evaluate_report` integration with `ai-evaluation`
+- [x] Local `evaluate_agent_report` scoring for trajectory, tools, memory, browser/CUA, voice, and pentest signals
 - [x] Tool-call capture in wrapper responses
 
 </td>
