@@ -3,6 +3,7 @@ import pytest
 from fi.simulate import (
     AdversarialEnvironmentPack,
     AgentResponse,
+    AutonomyLoopEnvironment,
     BrowserEnvironment,
     FileEnvironment,
     ImageEnvironment,
@@ -434,3 +435,87 @@ async def test_adversarial_environment_pack_exposes_hostile_world_surfaces():
         "browser",
         "memory",
     ]
+
+
+@pytest.mark.asyncio
+async def test_autonomy_loop_environment_records_control_loop_trace():
+    async def agent(input):
+        return AgentResponse(
+            content="The autonomous support case is resolved with verified loop evidence.",
+            tool_calls=[
+                {
+                    "id": "observe",
+                    "name": "record_observation",
+                    "arguments": {"signals": ["user wants refund", "policy requires lookup"]},
+                },
+                {
+                    "id": "orient",
+                    "name": "orient_strategy",
+                    "arguments": {"strategy": "resolve only after evidence and policy check"},
+                },
+                {
+                    "id": "plan",
+                    "name": "propose_plan",
+                    "arguments": {"steps": ["lookup order", "check policy", "respond"]},
+                },
+                {
+                    "id": "act",
+                    "name": "record_action",
+                    "arguments": {"action": "lookup order and policy"},
+                },
+                {
+                    "id": "verify",
+                    "name": "verify_outcome",
+                    "arguments": {"passed": True, "checks": ["order found", "policy allowed"]},
+                },
+                {
+                    "id": "reflect",
+                    "name": "reflect",
+                    "arguments": {"lesson": "verify policy before final refund guidance"},
+                },
+                {
+                    "id": "memory",
+                    "name": "write_memory",
+                    "arguments": {"order_id": "ord_123", "status": "resolved"},
+                },
+                {
+                    "id": "skill",
+                    "name": "store_skill",
+                    "arguments": {"name": "refund_policy_check", "steps": ["lookup", "verify", "respond"]},
+                },
+            ],
+        )
+
+    report = await LocalTextEngine().run(
+        scenario=_scenario(),
+        agent_callback=agent,
+        environment=AutonomyLoopEnvironment(
+            goal="Resolve support case with explicit monitor-control evidence.",
+            feedback={"verify": {"score": 1.0}, "reflect": {"error": "none"}},
+            prior_memory={"previous_case": "ask for order id first"},
+            policy={"irreversible_actions_require_verification": True},
+        ),
+        max_turns=1,
+        min_turns=1,
+    )
+
+    result = report.results[0]
+    autonomy_state = result.metadata["environment_state"]["autonomy_loop"]
+
+    assert set(autonomy_state["stages_observed"]) == {
+        "observe",
+        "orient",
+        "plan",
+        "act",
+        "verify",
+        "reflect",
+        "memory",
+        "skill",
+    }
+    assert autonomy_state["memory_updates"][-1]["order_id"] == "ord_123"
+    assert "refund_policy_check" in autonomy_state["skills"]
+    assert any(
+        artifact.type == "trace" and artifact.metadata.get("kind") == "autonomy_loop_trace"
+        for artifact in result.artifacts
+    )
+    assert any(event.type == "autonomy_loop" and event.name == "verify" for event in result.events)

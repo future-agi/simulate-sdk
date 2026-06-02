@@ -1248,6 +1248,224 @@ class MultiAgentRoomEnvironment(EnvironmentAdapter):
         )
 
 
+class AutonomyLoopEnvironment(EnvironmentAdapter):
+    """
+    Local autonomy-loop harness for observe/orient/plan/act/verify/reflect traces.
+
+    The adapter exposes deterministic tools an agent can call to make its control
+    loop observable. It is intended for testing the scaffold around an agent:
+    planning, feedback use, reflection, memory writes, and skill-library updates.
+    """
+
+    name = "autonomy_loop"
+
+    def __init__(
+        self,
+        *,
+        goal: Optional[str] = None,
+        required_stages: Optional[Iterable[str]] = None,
+        feedback: Optional[Mapping[str, Any]] = None,
+        prior_memory: Optional[Mapping[str, Any]] = None,
+        skill_library: Optional[Mapping[str, Any] | Iterable[Mapping[str, Any]]] = None,
+        policy: Optional[Mapping[str, Any]] = None,
+        state: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        self.goal = goal
+        self.required_stages = [
+            _normalize_autonomy_stage(stage)
+            for stage in (required_stages or DEFAULT_AUTONOMY_STAGES)
+        ]
+        self.required_stages = [stage for stage in self.required_stages if stage]
+        self.feedback = copy.deepcopy(dict(feedback or {}))
+        self.prior_memory = copy.deepcopy(dict(prior_memory or {}))
+        self.initial_skills = _normalize_skill_library(skill_library)
+        self.policy = copy.deepcopy(dict(policy or {}))
+        self.initial_state = copy.deepcopy(dict(state or {}))
+        self.entries: List[Dict[str, Any]] = []
+        self.memory_updates: List[Dict[str, Any]] = []
+        self.skills: Dict[str, Any] = copy.deepcopy(self.initial_skills)
+        self.state = copy.deepcopy(self.initial_state)
+
+    def reset(self, **context: Any) -> EnvironmentSnapshot:
+        self.entries = []
+        self.memory_updates = []
+        self.skills = copy.deepcopy(self.initial_skills)
+        self.state = copy.deepcopy(self.initial_state)
+        return EnvironmentSnapshot(
+            tools=self._tool_specs(),
+            artifacts=[self._trace_artifact()],
+            state={"autonomy_loop": self._state_payload()},
+            events=[
+                SimulationEvent(
+                    type="autonomy_loop",
+                    name="loop_ready",
+                    payload={
+                        "goal": self.goal,
+                        "required_stages": self.required_stages,
+                        "feedback_keys": sorted(self.feedback.keys()),
+                        "memory_keys": sorted(self.prior_memory.keys()),
+                        "skill_count": len(self.skills),
+                        "policy_keys": sorted(self.policy.keys()),
+                    },
+                )
+            ],
+            metadata={
+                "autonomy_loop": {
+                    "required_stages": self.required_stages,
+                    "feedback_keys": sorted(self.feedback.keys()),
+                }
+            },
+        )
+
+    def handle_tool_call(
+        self,
+        tool_call: Mapping[str, Any],
+        **context: Any,
+    ) -> Optional[ToolExecutionResult]:
+        name = _tool_name(tool_call)
+        stage = _autonomy_stage_for_tool(name)
+        if not stage:
+            return None
+
+        arguments = _tool_arguments(tool_call)
+        call_id = _tool_call_id(tool_call)
+        entry = {
+            "stage": stage,
+            "tool": name,
+            "arguments": copy.deepcopy(arguments),
+            "turn_index": context.get("turn_index"),
+        }
+        feedback = copy.deepcopy(
+            self.feedback.get(stage, self.feedback.get(str(name), self.feedback.get("default", {})))
+        )
+        if feedback:
+            entry["feedback"] = feedback
+        if self.policy:
+            entry["policy"] = copy.deepcopy(self.policy)
+        self.entries.append(entry)
+
+        if stage == "memory":
+            self.memory_updates.append(copy.deepcopy(arguments))
+        if stage == "skill":
+            skill_name = str(arguments.get("name") or arguments.get("skill") or f"skill_{len(self.skills) + 1}")
+            self.skills[skill_name] = copy.deepcopy(arguments)
+        if stage == "act":
+            self.state["last_action"] = copy.deepcopy(arguments)
+        if stage == "verify":
+            self.state["last_verification"] = copy.deepcopy(arguments)
+
+        payload = {
+            "stage": stage,
+            "tool": name,
+            "arguments": arguments,
+            "feedback": feedback,
+            "observed_stages": self._observed_stages(),
+        }
+        return ToolExecutionResult(
+            tool_call_id=call_id,
+            tool_name=str(name),
+            content=f"Recorded autonomy loop stage '{stage}'.",
+            result=payload,
+            state_updates={"autonomy_loop": self._state_payload()},
+            artifacts=[self._trace_artifact()],
+            events=[
+                SimulationEvent(
+                    type="autonomy_loop",
+                    name=stage,
+                    payload=payload,
+                )
+            ],
+            metadata={"autonomy_loop": {"stage": stage}},
+        )
+
+    def _tool_specs(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                "name": "record_observation",
+                "description": "Record observed task, environment, user, or state signals.",
+                "parameters": {"type": "object", "properties": {"signals": {"type": "array"}}},
+            },
+            {
+                "name": "orient_strategy",
+                "description": "Record the strategy, constraints, uncertainty, or policy orientation.",
+                "parameters": {"type": "object", "properties": {"strategy": {"type": "string"}}},
+            },
+            {
+                "name": "propose_plan",
+                "description": "Record a decomposed plan or candidate next steps.",
+                "parameters": {"type": "object", "properties": {"steps": {"type": "array"}}},
+            },
+            {
+                "name": "record_action",
+                "description": "Record the selected action and why it was chosen.",
+                "parameters": {"type": "object", "properties": {"action": {"type": "string"}}},
+            },
+            {
+                "name": "verify_outcome",
+                "description": "Record self-check, critic, test, or external verification evidence.",
+                "parameters": {"type": "object", "properties": {"passed": {"type": "boolean"}}},
+            },
+            {
+                "name": "reflect",
+                "description": "Record reflection or self-refinement notes from feedback.",
+                "parameters": {"type": "object", "properties": {"lesson": {"type": "string"}}},
+            },
+            {
+                "name": "write_memory",
+                "description": "Record an episodic memory update produced by the agent.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            {
+                "name": "store_skill",
+                "description": "Record a reusable skill, macro, or procedure learned by the agent.",
+                "parameters": {"type": "object", "properties": {"name": {"type": "string"}}},
+            },
+            {
+                "name": "autonomy_status",
+                "description": "Inspect observed autonomy loop stages, memory, skills, and feedback.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        ]
+
+    def _trace_artifact(self) -> SimulationArtifact:
+        return SimulationArtifact(
+            type="trace",
+            role="environment",
+            data=self._trace_payload(),
+            metadata={"kind": "autonomy_loop_trace", "required_stages": self.required_stages},
+        )
+
+    def _trace_payload(self) -> Dict[str, Any]:
+        return {
+            "kind": "autonomy_loop_trace",
+            "goal": self.goal,
+            "required_stages": list(self.required_stages),
+            "stages_observed": self._observed_stages(),
+            "entries": copy.deepcopy(self.entries),
+            "feedback": copy.deepcopy(self.feedback),
+            "prior_memory": copy.deepcopy(self.prior_memory),
+            "memory_updates": copy.deepcopy(self.memory_updates),
+            "skills": copy.deepcopy(self.skills),
+            "policy": copy.deepcopy(self.policy),
+        }
+
+    def _state_payload(self) -> Dict[str, Any]:
+        return {
+            "goal": self.goal,
+            "required_stages": list(self.required_stages),
+            "stages_observed": self._observed_stages(),
+            "entries": copy.deepcopy(self.entries),
+            "prior_memory": copy.deepcopy(self.prior_memory),
+            "memory_updates": copy.deepcopy(self.memory_updates),
+            "skills": copy.deepcopy(self.skills),
+            "policy": copy.deepcopy(self.policy),
+            "state": copy.deepcopy(self.state),
+        }
+
+    def _observed_stages(self) -> List[str]:
+        return sorted({entry["stage"] for entry in self.entries})
+
+
 def coerce_environment_adapters(
     environment: EnvironmentAdapter | Iterable[EnvironmentAdapter] | None,
 ) -> List[EnvironmentAdapter]:
@@ -1327,6 +1545,94 @@ def _coerce_event(value: SimulationEvent | Dict[str, Any]) -> SimulationEvent:
     if isinstance(value, SimulationEvent):
         return value
     return SimulationEvent(**value)
+
+
+DEFAULT_AUTONOMY_STAGES = ["observe", "orient", "plan", "act", "verify", "reflect", "memory"]
+
+AUTONOMY_TOOL_STAGES = {
+    "record_observation": "observe",
+    "observe_context": "observe",
+    "observe": "observe",
+    "orient_strategy": "orient",
+    "orient": "orient",
+    "propose_plan": "plan",
+    "plan": "plan",
+    "record_action": "act",
+    "act": "act",
+    "execute_step": "act",
+    "verify_outcome": "verify",
+    "verify": "verify",
+    "critic_check": "verify",
+    "reflect": "reflect",
+    "self_refine": "reflect",
+    "write_memory": "memory",
+    "remember": "memory",
+    "store_skill": "skill",
+    "write_skill": "skill",
+    "autonomy_status": "status",
+}
+
+AUTONOMY_STAGE_ALIASES = {
+    "observation": "observe",
+    "observations": "observe",
+    "sense": "observe",
+    "perceive": "observe",
+    "perception": "observe",
+    "orientation": "orient",
+    "strategy": "orient",
+    "situate": "orient",
+    "planning": "plan",
+    "planner": "plan",
+    "decompose": "plan",
+    "action": "act",
+    "execution": "act",
+    "tool_use": "act",
+    "check": "verify",
+    "critic": "verify",
+    "evaluation": "verify",
+    "self_check": "verify",
+    "verification": "verify",
+    "reflexion": "reflect",
+    "reflection": "reflect",
+    "self_refine": "reflect",
+    "review": "reflect",
+    "episodic_memory": "memory",
+    "memory_update": "memory",
+    "skill_library": "skill",
+    "skill_update": "skill",
+    "status": "status",
+}
+
+
+def _autonomy_stage_for_tool(name: Optional[str]) -> Optional[str]:
+    if not name:
+        return None
+    if str(name) in AUTONOMY_TOOL_STAGES:
+        return AUTONOMY_TOOL_STAGES[str(name)]
+    normalized = _normalize_autonomy_stage(str(name))
+    if normalized in set(DEFAULT_AUTONOMY_STAGES + ["skill", "status"]):
+        return normalized
+    return None
+
+
+def _normalize_autonomy_stage(stage: Any) -> str:
+    normalized = str(stage).strip().lower().replace("-", "_").replace(" ", "_")
+    return AUTONOMY_STAGE_ALIASES.get(normalized, normalized)
+
+
+def _normalize_skill_library(
+    skill_library: Optional[Mapping[str, Any] | Iterable[Mapping[str, Any]]],
+) -> Dict[str, Any]:
+    if skill_library is None:
+        return {}
+    if isinstance(skill_library, Mapping):
+        return copy.deepcopy(dict(skill_library))
+    normalized: Dict[str, Any] = {}
+    for index, skill in enumerate(skill_library):
+        item = dict(skill)
+        name = str(item.get("name") or item.get("skill") or f"skill_{index + 1}")
+        normalized[name] = item
+    return normalized
 
 
 def _normalize_browser_snapshots(
