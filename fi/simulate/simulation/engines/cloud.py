@@ -5,6 +5,7 @@ import logging
 import contextlib
 from typing import Optional, Callable, Dict, Any, List
 
+from fi.simulate.agent.generic import wrap_agent
 from fi.simulate.agent.wrapper import AgentWrapper, AgentInput, AgentResponse
 from fi.simulate.simulation.models import TestReport
 from fi.simulate.simulation.engines.base import BaseEngine
@@ -508,18 +509,4 @@ class CloudEngine(BaseEngine):
 
     def _normalize_callback(self, callback: Callable | AgentWrapper) -> AgentWrapper:
         """Ensures we have a AgentWrapper instance."""
-        if isinstance(callback, AgentWrapper):
-            return callback
-        
-        # If it's a function, wrap it
-        class FunctionalWrapper(AgentWrapper):
-            def __init__(self, func):
-                self.func = func
-            
-            async def call(self, input: AgentInput) -> str | AgentResponse:
-                # Support both async and sync functions
-                if asyncio.iscoroutinefunction(self.func):
-                    return await self.func(input)
-                return self.func(input)
-                
-        return FunctionalWrapper(callback)
+        return wrap_agent(callback)

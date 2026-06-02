@@ -2,6 +2,7 @@ from typing import List, Dict, Any, Union, Optional
 from pydantic import BaseModel, Field, validator
 import pandas as pd
 import json
+from fi.simulate.agent.wrapper import SimulationArtifact, SimulationEvent
 
 class Persona(BaseModel):
     """
@@ -37,6 +38,26 @@ class TestCaseResult(BaseModel):
     """
     persona: Persona = Field(..., description="The original persona that was run.")
     transcript: str = Field(..., description="The full transcript of the conversation.")
+    messages: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="Normalized message trajectory including user, assistant, and tool turns.",
+    )
+    tool_calls: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="Tool calls observed during the run, when wrappers expose them.",
+    )
+    artifacts: List[SimulationArtifact] = Field(
+        default_factory=list,
+        description="Multimodal artifacts observed during the run, such as audio, images, screenshots, files, and traces.",
+    )
+    events: List[SimulationEvent] = Field(
+        default_factory=list,
+        description="Normalized simulation events, including tools, memory, voice, browser/CUA, and framework spans.",
+    )
+    metadata: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Engine, scenario, timing, stop reason, and other run metadata.",
+    )
     evaluation: dict | None = Field(
         default=None,
         description="Optional evaluation results (scores, reasons) keyed by template.",

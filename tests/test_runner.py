@@ -51,7 +51,7 @@ async def test_runner_dispatches_to_cloud_engine(mock_agent_wrapper):
         MockCloudEngine.return_value = mock_engine_instance
         mock_engine_instance.run.return_value = "cloud_report"
 
-        runner = TestRunner(api_key="sk-test", api_url="http://api.test")
+        runner = TestRunner(api_key="sk-test", secret_key="secret-test", api_url="http://api.test")
         
         # Act: Call with run_id (Trigger Cloud Mode)
         result = await runner.run_test(run_id="run_123", agent_callback=mock_agent_wrapper)
@@ -59,13 +59,31 @@ async def test_runner_dispatches_to_cloud_engine(mock_agent_wrapper):
         # Assert
         assert result == "cloud_report"
         # Check CloudEngine was initialized with correct config
-        MockCloudEngine.assert_called_once_with("sk-test", "http://api.test")
+        MockCloudEngine.assert_called_once_with("sk-test", "secret-test", "http://api.test", timeout=120.0)
         # Check run was called with correct args
         mock_engine_instance.run.assert_called_once()
         call_kwargs = mock_engine_instance.run.call_args.kwargs
         assert call_kwargs["run_id"] == "run_123"
         assert call_kwargs["agent_callback"] == mock_agent_wrapper
-        print("✅ PASSED: test_runner_dispatches_to_cloud_engine")
+    print("✅ PASSED: test_runner_dispatches_to_cloud_engine")
+
+@pytest.mark.asyncio
+async def test_runner_dispatches_to_local_text_engine(mock_agent_wrapper):
+    with patch("fi.simulate.simulation.runner.LocalTextEngine") as MockLocalTextEngine:
+        mock_engine_instance = AsyncMock()
+        MockLocalTextEngine.return_value = mock_engine_instance
+        mock_engine_instance.run.return_value = "local_text_report"
+
+        runner = TestRunner()
+
+        result = await runner.run_test(topic="support refunds", agent_callback=mock_agent_wrapper)
+
+        assert result == "local_text_report"
+        MockLocalTextEngine.assert_called_once()
+        call_kwargs = mock_engine_instance.run.call_args.kwargs
+        assert call_kwargs["topic"] == "support refunds"
+        assert call_kwargs["agent_callback"] == mock_agent_wrapper
+        print("✅ PASSED: test_runner_dispatches_to_local_text_engine")
 
 @pytest.mark.asyncio
 async def test_runner_raises_error_if_ambiguous():
@@ -79,4 +97,3 @@ async def test_runner_raises_error_if_ambiguous():
 # Note: The logic for "cloud mode requires agent_callback" is currently inside 
 # CloudEngine.run() or implicit in the type signature, but TestRunner allows passing it through.
 # If CloudEngine validates it, we assume TestRunner just passes it along.
-

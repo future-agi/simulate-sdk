@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Iterable, Mapping, Sequence
 import os
 import base64
+import json
 
 from fi.simulate.simulation.models import TestReport
 
@@ -47,6 +48,18 @@ def evaluate_report(
         def resolve_source(key: str) -> str | None:
             if key == "transcript":
                 return transcript
+            if key == "messages":
+                return json.dumps(result.messages, default=str)
+            if key == "tool_calls":
+                return json.dumps(result.tool_calls, default=str)
+            if key == "artifacts":
+                return json.dumps([_model_to_dict(item) for item in result.artifacts], default=str)
+            if key == "events":
+                return json.dumps([_model_to_dict(item) for item in result.events], default=str)
+            if key == "metadata":
+                return json.dumps(result.metadata, default=str)
+            if key == "persona":
+                return json.dumps(persona.persona, default=str)
             if key == "persona.situation":
                 return persona.situation
             if key == "persona.outcome":
@@ -139,4 +152,11 @@ def evaluate_report(
 
     return report
 
+
+def _model_to_dict(value):
+    if hasattr(value, "model_dump"):
+        return value.model_dump()
+    if hasattr(value, "dict"):
+        return value.dict()
+    return value
 

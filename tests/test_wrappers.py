@@ -39,7 +39,7 @@ async def test_openai_wrapper_async(agent_input):
     # Verify call arguments
     mock_client.chat.completions.create.assert_called_once()
     call_kwargs = mock_client.chat.completions.create.call_args.kwargs
-    assert call_kwargs["model"] == "gpt-4"
+    assert call_kwargs["model"] == "gpt-5"
     assert len(call_kwargs["messages"]) == 3
     assert call_kwargs["messages"][0]["role"] == "user"
     print(f"✅ PASSED: test_openai_wrapper_async")
@@ -195,4 +195,3 @@ async def test_gemini_wrapper_async(agent_input):
         content = h["parts"][0] if h["parts"] else ""
         print(f"     {role}: {content}")
     print(f"     user: How are you? (last message sent)")
-

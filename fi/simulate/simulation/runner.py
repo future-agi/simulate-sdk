@@ -3,15 +3,16 @@ import os
 
 from fi.simulate.agent.definition import AgentDefinition, SimulatorAgentDefinition
 from fi.simulate.simulation.models import Scenario, TestReport
-from fi.simulate.simulation.engines import LiveKitEngine, BaseEngine, CloudEngine
+from fi.simulate.simulation.engines import LiveKitEngine, BaseEngine, CloudEngine, LocalTextEngine
 
 class TestRunner:
     """
     Main entry point for running agent simulations.
     
-    Supports two execution modes:
+    Supports three execution modes:
     1. Local mode (LiveKit): Uses LiveKit to connect to deployed agents
     2. Cloud mode (Backend API): Uses Future AGI backend for orchestrated testing
+    3. Local text mode: Runs a self-contained text simulator against an agent callback
     
     The mode is automatically determined based on the arguments provided.
     """
@@ -94,6 +95,16 @@ class TestRunner:
                 agent_callback=agent_callback,
                 **kwargs
             )
+        elif agent_callback is not None:
+            # Local text mode - no backend, LiveKit, or model dependency required
+            engine = LocalTextEngine()
+            return await engine.run(
+                scenario=scenario,
+                agent_callback=agent_callback,
+                num_scenarios=num_scenarios,
+                topic=topic,
+                **kwargs,
+            )
             
         elif agent_definition is not None:
             # Local mode - use LiveKit engine
@@ -120,5 +131,6 @@ class TestRunner:
         else:
             raise ValueError(
                 "Must provide either 'agent_definition' (Local/LiveKit mode) "
+                "'agent_callback' with a scenario/topic (Local text mode), "
                 "or 'run_id'/'run_test_name' (Cloud/Backend API mode)."
             )

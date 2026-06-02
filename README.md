@@ -225,7 +225,7 @@ Scores and transcripts land in the platform dashboard. The local `TestReport` is
 
 ## Agent wrappers
 
-Built-in adapters for the most common Python agent frameworks. All are text-only and live under `fi.simulate`.
+Built-in adapters for common SDKs plus a framework-neutral adapter layer. The generic adapter carries normalized messages, tools, memory, events, and multimodal artifacts, so the same report shape works for text, voice, image, browser/CUA, and framework-specific runtimes.
 
 | Wrapper | Wraps | Import |
 |---|---|---|
@@ -233,9 +233,38 @@ Built-in adapters for the most common Python agent frameworks. All are text-only
 | `AnthropicAgentWrapper` | `anthropic.Anthropic` / `AsyncAnthropic` | `from fi.simulate import AnthropicAgentWrapper` |
 | `GeminiAgentWrapper` | `google.generativeai.GenerativeModel` | `from fi.simulate import GeminiAgentWrapper` |
 | `LangChainAgentWrapper` | Any LangChain `Runnable` / chain | `from fi.simulate import LangChainAgentWrapper` |
+| `GenericAgentWrapper` / `wrap_agent` | Any callable/object with `call`, `ainvoke`, `invoke`, `run`, `send`, `respond`, or `chat` | `from fi.simulate import wrap_agent` |
+| `wrap_framework` | Import-free presets for LangChain, LangGraph, CrewAI, AutoGen, LlamaIndex, OpenAI Agents, LiveKit, Pipecat, browser/CUA, vision agents, and more | `from fi.simulate import wrap_framework` |
+| Mock wrappers | Scripted, echo, and rule-based agents for deterministic regression tests | `from fi.simulate import ScriptedAgentWrapper` |
 | Custom | Anything — subclass `AgentWrapper` | `from fi.simulate import AgentWrapper` |
 
 Rolling your own wrapper is a 20-line class — see [CONTRIBUTING.md → Adding a new agent wrapper](CONTRIBUTING.md#-adding-a-new-agent-wrapper).
+
+---
+
+## Local self-contained simulation
+
+Use `TestRunner` with `agent_callback` and a `scenario` or `topic` to run locally without LiveKit, Future AGI cloud, or model keys. Reports include transcript, normalized messages, tool calls, artifacts, events, and metadata.
+
+```python
+from fi.simulate import SyntheticDataGenerator, TestRunner, wrap_framework
+
+scenario = SyntheticDataGenerator().generate("browser checkout support", seed=11)
+agent = wrap_framework("computer_use", browser_agent)
+
+report = await TestRunner().run_test(
+    scenario=scenario,
+    agent_callback=agent,
+    modality="cua",
+    max_turns=2,
+)
+
+print(report.results[0].messages)
+print(report.results[0].artifacts)
+print(report.results[0].events)
+```
+
+See [`examples/local_multimodal_simulation.py`](examples/local_multimodal_simulation.py) for a full offline browser/CUA-style cookbook.
 
 ---
 
@@ -249,12 +278,14 @@ from fi.simulate.evaluation import evaluate_report
 # Named templates with sensible defaults
 evaluate_report(report, eval_templates=("task_completion", "tone", "is_helpful"))
 
-# Or explicit field mapping — including audio
+# Or explicit field mapping — including audio, trajectories, tools, and artifacts
 evaluate_report(
     report,
     eval_specs=[
         {"template": "task_completion",
          "map": {"input": "persona.situation", "output": "transcript"}},
+        {"template": "agent_trajectory",
+         "map": {"input": "messages", "tools": "tool_calls", "events": "events"}},
         {"template": "audio_quality",
          "map": {"input_audio": "audio_combined_path"}},
     ],
@@ -297,7 +328,11 @@ Traces from simulations flow into `Monitor`, scores flow into `Evaluate`, and fa
 
 - [x] LiveKit voice simulation engine
 - [x] Cloud simulation engine
+- [x] Self-contained local text/CUA simulation engine
 - [x] OpenAI / Anthropic / Gemini / LangChain wrappers
+- [x] Generic framework adapter presets
+- [x] Multimodal artifacts + event trajectories
+- [x] Deterministic synthetic data generator
 - [x] Per-speaker + combined audio capture
 - [x] Scenario auto-generation from a topic
 - [x] `evaluate_report` integration with `ai-evaluation`
@@ -309,12 +344,12 @@ Traces from simulations flow into `Monitor`, scores flow into `Evaluate`, and fa
 - [ ] Conversation-graph scenarios (branching flows)
 - [ ] Latency, interruption, and turn-taking metrics
 - [ ] Streaming transcript API
-- [ ] Pluggable voice-backend interface (VAPI / Retell / Pipecat land on the [main platform roadmap](https://github.com/future-agi/future-agi))
+- [ ] First-class Pipecat/VAPI/Retell voice backends over the generic voice artifact/event contract
 
 </td>
 <td>
 
-- [ ] Adversarial persona templates (jailbreak, PII probing)
+- [ ] Larger adversarial persona library (jailbreak, PII probing, CUA prompt injection)
 - [ ] Multi-agent scenarios
 - [ ] On-device VAD + STT for air-gapped runs
 - [ ] Regression dashboards in-SDK

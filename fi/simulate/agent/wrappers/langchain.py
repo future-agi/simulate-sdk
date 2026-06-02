@@ -4,10 +4,21 @@ from fi.simulate.agent.wrapper import AgentWrapper, AgentInput, AgentResponse
 try:
     from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 except ImportError:
-    # LangChain is an optional dependency. Silently set to None if not installed.
-    HumanMessage = None
-    AIMessage = None
-    SystemMessage = None
+    # LangChain is optional. Fallback message classes keep wrappers and tests
+    # usable for mocked/local simulations without installing langchain-core.
+    class _FallbackMessage:
+        def __init__(self, content: str):
+            self.content = content
+
+    class HumanMessage(_FallbackMessage):
+        pass
+
+    class AIMessage(_FallbackMessage):
+        pass
+
+    class SystemMessage(_FallbackMessage):
+        pass
+
     LANGCHAIN_INSTALLED = False
 else:
     LANGCHAIN_INSTALLED = True
@@ -23,11 +34,6 @@ class LangChainAgentWrapper(AgentWrapper):
                    It is expected to accept a dictionary with "messages" or "input".
             system_prompt: Optional system prompt to prepend to message history.
         """
-        if HumanMessage is None or AIMessage is None or SystemMessage is None:
-            raise ImportError(
-                "LangChain is not installed. Please install it with 'pip install langchain-core' "
-                "to use LangChainAgentWrapper."
-            )
         self.agent = agent
         self.system_prompt = system_prompt
 
@@ -72,4 +78,3 @@ class LangChainAgentWrapper(AgentWrapper):
             return response["output"]
             
         return str(response)
-

@@ -1,6 +1,7 @@
 from .models import Persona, Scenario, TestReport, TestCaseResult
 from .runner import TestRunner
 from .generator import ScenarioGenerator
+from .synthetic import SyntheticDataGenerator, SyntheticScenarioConfig
 
 __all__ = [
     "Persona",
@@ -9,4 +10,6 @@ __all__ = [
     "TestCaseResult",
     "TestRunner",
     "ScenarioGenerator",
+    "SyntheticDataGenerator",
+    "SyntheticScenarioConfig",
 ]
