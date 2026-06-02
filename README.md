@@ -391,7 +391,7 @@ environment = FrameworkTraceEnvironment(framework="traceai", events=trace_record
 ```
 
 See [`examples/local_environment_adapters.py`](examples/local_environment_adapters.py) for a full local world simulation with ai-evaluation scoring, and [`examples/local_voice_image_environments.py`](examples/local_voice_image_environments.py) for a voice + image artifact cookbook.
-See [`examples/local_browser_trace_replay.py`](examples/local_browser_trace_replay.py) for a browser/CUA trace replay cookbook with screenshots, DOM, console/network logs, and action replay.
+See [`examples/local_browser_trace_replay.py`](examples/local_browser_trace_replay.py) for a browser/CUA trace replay cookbook with screenshots, DOM, selector-level action fixtures, mutable browser state, console/network logs, DOM mutation events, and action replay.
 See [`examples/local_voice_replay_routing.py`](examples/local_voice_replay_routing.py) for a voice replay cookbook with VAD/STT/TTS events, interruption handling, and call routing.
 See [`examples/local_framework_trace_replay.py`](examples/local_framework_trace_replay.py) for a framework trace replay cookbook with native spans/events from orchestration frameworks.
 See [`examples/local_retrieval_memory_attribution.py`](examples/local_retrieval_memory_attribution.py) for a retrieval/memory attribution cookbook with queries, ranked documents, retrieval scores, citations, memory reads/writes, and freshness evidence.
@@ -488,8 +488,11 @@ evaluate_report(
 For fully local agent scoring, use `evaluate_agent_report`. It scores the
 normalized simulation trace directly: trajectory, tool use, prompt-injection
 resistance, environment-injection resistance, memory integrity, browser/CUA
-safety, browser trace coverage, voice turn-taking, voice trace coverage,
-framework trace coverage, tool argument schema validation, retrieval context quality, source grounding, retrieval/memory attribution, autonomy-loop coverage, multi-agent trace coverage, artifact coverage, and expected state.
+safety, browser action outcome/state success, browser trace coverage, voice
+turn-taking, voice trace coverage, framework trace coverage, tool argument
+schema validation, retrieval context quality, source grounding,
+retrieval/memory attribution, autonomy-loop coverage, multi-agent trace
+coverage, artifact coverage, and expected state.
 
 ```python
 from fi.simulate import evaluate_agent_report
@@ -502,7 +505,10 @@ evaluation = evaluate_agent_report(
         "allowed_domains": ["shop.example.com"],
         "memory_allowed_keys": ["order_id", "status"],
         "required_artifact_types": ["image", "audio"],
-        "required_browser_trace": ["dom", "screenshot", "action", "console", "network"],
+        "required_browser_trace": ["dom", "screenshot", "action", "dom_mutation", "state", "console", "network"],
+        "expected_browser_actions": [{"selector": "#confirm", "success": True}],
+        "expected_browser_state": {"url": "https://shop.example.com/done"},
+        "expected_browser_dom_contains": ["Done"],
         "required_voice_trace": ["audio", "vad", "stt", "tts", "interruption", "route"],
         "required_framework_trace": ["agent", "model", "tool", "handoff", "guardrail"],
         "required_retrieval_memory_trace": ["query", "document", "citation", "memory_read", "memory_write"],

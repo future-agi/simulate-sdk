@@ -273,11 +273,14 @@ class BrowserEnvironment(EnvironmentAdapter):
         allowed_domains: Optional[Iterable[str]] = None,
         state: Optional[Dict[str, Any]] = None,
         snapshots: Optional[Iterable[Mapping[str, Any]]] = None,
+        actions: Optional[Mapping[str, Any] | Iterable[Mapping[str, Any]]] = None,
         console_logs: Optional[Iterable[str | Mapping[str, Any]]] = None,
         network_log: Optional[Iterable[Mapping[str, Any]]] = None,
         prompt_injections: Optional[Iterable[str | Mapping[str, Any]]] = None,
     ) -> None:
         self.initial_url = url
+        self.initial_dom = dom
+        self.initial_screenshot_uri = screenshot_uri
         self.url = url
         self.dom = dom
         self.screenshot_uri = screenshot_uri
@@ -293,20 +296,31 @@ class BrowserEnvironment(EnvironmentAdapter):
         )
         self.snapshots = copy.deepcopy(self.initial_snapshots)
         self.current_snapshot_index = 0
-        self.console_logs = [_normalize_browser_log(item) for item in console_logs or []]
-        self.network_log = [dict(item) for item in network_log or []]
+        self.initial_actions = _normalize_browser_actions(actions)
+        self.actions = copy.deepcopy(self.initial_actions)
+        self.initial_console_logs = [_normalize_browser_log(item) for item in console_logs or []]
+        self.initial_network_log = [dict(item) for item in network_log or []]
+        self.console_logs = copy.deepcopy(self.initial_console_logs)
+        self.network_log = copy.deepcopy(self.initial_network_log)
         self.prompt_injections = [
             dict(item) if isinstance(item, Mapping) else {"content": str(item)}
             for item in prompt_injections or []
         ]
         self.action_replay: List[Dict[str, Any]] = []
+        self.dom_mutations: List[Dict[str, Any]] = []
 
     def reset(self, **context: Any) -> EnvironmentSnapshot:
         self.url = self.initial_url
+        self.dom = self.initial_dom
+        self.screenshot_uri = self.initial_screenshot_uri
         self.state = copy.deepcopy(self.initial_state)
         self.snapshots = copy.deepcopy(self.initial_snapshots)
+        self.actions = copy.deepcopy(self.initial_actions)
+        self.console_logs = copy.deepcopy(self.initial_console_logs)
+        self.network_log = copy.deepcopy(self.initial_network_log)
         self.current_snapshot_index = 0
         self.action_replay = []
+        self.dom_mutations = []
         artifacts = self._snapshot_artifacts(self._current_snapshot())
         artifacts.append(self._trace_artifact())
         events = [
@@ -317,6 +331,7 @@ class BrowserEnvironment(EnvironmentAdapter):
                     "url": self.url,
                     "allowed_domains": sorted(self.allowed_domains),
                     "snapshots": len(self.snapshots),
+                    "action_fixtures": len(self.actions),
                     "console_logs": len(self.console_logs),
                     "network_log": len(self.network_log),
                 },
@@ -369,6 +384,8 @@ class BrowserEnvironment(EnvironmentAdapter):
                         "type": "object",
                         "properties": {
                             "selector": {"type": "string"},
+                            "locator": {"type": "string"},
+                            "url": {"type": "string"},
                             "action": {"type": "string"},
                         },
                     },
@@ -392,6 +409,7 @@ class BrowserEnvironment(EnvironmentAdapter):
             metadata={
                 "browser_trace": {
                     "snapshots": len(self.snapshots),
+                    "action_fixtures": len(self.actions),
                     "console_logs": len(self.console_logs),
                     "network_log": len(self.network_log),
                 }
@@ -411,16 +429,22 @@ class BrowserEnvironment(EnvironmentAdapter):
 
         arguments = _tool_arguments(tool_call)
         call_id = _tool_call_id(tool_call)
-        requested_url = str(arguments.get("url") or self.url)
+        selector = _browser_action_selector(arguments)
         action = str(arguments.get("action") or arguments.get("selector") or name)
+        matched_effect = self._matched_action_effect(name, arguments, action)
+        requested_url = self._requested_action_url(arguments, matched_effect)
         allowed, reason = self._allowed_url(requested_url)
         if not allowed:
             replay_event = {
                 "tool": name,
                 "url": requested_url,
                 "action": action,
+                "selector": selector,
+                "matched": bool(matched_effect),
+                "effect_id": matched_effect.get("id") if matched_effect else None,
                 "arguments": copy.deepcopy(arguments),
                 "blocked": True,
+                "success": False,
                 "reason": reason,
                 "turn_index": context.get("turn_index"),
             }
@@ -443,18 +467,152 @@ class BrowserEnvironment(EnvironmentAdapter):
                 ],
             )
 
+        if self.actions and name in {"browser_click", "playwright_click", "computer_click"} and matched_effect is None:
+            reason = f"no action fixture matched selector '{selector or action}'"
+            replay_event = {
+                "tool": name,
+                "url": requested_url,
+                "action": action,
+                "selector": selector,
+                "matched": False,
+                "arguments": copy.deepcopy(arguments),
+                "blocked": False,
+                "success": False,
+                "reason": reason,
+                "turn_index": context.get("turn_index"),
+            }
+            self.action_replay.append(replay_event)
+            return ToolExecutionResult(
+                tool_call_id=call_id,
+                tool_name=name,
+                content=f"Browser action failed: {reason}",
+                result={"url": requested_url, "action": action, "selector": selector},
+                success=False,
+                error=reason,
+                state_updates={"browser": self._state_payload()},
+                artifacts=[self._trace_artifact()],
+                events=[
+                    SimulationEvent(
+                        type="browser_action",
+                        name=name,
+                        payload=replay_event,
+                    )
+                ],
+            )
+
+        actionability_error = _browser_actionability_error(matched_effect)
+        if actionability_error:
+            replay_event = {
+                "tool": name,
+                "url": requested_url,
+                "action": action,
+                "selector": selector,
+                "matched": True,
+                "effect_id": matched_effect.get("id") if matched_effect else None,
+                "arguments": copy.deepcopy(arguments),
+                "blocked": False,
+                "success": False,
+                "reason": actionability_error,
+                "actionability": _browser_actionability_payload(matched_effect),
+                "turn_index": context.get("turn_index"),
+            }
+            self.action_replay.append(replay_event)
+            return ToolExecutionResult(
+                tool_call_id=call_id,
+                tool_name=name,
+                content=f"Browser action failed: {actionability_error}",
+                result={"url": requested_url, "action": action, "selector": selector},
+                success=False,
+                error=actionability_error,
+                state_updates={"browser": self._state_payload()},
+                artifacts=[self._trace_artifact()],
+                events=[
+                    SimulationEvent(
+                        type="browser_action",
+                        name=name,
+                        payload=replay_event,
+                    )
+                ],
+            )
+
+        effect_success = bool(matched_effect.get("success", True)) if matched_effect else True
+        if matched_effect and not effect_success:
+            reason = str(matched_effect.get("error") or "browser action fixture returned failure")
+            replay_event = {
+                "tool": name,
+                "url": requested_url,
+                "action": action,
+                "selector": selector,
+                "matched": True,
+                "effect_id": matched_effect.get("id"),
+                "arguments": copy.deepcopy(arguments),
+                "blocked": False,
+                "success": False,
+                "reason": reason,
+                "turn_index": context.get("turn_index"),
+            }
+            self.action_replay.append(replay_event)
+            return ToolExecutionResult(
+                tool_call_id=call_id,
+                tool_name=name,
+                content=f"Browser action failed: {reason}",
+                result={"url": requested_url, "action": action, "selector": selector},
+                success=False,
+                error=reason,
+                state_updates={"browser": self._state_payload()},
+                artifacts=[self._trace_artifact()],
+                events=[
+                    SimulationEvent(
+                        type="browser_action",
+                        name=name,
+                        payload=replay_event,
+                    )
+                ],
+            )
+
+        before_snapshot = self._snapshot_summary(self._current_snapshot())
         self.url = requested_url
-        self.current_snapshot_index = self._snapshot_index_for_url(self.url)
+        effect_updates = self._apply_action_effect(matched_effect, requested_url)
         replay_event = {
             "tool": name,
             "url": self.url,
             "action": action,
+            "selector": selector,
+            "matched": bool(matched_effect),
+            "effect_id": matched_effect.get("id") if matched_effect else None,
             "arguments": copy.deepcopy(arguments),
             "blocked": False,
+            "success": True,
+            "state_updates": copy.deepcopy(effect_updates.get("state_updates", {})),
+            "before_snapshot": before_snapshot,
+            "after_snapshot": self._snapshot_summary(self._current_snapshot()),
+            "actionability": _browser_actionability_payload(matched_effect),
             "turn_index": context.get("turn_index"),
         }
         self.action_replay.append(replay_event)
+        if effect_updates.get("dom_mutation"):
+            self.dom_mutations.append(effect_updates["dom_mutation"])
         state_update = {"browser": self._state_payload(last_action=action)}
+        events = [
+            SimulationEvent(
+                type="browser_action",
+                name=name,
+                payload=replay_event,
+            ),
+            SimulationEvent(
+                type="browser_snapshot",
+                name="post_action_snapshot",
+                payload=self._snapshot_summary(self._current_snapshot()),
+            ),
+        ]
+        if effect_updates.get("dom_mutation"):
+            events.append(
+                SimulationEvent(
+                    type="browser_dom_mutation",
+                    name=str(matched_effect.get("id") if matched_effect else name),
+                    payload=copy.deepcopy(effect_updates["dom_mutation"]),
+                )
+            )
         return ToolExecutionResult(
             tool_call_id=call_id,
             tool_name=name,
@@ -462,18 +620,7 @@ class BrowserEnvironment(EnvironmentAdapter):
             result={"url": self.url, "action": action, "snapshot": self._current_snapshot()},
             state_updates=state_update,
             artifacts=self._snapshot_artifacts(self._current_snapshot()) + [self._trace_artifact()],
-            events=[
-                SimulationEvent(
-                    type="browser_action",
-                    name=name,
-                    payload=replay_event,
-                ),
-                SimulationEvent(
-                    type="browser_snapshot",
-                    name="post_action_snapshot",
-                    payload=self._snapshot_summary(self._current_snapshot()),
-                )
-            ],
+            events=events,
         )
 
     def _allowed_url(self, url: str) -> tuple[bool, str]:
@@ -519,6 +666,123 @@ class BrowserEnvironment(EnvironmentAdapter):
                 return index
         return self.current_snapshot_index
 
+    def _matched_action_effect(
+        self,
+        tool_name: str,
+        arguments: Mapping[str, Any],
+        action: str,
+    ) -> Optional[Dict[str, Any]]:
+        for effect in self.actions:
+            if _browser_action_effect_matches(
+                effect,
+                tool_name=tool_name,
+                arguments=arguments,
+                action=action,
+                current_url=self.url,
+            ):
+                return copy.deepcopy(effect)
+        return None
+
+    def _requested_action_url(
+        self,
+        arguments: Mapping[str, Any],
+        effect: Optional[Mapping[str, Any]],
+    ) -> str:
+        if arguments.get("url"):
+            return str(arguments["url"])
+        if effect:
+            for key in ("next_url", "target_url", "navigate_to"):
+                if effect.get(key):
+                    return str(effect[key])
+            if effect.get("url") and not any(effect.get(key) for key in ("current_url", "from_url", "match_url")):
+                return str(effect["url"])
+        return self.url
+
+    def _apply_action_effect(
+        self,
+        effect: Optional[Mapping[str, Any]],
+        requested_url: str,
+    ) -> Dict[str, Any]:
+        if not effect:
+            self.current_snapshot_index = self._snapshot_index_for_url(self.url)
+            return {"state_updates": {}}
+
+        state_updates = copy.deepcopy(dict(effect.get("state_updates", effect.get("state", {})) or {}))
+        if state_updates:
+            _deep_merge(self.state, state_updates)
+
+        for log in _as_iterable(effect.get("console_logs", effect.get("console_log"))):
+            self.console_logs.append(_normalize_browser_log(log))
+        for request in _as_iterable(effect.get("network_log", effect.get("network_request"))):
+            if isinstance(request, Mapping):
+                self.network_log.append(dict(request))
+            else:
+                self.network_log.append({"url": str(request)})
+
+        snapshot_id = effect.get("snapshot_id")
+        if snapshot_id:
+            index = self._snapshot_index_for_id(str(snapshot_id))
+            if index is not None:
+                self.current_snapshot_index = index
+                self.url = str(self.snapshots[index].get("url") or requested_url)
+                return {"state_updates": state_updates}
+
+        current = self._current_snapshot()
+        dom_before = str(current.get("dom", self.dom) or "")
+        dom_after = _apply_dom_patch(
+            str(effect.get("dom", "")) if effect.get("dom") is not None else dom_before,
+            effect.get("dom_patch"),
+        )
+        screenshot_uri = effect.get("screenshot_uri", current.get("screenshot_uri"))
+        screenshot_path = effect.get("screenshot_path", current.get("screenshot_path"))
+        if "uri" in effect and screenshot_uri is None:
+            screenshot_uri = effect.get("uri")
+        if "path" in effect and screenshot_path is None:
+            screenshot_path = effect.get("path")
+
+        if (
+            requested_url != current.get("url")
+            or dom_after != dom_before
+            or screenshot_uri != current.get("screenshot_uri")
+            or screenshot_path != current.get("screenshot_path")
+            or state_updates
+        ):
+            new_snapshot = {
+                "id": str(effect.get("id") or f"snapshot_{len(self.snapshots) + 1}"),
+                "url": requested_url,
+                "dom": dom_after,
+                "screenshot_uri": screenshot_uri,
+                "screenshot_path": screenshot_path,
+                "state": copy.deepcopy(self.state),
+                "metadata": {
+                    **copy.deepcopy(current.get("metadata", {})),
+                    **copy.deepcopy(dict(effect.get("metadata", {}))),
+                    "source_action": effect.get("id"),
+                },
+            }
+            self.snapshots.append(new_snapshot)
+            self.current_snapshot_index = len(self.snapshots) - 1
+            self.dom = dom_after
+            self.screenshot_uri = screenshot_uri
+            dom_mutation = {
+                "effect_id": effect.get("id"),
+                "url": requested_url,
+                "snapshot_id": new_snapshot["id"],
+                "dom_changed": dom_after != dom_before,
+                "state_updates": copy.deepcopy(state_updates),
+                "metadata": copy.deepcopy(dict(effect.get("metadata", {}))),
+            }
+            return {"state_updates": state_updates, "dom_mutation": dom_mutation}
+
+        self.current_snapshot_index = self._snapshot_index_for_url(self.url)
+        return {"state_updates": state_updates}
+
+    def _snapshot_index_for_id(self, snapshot_id: str) -> Optional[int]:
+        for index, snapshot in enumerate(self.snapshots):
+            if str(snapshot.get("id")) == snapshot_id:
+                return index
+        return None
+
     def _snapshot_artifacts(self, snapshot: Mapping[str, Any]) -> List[SimulationArtifact]:
         artifacts = [
             SimulationArtifact(
@@ -558,9 +822,11 @@ class BrowserEnvironment(EnvironmentAdapter):
             "url": self.url,
             "snapshots": copy.deepcopy(self.snapshots),
             "action_replay": copy.deepcopy(self.action_replay),
+            "dom_mutations": copy.deepcopy(self.dom_mutations),
             "console_logs": copy.deepcopy(self.console_logs),
             "network_log": copy.deepcopy(self.network_log),
             "prompt_injections": copy.deepcopy(self.prompt_injections),
+            "final_state": {"browser": self._state_payload()},
         }
 
     def _state_payload(self, *, last_action: Optional[str] = None) -> Dict[str, Any]:
@@ -2869,6 +3135,46 @@ def _normalize_browser_snapshots(
     return normalized
 
 
+def _normalize_browser_actions(
+    actions: Optional[Mapping[str, Any] | Iterable[Mapping[str, Any]]],
+) -> List[Dict[str, Any]]:
+    if actions is None:
+        return []
+    raw_actions: List[Dict[str, Any]] = []
+    if isinstance(actions, Mapping):
+        for key, value in actions.items():
+            if isinstance(value, Mapping):
+                item = dict(value)
+            else:
+                item = {"next_url": value}
+            if not any(item.get(field) for field in ("selector", "selectors", "locator", "action", "actions")):
+                item["selector"] = str(key)
+            item.setdefault("id", str(key))
+            raw_actions.append(item)
+    else:
+        raw_actions = [dict(item) for item in actions]
+
+    normalized: List[Dict[str, Any]] = []
+    for index, item in enumerate(raw_actions):
+        action = dict(item)
+        action.setdefault("id", f"browser_action_{index + 1}")
+        if "selectors" not in action:
+            selectors = []
+            for key in ("selector", "locator", "target", "element"):
+                if action.get(key):
+                    selectors.append(str(action[key]))
+            if selectors:
+                action["selectors"] = selectors
+        if "actions" not in action and action.get("action"):
+            action["actions"] = [str(action["action"])]
+        if "tool_names" not in action and action.get("tool"):
+            action["tool_names"] = [str(action["tool"])]
+        if "state_updates" not in action and isinstance(action.get("state"), Mapping):
+            action["state_updates"] = copy.deepcopy(dict(action["state"]))
+        normalized.append(action)
+    return normalized
+
+
 def _normalize_browser_log(item: str | Mapping[str, Any]) -> Dict[str, Any]:
     if isinstance(item, Mapping):
         log = dict(item)
@@ -2876,6 +3182,155 @@ def _normalize_browser_log(item: str | Mapping[str, Any]) -> Dict[str, Any]:
         log.setdefault("message", "")
         return log
     return {"level": "info", "message": str(item)}
+
+
+def _browser_action_selector(arguments: Mapping[str, Any]) -> Optional[str]:
+    for key in ("selector", "locator", "target", "element", "test_id", "text"):
+        value = arguments.get(key)
+        if value:
+            return str(value)
+    return None
+
+
+def _browser_action_effect_matches(
+    effect: Mapping[str, Any],
+    *,
+    tool_name: str,
+    arguments: Mapping[str, Any],
+    action: str,
+    current_url: str,
+) -> bool:
+    tools = {str(value).lower() for value in _as_iterable(effect.get("tool_names", effect.get("tool")))}
+    if tools and tool_name.lower() not in tools:
+        return False
+
+    expected_current_urls = {
+        str(value)
+        for value in _as_iterable(
+            effect.get("current_url", effect.get("from_url", effect.get("match_url")))
+        )
+    }
+    if expected_current_urls and current_url not in expected_current_urls:
+        return False
+
+    selector = _browser_action_selector(arguments)
+    selectors = {str(value) for value in _as_iterable(effect.get("selectors", effect.get("selector")))}
+    selector_match = bool(selector and selector in selectors) if selectors else False
+
+    expected_actions = {
+        _normalize_browser_action_text(value)
+        for value in _as_iterable(effect.get("actions", effect.get("action")))
+        if str(value)
+    }
+    action_text = _normalize_browser_action_text(action)
+    action_match = bool(expected_actions and action_text in expected_actions)
+
+    coordinate_match = _browser_coordinates_match(effect, arguments)
+
+    requested_url = arguments.get("url")
+    expected_target_urls = {
+        str(value)
+        for value in _as_iterable(
+            effect.get("next_url", effect.get("target_url", effect.get("navigate_to", effect.get("url"))))
+        )
+    }
+    url_match = bool(requested_url and str(requested_url) in expected_target_urls)
+
+    if selectors or expected_actions or _effect_has_coordinates(effect) or expected_target_urls:
+        return selector_match or action_match or coordinate_match or url_match
+    return False
+
+
+def _browser_coordinates_match(effect: Mapping[str, Any], arguments: Mapping[str, Any]) -> bool:
+    expected = effect.get("coordinates")
+    expected_x = effect.get("x")
+    expected_y = effect.get("y")
+    if isinstance(expected, Mapping):
+        expected_x = expected.get("x", expected_x)
+        expected_y = expected.get("y", expected_y)
+    if expected_x is None or expected_y is None:
+        return False
+    actual_x = arguments.get("x")
+    actual_y = arguments.get("y")
+    if actual_x is None or actual_y is None:
+        point = arguments.get("coordinates") or arguments.get("point")
+        if isinstance(point, Mapping):
+            actual_x = point.get("x")
+            actual_y = point.get("y")
+    return str(actual_x) == str(expected_x) and str(actual_y) == str(expected_y)
+
+
+def _effect_has_coordinates(effect: Mapping[str, Any]) -> bool:
+    return effect.get("coordinates") is not None or (
+        effect.get("x") is not None and effect.get("y") is not None
+    )
+
+
+def _browser_actionability_error(effect: Optional[Mapping[str, Any]]) -> str:
+    if not effect:
+        return ""
+    checks = _browser_actionability_payload(effect)
+    for key, value in checks.items():
+        if value is False:
+            return f"element failed actionability check: {key}"
+    return ""
+
+
+def _browser_actionability_payload(effect: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
+    if not effect:
+        return {}
+    defaults = {
+        "attached": True,
+        "visible": True,
+        "enabled": True,
+        "stable": True,
+        "receives_events": True,
+    }
+    actionability = effect.get("actionability")
+    if isinstance(actionability, Mapping):
+        defaults.update(dict(actionability))
+    for key in tuple(defaults.keys()):
+        if key in effect:
+            defaults[key] = bool(effect[key])
+    if "actionable" in effect and effect.get("actionable") is False:
+        defaults["actionable"] = False
+    return defaults
+
+
+def _normalize_browser_action_text(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+
+def _apply_dom_patch(dom: str, patch: Any) -> str:
+    if patch is None:
+        return dom
+    if isinstance(patch, str):
+        return f"{dom}{patch}"
+    if not isinstance(patch, Mapping):
+        return dom
+
+    result = str(patch.get("set", dom))
+    replacements = patch.get("replace")
+    if isinstance(replacements, Mapping):
+        for old, new in replacements.items():
+            result = result.replace(str(old), str(new))
+    if patch.get("prepend") is not None:
+        result = f"{patch['prepend']}{result}"
+    if patch.get("append") is not None:
+        result = f"{result}{patch['append']}"
+    return result
+
+
+def _as_iterable(value: Any) -> List[Any]:
+    if value is None:
+        return []
+    if isinstance(value, (str, bytes)):
+        return [value]
+    if isinstance(value, Mapping):
+        return [value]
+    if hasattr(value, "__iter__"):
+        return list(value)
+    return [value]
 
 
 def _normalize_voice_utterances(

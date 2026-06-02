@@ -287,6 +287,75 @@ async def test_browser_environment_records_trace_snapshot_logs_and_replay():
 
 
 @pytest.mark.asyncio
+async def test_browser_environment_applies_mutable_action_effects():
+    async def agent(input):
+        selector = "#confirm" if input.turn_index == 0 else "#missing"
+        return AgentResponse(
+            content=f"I will click {selector}.",
+            tool_calls=[
+                {
+                    "id": f"call_click_{input.turn_index}",
+                    "name": "browser_click",
+                    "arguments": {"selector": selector, "action": "click confirm"},
+                }
+            ],
+        )
+
+    report = await LocalTextEngine().run(
+        scenario=_scenario(),
+        agent_callback=agent,
+        environment=BrowserEnvironment(
+            url="https://shop.example.com/checkout",
+            dom="<button id='confirm' data-testid='confirm'>Confirm</button>",
+            screenshot_uri="file:///fixtures/checkout.png",
+            allowed_domains=["shop.example.com"],
+            state={"checkout": {"status": "pending"}},
+            actions={
+                "#confirm": {
+                    "id": "confirm_checkout",
+                    "next_url": "https://shop.example.com/done",
+                    "dom": "<main>Done</main>",
+                    "screenshot_uri": "file:///fixtures/done.png",
+                    "state_updates": {"checkout": {"status": "confirmed"}},
+                    "console_log": {"level": "info", "message": "confirmed"},
+                    "network_request": {
+                        "url": "https://shop.example.com/api/checkout",
+                        "status": 200,
+                    },
+                }
+            },
+        ),
+        max_turns=2,
+        min_turns=2,
+        modality="cua",
+    )
+
+    result = report.results[0]
+    browser = result.metadata["environment_state"]["browser"]
+    traces = [
+        artifact.data
+        for artifact in result.artifacts
+        if artifact.type == "trace" and artifact.metadata.get("kind") == "browser_trace"
+    ]
+    actions = browser["action_replay"]
+
+    assert actions[0]["matched"] is True
+    assert actions[0]["success"] is True
+    assert actions[0]["selector"] == "#confirm"
+    assert actions[0]["effect_id"] == "confirm_checkout"
+    assert actions[1]["matched"] is False
+    assert actions[1]["success"] is False
+    assert browser["url"] == "https://shop.example.com/done"
+    assert browser["checkout"]["status"] == "confirmed"
+    assert browser["snapshot"]["id"] == "confirm_checkout"
+    assert browser["console_logs"][-1]["message"] == "confirmed"
+    assert browser["network_log"][-1]["status"] == 200
+    assert any(event.type == "browser_dom_mutation" for event in result.events)
+    assert traces[-1]["dom_mutations"][-1]["state_updates"]["checkout"]["status"] == "confirmed"
+    assert traces[-1]["final_state"]["browser"]["checkout"]["status"] == "confirmed"
+
+
+@pytest.mark.asyncio
 async def test_file_and_multi_agent_environments_update_state():
     async def agent(input):
         return AgentResponse(
