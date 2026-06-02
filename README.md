@@ -391,6 +391,34 @@ evaluation = evaluate_agent_report(
 
 See [`examples/local_pentest_scenarios.py`](examples/local_pentest_scenarios.py) for a full local adversarial simulation and scoring cookbook.
 
+### Synthetic tool-world scenarios
+
+Use `generate_tool_task` when you need a runnable synthetic API world, not just
+synthetic personas. The returned bundle includes a `Scenario`, tool schemas, a
+`ToolMockEnvironment`, expected final state, expected tool outcomes, and an
+`ai-evaluation` config.
+
+```python
+from fi.simulate import SyntheticDataGenerator, TestRunner, evaluate_agent_report
+
+bundle = SyntheticDataGenerator().generate_tool_task(
+    "order fulfillment",
+    target_status="shipped",
+    seed=8,
+)
+
+report = await TestRunner().run_test(
+    scenario=bundle.scenario,
+    agent_callback=agent,
+    environment=bundle.make_environment(),
+    max_turns=1,
+)
+
+evaluation = evaluate_agent_report(report, config=bundle.agent_report_config)
+```
+
+See [`examples/local_synthetic_tool_task.py`](examples/local_synthetic_tool_task.py) for the complete local synthetic tool-world cookbook.
+
 ---
 
 ## Evaluation
@@ -496,6 +524,7 @@ Traces from simulations flow into `Monitor`, scores flow into `Evaluate`, and fa
 - [x] Multimodal artifacts + event trajectories
 - [x] Local environment adapters for mocked tools/APIs, framework trace replay, retrieval/memory attribution, autonomy-loop traces, multi-agent handoff traces, browser/CUA trace replay, voice replay/routing, images, files, adversarial packs, and multi-agent rooms
 - [x] Deterministic synthetic data generator
+- [x] Self-contained synthetic tool-world generator with schemas, mocks, state expectations, and evaluator config
 - [x] Deterministic pentest scenario generator
 - [x] Per-speaker + combined audio capture
 - [x] Scenario auto-generation from a topic

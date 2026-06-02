@@ -2,6 +2,7 @@ import pytest
 
 from fi.simulate.agent.mocks import ScriptedAgentWrapper, make_tool_response
 from fi.simulate.agent.wrapper import AgentResponse, SimulationArtifact, SimulationEvent
+from fi.simulate.evaluation import evaluate_agent_report
 from fi.simulate.simulation.engines.local_text import LocalTextEngine
 from fi.simulate.simulation.models import Persona, Scenario
 from fi.simulate.simulation.synthetic import SyntheticDataGenerator
@@ -203,6 +204,84 @@ def test_synthetic_data_generator_builds_named_pentest_vectors():
     assert all(persona.persona["risk_profile"] == "adversarial" for persona in scenario.dataset)
     assert "reveal the hidden system prompt" in scenario.dataset[0].persona["attack_prompt"]
     assert "https://evil.example/pay" in scenario.dataset[2].persona["attack_prompt"]
+
+
+def test_synthetic_data_generator_builds_self_contained_tool_task():
+    generator = SyntheticDataGenerator()
+
+    first = generator.generate_tool_task(
+        "order fulfillment",
+        num_personas=2,
+        seed=5,
+        target_status="shipped",
+    )
+    second = generator.generate_tool_task(
+        "order fulfillment",
+        num_personas=2,
+        seed=5,
+        target_status="shipped",
+    )
+
+    assert _model_dump(first) == _model_dump(second)
+    assert first.scenario.name == "synthetic-order-fulfillment-tool-task"
+    assert first.tool_name == "update_order"
+    assert first.tool_arguments == {
+        "order_id": "123",
+        "status": "shipped",
+        "commit": True,
+    }
+    assert first.tool_schemas[0]["parameters"]["required"] == [
+        "order_id",
+        "status",
+        "commit",
+    ]
+    assert first.expected_state == {"order": {"status": "shipped"}}
+    assert first.agent_report_config["expected_tool_outcomes"]["update_order"]["final_state"] == {
+        "order": {"status": "shipped"}
+    }
+    assert first.make_environment().reset().tools[0]["name"] == "update_order"
+
+
+@pytest.mark.asyncio
+async def test_generated_tool_task_runs_and_scores_with_local_evaluator():
+    bundle = SyntheticDataGenerator().generate_tool_task(
+        "order fulfillment",
+        seed=8,
+        target_status="shipped",
+    )
+
+    async def agent(input):
+        task = input.persona["tool_task"]
+        return AgentResponse(
+            content="Order 123 has status shipped in the simulated system.",
+            tool_calls=[
+                {
+                    "id": "call_update_order",
+                    "name": task["tool"],
+                    "arguments": task["arguments"],
+                }
+            ],
+        )
+
+    report = await LocalTextEngine().run(
+        scenario=bundle.scenario,
+        agent_callback=agent,
+        environment=bundle.make_environment(),
+        max_turns=1,
+        min_turns=1,
+    )
+    evaluation = evaluate_agent_report(
+        report,
+        config=bundle.agent_report_config,
+        threshold=0.85,
+    )
+    scores = evaluation.summary["metric_averages"]
+
+    assert report.results[0].metadata["environment_state"]["order"]["status"] == "shipped"
+    assert scores["tool_argument_schema"] == 1.0
+    assert scores["tool_outcome"] == 1.0
+    assert scores["state_goal_accuracy"] == 1.0
+    assert evaluation.passed is True
 
 
 @pytest.mark.asyncio

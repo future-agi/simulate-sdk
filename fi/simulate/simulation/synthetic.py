@@ -44,6 +44,82 @@ class SyntheticScenarioConfig(BaseModel):
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
+class SyntheticToolTaskConfig(BaseModel):
+    """Configuration for deterministic tool-world scenario generation."""
+
+    topic: str
+    num_personas: int = Field(1, ge=1)
+    scenario_name: Optional[str] = None
+    seed: Optional[int] = None
+    entity_name: str = "order"
+    entity_id: str = "123"
+    tool_name: Optional[str] = None
+    initial_status: str = "pending"
+    target_status: str = "resolved"
+    status_values: List[str] = Field(default_factory=lambda: ["pending", "resolved", "cancelled"])
+    require_commit: bool = True
+    include_adversarial: bool = False
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class SyntheticToolTaskBundle(BaseModel):
+    """
+    Self-contained synthetic tool task.
+
+    The bundle is intentionally serializable. Call `make_environment()` when a
+    local simulation needs the executable mocked API.
+    """
+
+    scenario: Scenario
+    tool_name: str
+    tool_schemas: List[Dict[str, Any]]
+    tool_arguments: Dict[str, Any]
+    initial_state: Dict[str, Any]
+    expected_state: Dict[str, Any]
+    expected_tool_outcomes: Dict[str, Any]
+    agent_report_config: Dict[str, Any]
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+    def make_environment(self):
+        from fi.simulate.environment import ToolMockEnvironment
+
+        entity_key = str(self.metadata.get("entity_key", "entity"))
+        id_field = str(self.metadata.get("id_field", "entity_id"))
+        status_field = str(self.metadata.get("status_field", "status"))
+        commit_field = str(self.metadata.get("commit_field", "commit"))
+        require_commit = bool(self.metadata.get("require_commit", True))
+
+        def handler(args: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
+            entity_id = str(args.get(id_field, self.tool_arguments.get(id_field, "")))
+            status = args.get(status_field)
+            committed = True
+            if require_commit:
+                committed = args.get(commit_field) is True
+            state_updates = (
+                {entity_key: {"id": entity_id, status_field: status}}
+                if committed
+                else {}
+            )
+            return {
+                "content": (
+                    f"{entity_key} {entity_id} {status_field}={status}; "
+                    f"committed={committed}."
+                ),
+                "result": {
+                    "id": entity_id,
+                    status_field: status,
+                    "committed": committed,
+                },
+                "state_updates": state_updates,
+            }
+
+        return ToolMockEnvironment(
+            {self.tool_name: handler},
+            tool_schemas=self.tool_schemas,
+            initial_state=self.initial_state,
+        )
+
+
 class SyntheticDataGenerator:
     """
     Creates local, deterministic personas for simulation tests.
@@ -270,6 +346,182 @@ class SyntheticDataGenerator:
             dataset=dataset,
         )
 
+    def generate_tool_task(
+        self,
+        topic: str | None = None,
+        *,
+        num_personas: int = 1,
+        seed: int | None = None,
+        scenario_name: str | None = None,
+        entity_name: str = "order",
+        entity_id: str = "123",
+        tool_name: str | None = None,
+        initial_status: str = "pending",
+        target_status: str = "resolved",
+        status_values: Optional[Iterable[str]] = None,
+        require_commit: bool = True,
+        include_adversarial: bool = False,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SyntheticToolTaskBundle:
+        config = SyntheticToolTaskConfig(
+            topic=topic or f"{entity_name} status update",
+            num_personas=num_personas,
+            seed=seed,
+            scenario_name=scenario_name,
+            entity_name=entity_name,
+            entity_id=entity_id,
+            tool_name=tool_name,
+            initial_status=initial_status,
+            target_status=target_status,
+            status_values=list(status_values or ["pending", target_status, "cancelled"]),
+            require_commit=require_commit,
+            include_adversarial=include_adversarial,
+            metadata=metadata or {},
+        )
+        return self.generate_tool_task_from_config(config)
+
+    def generate_tool_task_from_config(
+        self,
+        config: SyntheticToolTaskConfig,
+    ) -> SyntheticToolTaskBundle:
+        rng = random.Random(config.seed)
+        entity_key = _identifier(config.entity_name)
+        id_field = f"{entity_key}_id"
+        status_field = "status"
+        commit_field = "commit"
+        tool_name = config.tool_name or f"update_{entity_key}"
+        status_values = _dedupe([config.initial_status, config.target_status, *config.status_values])
+        tool_arguments = {
+            id_field: str(config.entity_id),
+            status_field: config.target_status,
+        }
+        if config.require_commit:
+            tool_arguments[commit_field] = True
+
+        initial_state = {
+            entity_key: {
+                "id": str(config.entity_id),
+                status_field: config.initial_status,
+            }
+        }
+        expected_state = {
+            entity_key: {
+                status_field: config.target_status,
+            }
+        }
+        result_expectation = {
+            status_field: config.target_status,
+            "committed": True,
+        }
+        expected_tool_outcomes = {
+            tool_name: {
+                "success": True,
+                "result": result_expectation,
+                "state_updates": expected_state,
+                "final_state": expected_state,
+            }
+        }
+        parameters = {
+            "type": "object",
+            "properties": {
+                id_field: {"type": "string", "minLength": 1},
+                status_field: {"type": "string", "enum": status_values},
+            },
+            "required": [id_field, status_field],
+            "additionalProperties": False,
+        }
+        if config.require_commit:
+            parameters["properties"][commit_field] = {"type": "boolean"}
+            parameters["required"].append(commit_field)
+
+        tool_schemas = [
+            {
+                "name": tool_name,
+                "description": (
+                    f"Update the simulated {entity_key} status from "
+                    f"{config.initial_status} to an allowed target status."
+                ),
+                "parameters": parameters,
+            }
+        ]
+        agent_report_config = {
+            "required_tools": [tool_name],
+            "available_tools": [tool_name],
+            "tool_argument_schemas": {tool_name: parameters},
+            "expected_state": expected_state,
+            "expected_tool_outcomes": expected_tool_outcomes,
+            "metric_weights": {
+                "tool_argument_schema": 2.0,
+                "tool_outcome": 4.0,
+                "state_goal_accuracy": 3.0,
+            },
+        }
+
+        dataset = []
+        for index in range(config.num_personas):
+            name = self._pick(rng, self._names)
+            tone = self._pick(rng, self._tones)
+            locale = self._pick(rng, ["en-US"])
+            persona = {
+                "name": name,
+                "tone": tone,
+                "locale": locale,
+                "risk_profile": "standard",
+                "tool_task": {
+                    "tool": tool_name,
+                    "arguments": dict(tool_arguments),
+                    "expected_state": expected_state,
+                },
+            }
+            if config.include_adversarial and index == config.num_personas - 1:
+                persona["risk_profile"] = "adversarial"
+                persona["attack_vector"] = "tool_abuse"
+                persona["attack_prompt"] = self.ATTACK_LIBRARY["tool_abuse"].prompt
+                persona["expected_defense"] = self.ATTACK_LIBRARY["tool_abuse"].expected_defense
+
+            dataset.append(
+                Persona(
+                    persona=persona,
+                    situation=(
+                        f"{name} needs {config.entity_name} {config.entity_id} "
+                        f"moved from {config.initial_status} to {config.target_status}. "
+                        f"Use {tool_name} with grounded arguments."
+                    ),
+                    outcome=(
+                        f"{config.entity_name.title()} {config.entity_id} has "
+                        f"{status_field} {config.target_status} in the simulated system."
+                    ),
+                )
+            )
+
+        scenario = Scenario(
+            name=config.scenario_name or f"synthetic-{_slug(config.topic)}-tool-task",
+            description=(
+                f"Synthetic executable tool task for {config.topic}. "
+                "Includes tool schemas, a mocked API environment, and evaluator expectations."
+            ),
+            dataset=dataset,
+        )
+        return SyntheticToolTaskBundle(
+            scenario=scenario,
+            tool_name=tool_name,
+            tool_schemas=tool_schemas,
+            tool_arguments=tool_arguments,
+            initial_state=initial_state,
+            expected_state=expected_state,
+            expected_tool_outcomes=expected_tool_outcomes,
+            agent_report_config=agent_report_config,
+            metadata={
+                "kind": "synthetic_tool_task",
+                "entity_key": entity_key,
+                "id_field": id_field,
+                "status_field": status_field,
+                "commit_field": commit_field,
+                "require_commit": config.require_commit,
+                **config.metadata,
+            },
+        )
+
     @staticmethod
     def _pick(rng: random.Random, values: Iterable[str]) -> str:
         values = list(values)
@@ -284,3 +536,19 @@ def _slug(value: str) -> str:
         elif chars and chars[-1] != "-":
             chars.append("-")
     return "".join(chars).strip("-") or "scenario"
+
+
+def _identifier(value: str) -> str:
+    return _slug(value).replace("-", "_")
+
+
+def _dedupe(values: Iterable[str]) -> List[str]:
+    seen = set()
+    result = []
+    for value in values:
+        item = str(value)
+        if item in seen:
+            continue
+        seen.add(item)
+        result.append(item)
+    return result

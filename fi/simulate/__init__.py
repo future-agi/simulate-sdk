@@ -50,6 +50,8 @@ from .simulation import (
     ScenarioGenerator,
     SyntheticDataGenerator,
     SyntheticScenarioConfig,
+    SyntheticToolTaskBundle,
+    SyntheticToolTaskConfig,
 )
 from .evaluation import evaluate_agent_report, evaluate_report
 
@@ -101,6 +103,8 @@ __all__ = [
     "ScenarioGenerator",
     "SyntheticDataGenerator",
     "SyntheticScenarioConfig",
+    "SyntheticToolTaskBundle",
+    "SyntheticToolTaskConfig",
     "evaluate_report",
     "evaluate_agent_report",
 ]
