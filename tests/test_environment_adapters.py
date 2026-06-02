@@ -4,8 +4,10 @@ from fi.simulate import (
     AgentResponse,
     BrowserEnvironment,
     FileEnvironment,
+    ImageEnvironment,
     MultiAgentRoomEnvironment,
     ToolMockEnvironment,
+    VoiceEnvironment,
 )
 from fi.simulate.simulation.engines.local_text import LocalTextEngine
 from fi.simulate.simulation.models import Persona, Scenario
@@ -162,3 +164,78 @@ async def test_file_and_multi_agent_environments_update_state():
     assert "policy_specialist" in tool_text
     assert result.metadata["environment_state"]["files"]["paths"] == ["policy.md"]
     assert result.metadata["environment_state"]["multi_agent"]["messages"][0]["to"] == "policy_specialist"
+
+
+@pytest.mark.asyncio
+async def test_voice_and_image_environments_expose_media_and_execute_tools():
+    seen_tools = []
+
+    async def agent(input):
+        seen_tools.extend(tool["name"] for tool in input.tools)
+        return AgentResponse(
+            content="I will inspect the image and respond by voice.",
+            tool_calls=[
+                {
+                    "id": "call_image",
+                    "name": "inspect_image",
+                    "arguments": {"id": "receipt"},
+                },
+                {
+                    "id": "call_stt",
+                    "name": "transcribe_audio",
+                    "arguments": {"id": "utt_1"},
+                },
+                {
+                    "id": "call_speak",
+                    "name": "speak",
+                    "arguments": {
+                        "text": "The receipt image shows order 123.",
+                        "latency_ms": 350,
+                    },
+                },
+                {
+                    "id": "call_stop",
+                    "name": "stop_speaking",
+                    "arguments": {},
+                },
+            ],
+        )
+
+    report = await LocalTextEngine().run(
+        scenario=_scenario(),
+        agent_callback=agent,
+        environment=[
+            ImageEnvironment(
+                {
+                    "receipt": {
+                        "uri": "file:///tmp/receipt.png",
+                        "description": "Receipt for order 123",
+                        "labels": ["receipt", "order"],
+                    }
+                }
+            ),
+            VoiceEnvironment(
+                [
+                    {
+                        "id": "utt_1",
+                        "transcript": "Please inspect the receipt.",
+                        "audio_uri": "file:///tmp/user.wav",
+                        "barge_in": True,
+                    }
+                ],
+                sample_rate_hz=24000,
+            ),
+        ],
+        max_turns=1,
+        min_turns=1,
+        modality="voice",
+    )
+
+    result = report.results[0]
+    assert {"inspect_image", "transcribe_audio", "speak", "stop_speaking"}.issubset(set(seen_tools))
+    assert any(artifact.type == "image" and artifact.metadata["id"] == "receipt" for artifact in result.artifacts)
+    assert any(artifact.type == "audio" and artifact.metadata["id"] == "utt_1" for artifact in result.artifacts)
+    assert any(event.type == "image" and event.name == "inspect_image" for event in result.events)
+    assert any(event.type == "voice" and event.name == "tts_output" for event in result.events)
+    assert result.metadata["environment_state"]["images"]["last_inspected"] == "receipt"
+    assert result.metadata["environment_state"]["voice"]["interruptions_handled"] == 1

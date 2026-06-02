@@ -29,9 +29,11 @@ from .environment import (
     EnvironmentAdapter,
     EnvironmentSnapshot,
     FileEnvironment,
+    ImageEnvironment,
     MultiAgentRoomEnvironment,
     ToolExecutionResult,
     ToolMockEnvironment,
+    VoiceEnvironment,
 )
 from .simulation import (
     AttackDefinition,
@@ -76,9 +78,11 @@ __all__ = [
     "EnvironmentAdapter",
     "EnvironmentSnapshot",
     "FileEnvironment",
+    "ImageEnvironment",
     "MultiAgentRoomEnvironment",
     "ToolExecutionResult",
     "ToolMockEnvironment",
+    "VoiceEnvironment",
     "AttackDefinition",
     "AttackVector",
     "Persona",

@@ -289,6 +289,270 @@ class BrowserEnvironment(EnvironmentAdapter):
         return False, f"host '{host}' is outside allowed domains"
 
 
+class VoiceEnvironment(EnvironmentAdapter):
+    """Local voice-frame environment with audio artifacts, STT/TTS events, and interruption tools."""
+
+    name = "voice"
+
+    def __init__(
+        self,
+        utterances: Optional[Iterable[str | Mapping[str, Any]]] = None,
+        *,
+        audio_uris: Optional[Iterable[str]] = None,
+        sample_rate_hz: int = 16000,
+        stt_latency_ms: int = 180,
+        tts_latency_ms: int = 320,
+        state: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        self.sample_rate_hz = sample_rate_hz
+        self.stt_latency_ms = stt_latency_ms
+        self.tts_latency_ms = tts_latency_ms
+        self.initial_state = copy.deepcopy(state or {})
+        self.state = copy.deepcopy(self.initial_state)
+        self.utterances = _normalize_voice_utterances(utterances or [], audio_uris or [])
+
+    def reset(self, **context: Any) -> EnvironmentSnapshot:
+        self.state = copy.deepcopy(self.initial_state)
+        artifacts = [
+            artifact
+            for artifact in (_voice_artifact_from_utterance(item, self.sample_rate_hz) for item in self.utterances)
+            if artifact is not None
+        ]
+        events = [
+            SimulationEvent(
+                type="voice",
+                name="voice_session_ready",
+                payload={
+                    "sample_rate_hz": self.sample_rate_hz,
+                    "utterance_count": len(self.utterances),
+                },
+            )
+        ]
+        for utterance in self.utterances:
+            payload = {
+                "id": utterance["id"],
+                "speaker": utterance.get("speaker", "user"),
+                "transcript": utterance.get("transcript", ""),
+                "turn_index": utterance.get("turn_index"),
+                "latency_ms": utterance.get("latency_ms", self.stt_latency_ms),
+            }
+            if utterance.get("barge_in"):
+                payload["barge_in"] = True
+            events.append(SimulationEvent(type="voice", name="stt_result", payload=payload))
+        return EnvironmentSnapshot(
+            tools=[
+                {
+                    "name": "speak",
+                    "description": "Emit simulated TTS audio for a voice response.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "text": {"type": "string"},
+                            "latency_ms": {"type": "integer"},
+                        },
+                        "required": ["text"],
+                    },
+                },
+                {
+                    "name": "stop_speaking",
+                    "description": "Stop current simulated TTS output after an interruption.",
+                },
+                {
+                    "name": "transcribe_audio",
+                    "description": "Return a transcript for a simulated audio fixture.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"id": {"type": "string"}},
+                    },
+                },
+            ],
+            artifacts=artifacts,
+            state={
+                "voice": {
+                    "sample_rate_hz": self.sample_rate_hz,
+                    "utterance_count": len(self.utterances),
+                    "speaking": False,
+                    **copy.deepcopy(self.state),
+                }
+            },
+            events=events,
+        )
+
+    def handle_tool_call(
+        self,
+        tool_call: Mapping[str, Any],
+        **context: Any,
+    ) -> Optional[ToolExecutionResult]:
+        name = _tool_name(tool_call)
+        if name not in {"speak", "stop_speaking", "transcribe_audio"}:
+            return None
+        arguments = _tool_arguments(tool_call)
+        call_id = _tool_call_id(tool_call)
+
+        if name == "transcribe_audio":
+            utterance_id = str(arguments.get("id") or arguments.get("audio_id") or "")
+            utterance = _find_by_id(self.utterances, utterance_id) or (self.utterances[0] if self.utterances else {})
+            transcript = str(utterance.get("transcript", ""))
+            return ToolExecutionResult(
+                tool_call_id=call_id,
+                tool_name=name,
+                content=transcript,
+                result={"id": utterance.get("id"), "transcript": transcript},
+                events=[
+                    SimulationEvent(
+                        type="voice",
+                        name="stt_result",
+                        payload={
+                            "id": utterance.get("id"),
+                            "transcript": transcript,
+                            "latency_ms": utterance.get("latency_ms", self.stt_latency_ms),
+                        },
+                    )
+                ],
+            )
+
+        if name == "stop_speaking":
+            handled = int(self.state.get("interruptions_handled", 0)) + 1
+            self.state.update({"speaking": False, "interruptions_handled": handled})
+            state_update = {"voice": copy.deepcopy(self.state)}
+            return ToolExecutionResult(
+                tool_call_id=call_id,
+                tool_name=name,
+                content="Stopped simulated speech output.",
+                result={"interruption_handled": True},
+                state_updates=state_update,
+                events=[
+                    SimulationEvent(
+                        type="voice",
+                        name="barge_in_handled",
+                        payload={"interruption_handled": True},
+                    )
+                ],
+            )
+
+        text = str(arguments.get("text", arguments.get("content", "")))
+        latency_ms = int(arguments.get("latency_ms", self.tts_latency_ms))
+        self.state.update({"speaking": True, "last_tts_text": text, "last_tts_latency_ms": latency_ms})
+        state_update = {"voice": copy.deepcopy(self.state)}
+        return ToolExecutionResult(
+            tool_call_id=call_id,
+            tool_name=name,
+            content=f"Spoke simulated TTS output: {text}",
+            result={"text": text, "latency_ms": latency_ms},
+            state_updates=state_update,
+            events=[
+                SimulationEvent(
+                    type="voice",
+                    name="tts_output",
+                    payload={"text": text, "latency_ms": latency_ms},
+                )
+            ],
+        )
+
+
+class ImageEnvironment(EnvironmentAdapter):
+    """Local image fixture environment for vision and multimodal agent tests."""
+
+    name = "image"
+
+    def __init__(
+        self,
+        images: Mapping[str, Any] | Iterable[Any],
+        *,
+        default_mime_type: str = "image/png",
+        state: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        self.default_mime_type = default_mime_type
+        self.initial_state = copy.deepcopy(state or {})
+        self.state = copy.deepcopy(self.initial_state)
+        if isinstance(images, Mapping):
+            items = images.items()
+        else:
+            items = ((f"image_{index + 1}", value) for index, value in enumerate(images))
+        self.images = {
+            str(image_id): _normalize_image_fixture(str(image_id), value, default_mime_type)
+            for image_id, value in items
+        }
+
+    def reset(self, **context: Any) -> EnvironmentSnapshot:
+        self.state = copy.deepcopy(self.initial_state)
+        artifacts = [_image_artifact_from_fixture(fixture) for fixture in self.images.values()]
+        return EnvironmentSnapshot(
+            tools=[
+                {
+                    "name": "list_images",
+                    "description": "List image fixtures available in the simulated environment.",
+                },
+                {
+                    "name": "inspect_image",
+                    "description": "Inspect a simulated image fixture by id.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"id": {"type": "string"}, "image_id": {"type": "string"}},
+                    },
+                },
+            ],
+            artifacts=artifacts,
+            state={"images": {"ids": sorted(self.images.keys()), **copy.deepcopy(self.state)}},
+            events=[
+                SimulationEvent(
+                    type="image",
+                    name="image_fixtures_ready",
+                    payload={"ids": sorted(self.images.keys())},
+                )
+            ],
+        )
+
+    def handle_tool_call(
+        self,
+        tool_call: Mapping[str, Any],
+        **context: Any,
+    ) -> Optional[ToolExecutionResult]:
+        name = _tool_name(tool_call)
+        if name not in {"list_images", "inspect_image"}:
+            return None
+        arguments = _tool_arguments(tool_call)
+        call_id = _tool_call_id(tool_call)
+
+        if name == "list_images":
+            result = {"ids": sorted(self.images.keys())}
+            return ToolExecutionResult(
+                tool_call_id=call_id,
+                tool_name=name,
+                content=json.dumps(result),
+                result=result,
+                events=[SimulationEvent(type="image", name="list_images", payload=result)],
+            )
+
+        image_id = str(arguments.get("id") or arguments.get("image_id") or "")
+        if not image_id and self.images:
+            image_id = sorted(self.images.keys())[0]
+        fixture = self.images.get(image_id)
+        if fixture is None:
+            return ToolExecutionResult(
+                tool_call_id=call_id,
+                tool_name=name,
+                content=f"Image not found: {image_id}",
+                success=False,
+                error="image_not_found",
+            )
+        result = {
+            "id": image_id,
+            "description": fixture.get("description", ""),
+            "labels": fixture.get("labels", []),
+            "metadata": fixture.get("metadata", {}),
+        }
+        self.state["last_inspected"] = image_id
+        return ToolExecutionResult(
+            tool_call_id=call_id,
+            tool_name=name,
+            content=json.dumps(result, default=str),
+            result=result,
+            state_updates={"images": copy.deepcopy(self.state)},
+            events=[SimulationEvent(type="image", name="inspect_image", payload=result)],
+        )
+
+
 class FileEnvironment(EnvironmentAdapter):
     """In-memory file environment with read/write/list tools."""
 
@@ -501,6 +765,99 @@ def _coerce_event(value: SimulationEvent | Dict[str, Any]) -> SimulationEvent:
     if isinstance(value, SimulationEvent):
         return value
     return SimulationEvent(**value)
+
+
+def _normalize_voice_utterances(
+    utterances: Iterable[str | Mapping[str, Any]],
+    audio_uris: Iterable[str],
+) -> List[Dict[str, Any]]:
+    normalized: List[Dict[str, Any]] = []
+    for index, value in enumerate(utterances):
+        item = {"transcript": value} if isinstance(value, str) else dict(value)
+        item.setdefault("id", f"utt_{index + 1}")
+        normalized.append(item)
+    offset = len(normalized)
+    for index, uri in enumerate(audio_uris):
+        normalized.append(
+            {
+                "id": f"audio_{index + 1 + offset}",
+                "audio_uri": uri,
+                "transcript": "",
+            }
+        )
+    return normalized
+
+
+def _voice_artifact_from_utterance(
+    utterance: Mapping[str, Any],
+    sample_rate_hz: int,
+) -> Optional[SimulationArtifact]:
+    uri = utterance.get("audio_uri") or utterance.get("uri")
+    path = utterance.get("audio_path") or utterance.get("path")
+    data = utterance.get("audio_data") or utterance.get("data")
+    if uri is None and path is None and data is None:
+        return None
+    return SimulationArtifact(
+        type="audio",
+        uri=str(uri) if uri is not None else None,
+        path=str(path) if path is not None else None,
+        data=data,
+        mime_type=str(utterance.get("mime_type", "audio/wav")),
+        role=str(utterance.get("role", "environment")),
+        metadata={
+            "id": utterance.get("id"),
+            "speaker": utterance.get("speaker", "user"),
+            "transcript": utterance.get("transcript", ""),
+            "sample_rate_hz": utterance.get("sample_rate_hz", sample_rate_hz),
+        },
+    )
+
+
+def _find_by_id(items: Iterable[Mapping[str, Any]], item_id: str) -> Optional[Mapping[str, Any]]:
+    if not item_id:
+        return None
+    for item in items:
+        if str(item.get("id")) == item_id:
+            return item
+    return None
+
+
+def _normalize_image_fixture(
+    image_id: str,
+    value: Any,
+    default_mime_type: str,
+) -> Dict[str, Any]:
+    if isinstance(value, SimulationArtifact):
+        fixture = value.model_dump() if hasattr(value, "model_dump") else value.dict()
+    elif isinstance(value, Mapping):
+        fixture = dict(value)
+    elif isinstance(value, str):
+        location_key = "uri" if value.startswith(("http://", "https://", "file://", "data:")) else "path"
+        fixture = {location_key: value}
+    else:
+        fixture = {"data": value}
+    fixture.setdefault("id", image_id)
+    fixture.setdefault("mime_type", default_mime_type)
+    fixture.setdefault("metadata", {})
+    return fixture
+
+
+def _image_artifact_from_fixture(fixture: Mapping[str, Any]) -> SimulationArtifact:
+    metadata = dict(fixture.get("metadata", {}))
+    metadata.setdefault("id", fixture.get("id"))
+    if "description" in fixture:
+        metadata.setdefault("description", fixture.get("description"))
+    if "labels" in fixture:
+        metadata.setdefault("labels", fixture.get("labels"))
+    return SimulationArtifact(
+        type="image",
+        uri=str(fixture["uri"]) if fixture.get("uri") is not None else None,
+        path=str(fixture["path"]) if fixture.get("path") is not None else None,
+        data=fixture.get("data"),
+        mime_type=str(fixture.get("mime_type", "image/png")),
+        role=str(fixture.get("role", "environment")),
+        metadata=metadata,
+    )
 
 
 def _deep_merge(target: Dict[str, Any], updates: Mapping[str, Any]) -> None:

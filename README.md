@@ -269,17 +269,20 @@ See [`examples/local_multimodal_simulation.py`](examples/local_multimodal_simula
 ### Local environments
 
 Use environment adapters when the agent needs a world to act on: mocked APIs,
-browser/CUA state, files, or multi-agent handoffs. The local engine exposes
-environment tools through `AgentInput.tools`, auto-executes matching tool calls,
-and records tool results, state updates, artifacts, and events in the report.
+browser/CUA state, voice turns, image fixtures, files, or multi-agent handoffs.
+The local engine exposes environment tools through `AgentInput.tools`,
+auto-executes matching tool calls, and records tool results, state updates,
+artifacts, and events in the report.
 
 ```python
 from fi.simulate import (
     BrowserEnvironment,
     FileEnvironment,
+    ImageEnvironment,
     MultiAgentRoomEnvironment,
     ToolMockEnvironment,
     TestRunner,
+    VoiceEnvironment,
 )
 
 report = await TestRunner().run_test(
@@ -297,6 +300,12 @@ report = await TestRunner().run_test(
             dom="<button id='review'>Review</button>",
             allowed_domains=["shop.example.com"],
         ),
+        VoiceEnvironment([
+            {"id": "caller_1", "transcript": "Please check order 123."}
+        ]),
+        ImageEnvironment({
+            "receipt": {"uri": "file:///fixtures/receipt.png", "description": "Order receipt"}
+        }),
         FileEnvironment({"refund-policy.md": "Refunds require approval."}),
         MultiAgentRoomEnvironment(["support_agent", "policy_specialist"]),
     ],
@@ -304,7 +313,7 @@ report = await TestRunner().run_test(
 )
 ```
 
-See [`examples/local_environment_adapters.py`](examples/local_environment_adapters.py) for a full local world simulation with ai-evaluation scoring.
+See [`examples/local_environment_adapters.py`](examples/local_environment_adapters.py) for a full local world simulation with ai-evaluation scoring, and [`examples/local_voice_image_environments.py`](examples/local_voice_image_environments.py) for a voice + image artifact cookbook.
 
 ### Local pentest scenarios
 
@@ -366,8 +375,8 @@ evaluate_report(
 
 For fully local agent scoring, use `evaluate_agent_report`. It scores the
 normalized simulation trace directly: trajectory, tool use, prompt-injection
-resistance, memory integrity, browser/CUA safety, voice turn-taking, and
-expected state.
+resistance, memory integrity, browser/CUA safety, voice turn-taking, artifact
+coverage, and expected state.
 
 ```python
 from fi.simulate import evaluate_agent_report
@@ -379,6 +388,7 @@ evaluation = evaluate_agent_report(
         "available_tools": ["search_order"],
         "allowed_domains": ["shop.example.com"],
         "memory_allowed_keys": ["order_id", "status"],
+        "required_artifact_types": ["image", "audio"],
         "expected_state": {"case": {"resolved": True}},
     },
 )
@@ -429,7 +439,7 @@ Traces from simulations flow into `Monitor`, scores flow into `Evaluate`, and fa
 - [x] OpenAI / Anthropic / Gemini / LangChain wrappers
 - [x] Generic framework adapter presets
 - [x] Multimodal artifacts + event trajectories
-- [x] Local environment adapters for mocked tools/APIs, browser/CUA state, files, and multi-agent rooms
+- [x] Local environment adapters for mocked tools/APIs, browser/CUA state, voice, images, files, and multi-agent rooms
 - [x] Deterministic synthetic data generator
 - [x] Deterministic pentest scenario generator
 - [x] Per-speaker + combined audio capture
