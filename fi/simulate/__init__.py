@@ -25,6 +25,7 @@ from .agent import (
     AnthropicAgentWrapper,
 )
 from .environment import (
+    AdversarialEnvironmentPack,
     BrowserEnvironment,
     EnvironmentAdapter,
     EnvironmentSnapshot,
@@ -74,6 +75,7 @@ __all__ = [
     "LangChainAgentWrapper",
     "GeminiAgentWrapper",
     "AnthropicAgentWrapper",
+    "AdversarialEnvironmentPack",
     "BrowserEnvironment",
     "EnvironmentAdapter",
     "EnvironmentSnapshot",

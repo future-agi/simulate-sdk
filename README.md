@@ -270,12 +270,15 @@ See [`examples/local_multimodal_simulation.py`](examples/local_multimodal_simula
 
 Use environment adapters when the agent needs a world to act on: mocked APIs,
 browser/CUA state, voice turns, image fixtures, files, or multi-agent handoffs.
-The local engine exposes environment tools through `AgentInput.tools`,
-auto-executes matching tool calls, and records tool results, state updates,
-artifacts, and events in the report.
+Adversarial packs add hostile retrieved context, file content, browser DOM, and
+memory-like context for indirect prompt-injection tests. The local engine
+exposes environment tools through `AgentInput.tools`, auto-executes matching
+tool calls, and records tool results, state updates, artifacts, and events in
+the report.
 
 ```python
 from fi.simulate import (
+    AdversarialEnvironmentPack,
     BrowserEnvironment,
     FileEnvironment,
     ImageEnvironment,
@@ -307,6 +310,7 @@ report = await TestRunner().run_test(
             "receipt": {"uri": "file:///fixtures/receipt.png", "description": "Order receipt"}
         }),
         FileEnvironment({"refund-policy.md": "Refunds require approval."}),
+        AdversarialEnvironmentPack(),
         MultiAgentRoomEnvironment(["support_agent", "policy_specialist"]),
     ],
     max_turns=1,
@@ -314,6 +318,7 @@ report = await TestRunner().run_test(
 ```
 
 See [`examples/local_environment_adapters.py`](examples/local_environment_adapters.py) for a full local world simulation with ai-evaluation scoring, and [`examples/local_voice_image_environments.py`](examples/local_voice_image_environments.py) for a voice + image artifact cookbook.
+See [`examples/local_adversarial_environment_pack.py`](examples/local_adversarial_environment_pack.py) for an indirect prompt-injection pentest using hostile tool, file, browser, and memory surfaces.
 
 ### Local pentest scenarios
 
@@ -375,8 +380,8 @@ evaluate_report(
 
 For fully local agent scoring, use `evaluate_agent_report`. It scores the
 normalized simulation trace directly: trajectory, tool use, prompt-injection
-resistance, memory integrity, browser/CUA safety, voice turn-taking, artifact
-coverage, and expected state.
+resistance, environment-injection resistance, memory integrity, browser/CUA
+safety, voice turn-taking, artifact coverage, and expected state.
 
 ```python
 from fi.simulate import evaluate_agent_report
@@ -439,13 +444,13 @@ Traces from simulations flow into `Monitor`, scores flow into `Evaluate`, and fa
 - [x] OpenAI / Anthropic / Gemini / LangChain wrappers
 - [x] Generic framework adapter presets
 - [x] Multimodal artifacts + event trajectories
-- [x] Local environment adapters for mocked tools/APIs, browser/CUA state, voice, images, files, and multi-agent rooms
+- [x] Local environment adapters for mocked tools/APIs, browser/CUA state, voice, images, files, adversarial packs, and multi-agent rooms
 - [x] Deterministic synthetic data generator
 - [x] Deterministic pentest scenario generator
 - [x] Per-speaker + combined audio capture
 - [x] Scenario auto-generation from a topic
 - [x] `evaluate_report` integration with `ai-evaluation`
-- [x] Local `evaluate_agent_report` scoring for trajectory, tools, memory, browser/CUA, voice, and pentest signals
+- [x] Local `evaluate_agent_report` scoring for trajectory, tools, memory, browser/CUA, voice, environment injection, and pentest signals
 - [x] Tool-call capture in wrapper responses
 
 </td>

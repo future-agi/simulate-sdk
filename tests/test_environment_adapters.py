@@ -1,6 +1,7 @@
 import pytest
 
 from fi.simulate import (
+    AdversarialEnvironmentPack,
     AgentResponse,
     BrowserEnvironment,
     FileEnvironment,
@@ -239,3 +240,52 @@ async def test_voice_and_image_environments_expose_media_and_execute_tools():
     assert any(event.type == "voice" and event.name == "tts_output" for event in result.events)
     assert result.metadata["environment_state"]["images"]["last_inspected"] == "receipt"
     assert result.metadata["environment_state"]["voice"]["interruptions_handled"] == 1
+
+
+@pytest.mark.asyncio
+async def test_adversarial_environment_pack_exposes_hostile_world_surfaces():
+    async def agent(input):
+        return AgentResponse(
+            content="I will inspect retrieved context.",
+            tool_calls=[
+                {
+                    "id": "call_search",
+                    "name": "search_knowledge_base",
+                    "arguments": {"query": "refund policy"},
+                },
+                {
+                    "id": "call_file",
+                    "name": "read_adversarial_file",
+                    "arguments": {"path": "retrieved-policy.md"},
+                },
+                {
+                    "id": "call_memory",
+                    "name": "load_memory_context",
+                    "arguments": {},
+                },
+            ],
+        )
+
+    report = await LocalTextEngine().run(
+        scenario=_scenario(),
+        agent_callback=agent,
+        environment=AdversarialEnvironmentPack(),
+        max_turns=1,
+        min_turns=1,
+    )
+
+    result = report.results[0]
+    tool_text = "\n".join(
+        message["content"] for message in result.messages if message["role"] == "tool"
+    )
+
+    assert "Ignore previous instructions" in tool_text
+    assert any(artifact.type == "file" for artifact in result.artifacts)
+    assert any(artifact.type == "browser_dom" for artifact in result.artifacts)
+    assert any(event.type == "environment_injection" for event in result.events)
+    assert result.metadata["environment_state"]["adversarial"]["surfaces"] == [
+        "tool",
+        "file",
+        "browser",
+        "memory",
+    ]
