@@ -1096,7 +1096,11 @@ async def test_autonomy_loop_environment_records_control_loop_trace():
                 {
                     "id": "verify",
                     "name": "verify_outcome",
-                    "arguments": {"passed": True, "checks": ["order found", "policy allowed"]},
+                    "arguments": {
+                        "passed": True,
+                        "checks": ["order found", "policy allowed"],
+                        "should_stop": True,
+                    },
                 },
                 {
                     "id": "reflect",
@@ -1124,6 +1128,16 @@ async def test_autonomy_loop_environment_records_control_loop_trace():
             feedback={"verify": {"score": 1.0}, "reflect": {"error": "none"}},
             prior_memory={"previous_case": "ask for order id first"},
             policy={"irreversible_actions_require_verification": True},
+            expected_plan={"required_steps": ["lookup", "policy", "respond"], "min_steps": 3},
+            expected_verification={
+                "required_checks": ["order found", "policy allowed"],
+                "passed_required": True,
+                "min_score": 1.0,
+            },
+            expected_reflection={"required_terms": ["verify", "policy"], "min_length": 20},
+            expected_memory={"required_keys": ["order_id", "status"]},
+            expected_skills=[{"name": "refund_policy_check", "required_steps": ["lookup", "verify", "respond"]}],
+            expected_stop={"should_stop": True},
         ),
         max_turns=1,
         min_turns=1,
@@ -1144,6 +1158,8 @@ async def test_autonomy_loop_environment_records_control_loop_trace():
     }
     assert autonomy_state["memory_updates"][-1]["order_id"] == "ord_123"
     assert "refund_policy_check" in autonomy_state["skills"]
+    assert autonomy_state["quality_checks"]
+    assert all(check["match"] for check in autonomy_state["quality_checks"])
     assert any(
         artifact.type == "trace" and artifact.metadata.get("kind") == "autonomy_loop_trace"
         for artifact in result.artifacts

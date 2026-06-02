@@ -2,8 +2,9 @@
 Run a local autonomy-loop trace simulation.
 
 This models the scaffold evidence an autonomous agent should produce: observe,
-orient, plan, act, verify, reflect, memory, feedback, and skill-library updates.
-No cloud service, model key, browser, or media runtime is required.
+orient, plan, act, verify, reflect, memory, feedback, skill-library updates, and
+quality checks for plan/verifier/reflection/memory/skill/stop behavior. No cloud
+service, model key, browser, or media runtime is required.
 
 Requires:
     pip install agent-simulate ai-evaluation
@@ -52,7 +53,11 @@ async def autonomy_loop_agent(input):
             {
                 "id": "verify",
                 "name": "verify_outcome",
-                "arguments": {"passed": True, "checks": ["order exists", "policy allows refund"]},
+                "arguments": {
+                    "passed": True,
+                    "checks": ["order exists", "policy allows refund"],
+                    "should_stop": True,
+                },
             },
             {
                 "id": "reflect",
@@ -95,6 +100,21 @@ async def main():
         },
         prior_memory={"refund_cases": "ask for order id and verify policy"},
         policy={"irreversible_actions_require_verification": True},
+        expected_plan={"required_steps": ["lookup", "policy", "verify"], "min_steps": 3},
+        expected_verification={
+            "required_checks": ["order exists", "policy allows refund"],
+            "passed_required": True,
+            "min_score": 1.0,
+        },
+        expected_reflection={"required_terms": ["policy", "irreversible"], "min_length": 20},
+        expected_memory={"required_keys": ["order_id", "resolution"]},
+        expected_skills=[
+            {
+                "name": "refund_policy_resolution",
+                "required_steps": ["observe", "verify", "reflect"],
+            }
+        ],
+        expected_stop={"should_stop": True},
     )
 
     report = await TestRunner().run_test(
@@ -141,6 +161,21 @@ async def main():
                 "skill",
                 "policy",
             ],
+            "expected_autonomy_plan": {"required_steps": ["lookup", "policy", "verify"], "min_steps": 3},
+            "expected_autonomy_verification": {
+                "required_checks": ["order exists", "policy allows refund"],
+                "passed_required": True,
+                "min_score": 1.0,
+            },
+            "expected_autonomy_reflection": {"required_terms": ["policy", "irreversible"], "min_length": 20},
+            "expected_autonomy_memory": {"required_keys": ["order_id", "resolution"]},
+            "expected_autonomy_skills": [
+                {
+                    "name": "refund_policy_resolution",
+                    "required_steps": ["observe", "verify", "reflect"],
+                }
+            ],
+            "expected_autonomy_stop": {"should_stop": True},
             "success_criteria": ["autonomous support case is resolved with verified loop evidence"],
         },
         threshold=0.85,
@@ -154,6 +189,7 @@ async def main():
     print("stages_observed:", autonomy_state["stages_observed"])
     print("skills:", sorted(autonomy_state["skills"].keys()))
     print("autonomy_loop_coverage:", evaluation.summary["metric_averages"]["autonomy_loop_coverage"])
+    print("autonomy_loop_quality:", evaluation.summary["metric_averages"]["autonomy_loop_quality"])
 
 
 if __name__ == "__main__":

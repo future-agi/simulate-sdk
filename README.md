@@ -317,7 +317,13 @@ report = await TestRunner().run_test(
             }
         }),
         AutonomyLoopEnvironment(
-            goal="Resolve the case with observe/orient/plan/act/verify/reflect evidence."
+            goal="Resolve the case with observe/orient/plan/act/verify/reflect evidence.",
+            expected_plan={"required_steps": ["lookup", "policy", "respond"]},
+            expected_verification={"required_checks": ["order found"], "passed_required": True},
+            expected_reflection={"required_terms": ["verify", "policy"]},
+            expected_memory={"required_keys": ["order_id", "status"]},
+            expected_skills=[{"name": "refund_policy_check", "required_steps": ["lookup", "verify"]}],
+            expected_stop={"should_stop": True},
         ),
         FrameworkTraceEnvironment(
             framework="openai_agents",
@@ -412,7 +418,7 @@ See [`examples/local_browser_trace_replay.py`](examples/local_browser_trace_repl
 See [`examples/local_voice_replay_routing.py`](examples/local_voice_replay_routing.py) for a voice replay cookbook with VAD/STT/TTS events, Pipecat-style frame replay, noise/overlap evidence, interruption handling, and call routing.
 See [`examples/local_framework_trace_replay.py`](examples/local_framework_trace_replay.py) for a framework trace replay cookbook with native spans/events from orchestration frameworks.
 See [`examples/local_retrieval_memory_attribution.py`](examples/local_retrieval_memory_attribution.py) for a retrieval/memory attribution cookbook with queries, ranked documents, retrieval scores, citations, memory reads/writes, and freshness evidence.
-See [`examples/local_autonomy_loop_trace.py`](examples/local_autonomy_loop_trace.py) for an autonomy-loop cookbook with observe/orient/plan/act/verify/reflect, feedback, memory, and skill-library evidence.
+See [`examples/local_autonomy_loop_trace.py`](examples/local_autonomy_loop_trace.py) for an autonomy-loop cookbook with observe/orient/plan/act/verify/reflect, feedback, memory, skill-library evidence, and plan/verifier/reflection/memory/skill/stop quality checks.
 See [`examples/local_multi_agent_handoff_trace.py`](examples/local_multi_agent_handoff_trace.py) for a multi-agent handoff cookbook with roles, contracts, delegated work, review, reconciliation, trace coverage, and coordination-quality scoring.
 See [`examples/local_adversarial_environment_pack.py`](examples/local_adversarial_environment_pack.py) for an indirect prompt-injection pentest using hostile tool, file, browser, and memory surfaces.
 
@@ -508,8 +514,9 @@ resistance, environment-injection resistance, memory integrity, browser/CUA
 safety, browser action outcome/state success, browser trace coverage, voice
 turn-taking, voice interaction quality, voice trace coverage, framework trace
 coverage, tool argument schema validation, retrieval context quality, source grounding,
-retrieval/memory attribution, autonomy-loop coverage, multi-agent trace
-coverage, multi-agent coordination quality, artifact coverage, and expected state.
+retrieval/memory attribution, autonomy-loop coverage, autonomy-loop quality,
+multi-agent trace coverage, multi-agent coordination quality, artifact coverage,
+and expected state.
 
 ```python
 from fi.simulate import evaluate_agent_report
@@ -539,6 +546,12 @@ evaluation = evaluate_agent_report(
         "require_current_retrieval": True,
         "require_source_grounding": True,
         "required_autonomy_loop": ["observe", "orient", "plan", "act", "verify", "reflect"],
+        "expected_autonomy_plan": {"required_steps": ["lookup", "policy", "respond"], "min_steps": 3},
+        "expected_autonomy_verification": {"required_checks": ["order found"], "passed_required": True},
+        "expected_autonomy_reflection": {"required_terms": ["verify", "policy"]},
+        "expected_autonomy_memory": {"required_keys": ["order_id", "status"]},
+        "expected_autonomy_skills": [{"name": "refund_policy_check", "required_steps": ["lookup", "verify"]}],
+        "expected_autonomy_stop": {"should_stop": True},
         "required_multi_agent_trace": ["role", "contract", "handoff", "review", "reconciliation"],
         "required_multi_agent_roles": ["support_agent", "policy_specialist", "qa_reviewer"],
         "expected_multi_agent_handoffs": [{"to": "policy_specialist", "context_keys": ["order_id"]}],
@@ -601,7 +614,7 @@ Traces from simulations flow into `Monitor`, scores flow into `Evaluate`, and fa
 - [x] Per-speaker + combined audio capture
 - [x] Scenario auto-generation from a topic
 - [x] `evaluate_report` integration with `ai-evaluation`
-- [x] Local `evaluate_agent_report` scoring for trajectory, tools, memory, framework trace coverage, retrieval/memory attribution, autonomy-loop coverage, multi-agent trace coverage, multi-agent coordination quality, browser/CUA, browser trace coverage, voice trace coverage, voice interaction quality, environment injection, and pentest signals
+- [x] Local `evaluate_agent_report` scoring for trajectory, tools, memory, framework trace coverage, retrieval/memory attribution, autonomy-loop coverage, autonomy-loop quality, multi-agent trace coverage, multi-agent coordination quality, browser/CUA, browser trace coverage, voice trace coverage, voice interaction quality, environment injection, and pentest signals
 - [x] Tool-call capture in wrapper responses
 
 </td>

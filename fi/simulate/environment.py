@@ -2365,6 +2365,12 @@ class AutonomyLoopEnvironment(EnvironmentAdapter):
         prior_memory: Optional[Mapping[str, Any]] = None,
         skill_library: Optional[Mapping[str, Any] | Iterable[Mapping[str, Any]]] = None,
         policy: Optional[Mapping[str, Any]] = None,
+        expected_plan: Optional[Mapping[str, Any]] = None,
+        expected_verification: Optional[Mapping[str, Any]] = None,
+        expected_reflection: Optional[Mapping[str, Any]] = None,
+        expected_memory: Optional[Mapping[str, Any]] = None,
+        expected_skills: Optional[Iterable[str | Mapping[str, Any]]] = None,
+        expected_stop: Optional[Mapping[str, Any] | bool] = None,
         state: Optional[Mapping[str, Any]] = None,
     ) -> None:
         self.goal = goal
@@ -2377,6 +2383,12 @@ class AutonomyLoopEnvironment(EnvironmentAdapter):
         self.prior_memory = copy.deepcopy(dict(prior_memory or {}))
         self.initial_skills = _normalize_skill_library(skill_library)
         self.policy = copy.deepcopy(dict(policy or {}))
+        self.expected_plan = copy.deepcopy(dict(expected_plan or {}))
+        self.expected_verification = copy.deepcopy(dict(expected_verification or {}))
+        self.expected_reflection = copy.deepcopy(dict(expected_reflection or {}))
+        self.expected_memory = copy.deepcopy(dict(expected_memory or {}))
+        self.expected_skills = _normalize_expected_skills(expected_skills)
+        self.expected_stop = _normalize_expected_stop(expected_stop)
         self.initial_state = copy.deepcopy(dict(state or {}))
         self.entries: List[Dict[str, Any]] = []
         self.memory_updates: List[Dict[str, Any]] = []
@@ -2403,6 +2415,7 @@ class AutonomyLoopEnvironment(EnvironmentAdapter):
                         "memory_keys": sorted(self.prior_memory.keys()),
                         "skill_count": len(self.skills),
                         "policy_keys": sorted(self.policy.keys()),
+                        "expected_quality_checks": self._expected_quality_count(),
                     },
                 )
             ],
@@ -2410,6 +2423,7 @@ class AutonomyLoopEnvironment(EnvironmentAdapter):
                 "autonomy_loop": {
                     "required_stages": self.required_stages,
                     "feedback_keys": sorted(self.feedback.keys()),
+                    "expected_quality_checks": self._expected_quality_count(),
                 }
             },
         )
@@ -2450,6 +2464,10 @@ class AutonomyLoopEnvironment(EnvironmentAdapter):
             self.state["last_action"] = copy.deepcopy(arguments)
         if stage == "verify":
             self.state["last_verification"] = copy.deepcopy(arguments)
+            if any(key in arguments for key in ("stop", "should_stop", "continue", "should_continue", "decision")):
+                self.state["last_stop_decision"] = copy.deepcopy(arguments)
+        if stage == "reflect" and any(key in arguments for key in ("stop", "should_stop", "continue", "should_continue", "decision")):
+            self.state["last_stop_decision"] = copy.deepcopy(arguments)
 
         payload = {
             "stage": stage,
@@ -2457,6 +2475,7 @@ class AutonomyLoopEnvironment(EnvironmentAdapter):
             "arguments": arguments,
             "feedback": feedback,
             "observed_stages": self._observed_stages(),
+            "quality_checks": self._quality_checks(),
         }
         return ToolExecutionResult(
             tool_call_id=call_id,
@@ -2544,6 +2563,13 @@ class AutonomyLoopEnvironment(EnvironmentAdapter):
             "memory_updates": copy.deepcopy(self.memory_updates),
             "skills": copy.deepcopy(self.skills),
             "policy": copy.deepcopy(self.policy),
+            "expected_plan": copy.deepcopy(self.expected_plan),
+            "expected_verification": copy.deepcopy(self.expected_verification),
+            "expected_reflection": copy.deepcopy(self.expected_reflection),
+            "expected_memory": copy.deepcopy(self.expected_memory),
+            "expected_skills": copy.deepcopy(self.expected_skills),
+            "expected_stop": copy.deepcopy(self.expected_stop),
+            "quality_checks": self._quality_checks(),
         }
 
     def _state_payload(self) -> Dict[str, Any]:
@@ -2556,11 +2582,45 @@ class AutonomyLoopEnvironment(EnvironmentAdapter):
             "memory_updates": copy.deepcopy(self.memory_updates),
             "skills": copy.deepcopy(self.skills),
             "policy": copy.deepcopy(self.policy),
+            "expected_plan": copy.deepcopy(self.expected_plan),
+            "expected_verification": copy.deepcopy(self.expected_verification),
+            "expected_reflection": copy.deepcopy(self.expected_reflection),
+            "expected_memory": copy.deepcopy(self.expected_memory),
+            "expected_skills": copy.deepcopy(self.expected_skills),
+            "expected_stop": copy.deepcopy(self.expected_stop),
+            "quality_checks": self._quality_checks(),
             "state": copy.deepcopy(self.state),
         }
 
     def _observed_stages(self) -> List[str]:
         return sorted({entry["stage"] for entry in self.entries})
+
+    def _quality_checks(self) -> List[Dict[str, Any]]:
+        return _autonomy_quality_checks(
+            entries=self.entries,
+            memory_updates=self.memory_updates,
+            skills=self.skills,
+            expected_plan=self.expected_plan,
+            expected_verification=self.expected_verification,
+            expected_reflection=self.expected_reflection,
+            expected_memory=self.expected_memory,
+            expected_skills=self.expected_skills,
+            expected_stop=self.expected_stop,
+        )
+
+    def _expected_quality_count(self) -> int:
+        return sum(
+            1
+            for item in (
+                self.expected_plan,
+                self.expected_verification,
+                self.expected_reflection,
+                self.expected_memory,
+                self.expected_skills,
+                self.expected_stop,
+            )
+            if item
+        )
 
 
 def coerce_environment_adapters(
@@ -3402,6 +3462,314 @@ def _autonomy_stage_for_tool(name: Optional[str]) -> Optional[str]:
 def _normalize_autonomy_stage(stage: Any) -> str:
     normalized = str(stage).strip().lower().replace("-", "_").replace(" ", "_")
     return AUTONOMY_STAGE_ALIASES.get(normalized, normalized)
+
+
+def _autonomy_quality_checks(
+    *,
+    entries: Iterable[Mapping[str, Any]],
+    memory_updates: Iterable[Mapping[str, Any]],
+    skills: Mapping[str, Any],
+    expected_plan: Mapping[str, Any],
+    expected_verification: Mapping[str, Any],
+    expected_reflection: Mapping[str, Any],
+    expected_memory: Mapping[str, Any],
+    expected_skills: Iterable[Mapping[str, Any]],
+    expected_stop: Mapping[str, Any],
+) -> List[Dict[str, Any]]:
+    entries_by_stage = _autonomy_entries_by_stage(entries)
+    checks: List[Dict[str, Any]] = []
+
+    plan_entries = entries_by_stage.get("plan", [])
+    plan_steps = _autonomy_plan_steps(plan_entries)
+    if expected_plan:
+        required_steps = _autonomy_string_list(
+            expected_plan.get("required_steps") or expected_plan.get("steps")
+        )
+        if required_steps:
+            missing = [step for step in required_steps if not _autonomy_terms_present(plan_steps, step)]
+            checks.append(
+                {
+                    "check": "plan_steps",
+                    "expected": required_steps,
+                    "actual": plan_steps,
+                    "match": not missing,
+                    "missing": missing,
+                }
+            )
+        min_steps = expected_plan.get("min_steps")
+        if min_steps is not None:
+            checks.append(
+                {
+                    "check": "plan_min_steps",
+                    "expected": int(min_steps),
+                    "actual": len(plan_steps),
+                    "match": len(plan_steps) >= int(min_steps),
+                }
+            )
+        forbidden_steps = _autonomy_string_list(expected_plan.get("forbidden_steps"))
+        if forbidden_steps:
+            present = [step for step in forbidden_steps if _autonomy_terms_present(plan_steps, step)]
+            checks.append(
+                {
+                    "check": "plan_forbidden_steps",
+                    "expected": [],
+                    "actual": present,
+                    "match": not present,
+                }
+            )
+
+    verify_entries = entries_by_stage.get("verify", [])
+    verify_text = _autonomy_entries_text(verify_entries)
+    if expected_verification:
+        required_checks = _autonomy_string_list(
+            expected_verification.get("required_checks") or expected_verification.get("checks")
+        )
+        if required_checks:
+            missing = [term for term in required_checks if term.lower() not in verify_text]
+            checks.append(
+                {
+                    "check": "verification_checks",
+                    "expected": required_checks,
+                    "actual": _autonomy_verification_checks(verify_entries),
+                    "match": not missing,
+                    "missing": missing,
+                }
+            )
+        if expected_verification.get("passed_required") is not None:
+            passed = any(_autonomy_entry_passed(entry) for entry in verify_entries)
+            checks.append(
+                {
+                    "check": "verification_passed",
+                    "expected": bool(expected_verification.get("passed_required")),
+                    "actual": passed,
+                    "match": passed == bool(expected_verification.get("passed_required")),
+                }
+            )
+        if expected_verification.get("min_score") is not None:
+            scores = _autonomy_entry_scores(verify_entries)
+            max_score = max(scores) if scores else None
+            checks.append(
+                {
+                    "check": "verification_score",
+                    "expected": f">= {expected_verification.get('min_score')}",
+                    "actual": max_score,
+                    "match": max_score is not None and max_score >= float(expected_verification.get("min_score")),
+                }
+            )
+
+    reflect_entries = entries_by_stage.get("reflect", [])
+    reflect_text = _autonomy_entries_text(reflect_entries)
+    if expected_reflection:
+        required_terms = _autonomy_string_list(
+            expected_reflection.get("required_terms") or expected_reflection.get("lesson_contains")
+        )
+        if required_terms:
+            missing = [term for term in required_terms if term.lower() not in reflect_text]
+            checks.append(
+                {
+                    "check": "reflection_terms",
+                    "expected": required_terms,
+                    "actual": reflect_text,
+                    "match": not missing,
+                    "missing": missing,
+                }
+            )
+        min_length = expected_reflection.get("min_length")
+        if min_length is not None:
+            checks.append(
+                {
+                    "check": "reflection_length",
+                    "expected": int(min_length),
+                    "actual": len(reflect_text),
+                    "match": len(reflect_text) >= int(min_length),
+                }
+            )
+
+    memory_list = [dict(item) for item in memory_updates]
+    if expected_memory:
+        required_keys = _autonomy_string_list(
+            expected_memory.get("required_keys") or expected_memory.get("keys")
+        )
+        if required_keys:
+            actual_keys = sorted({str(key) for item in memory_list for key in item.keys()})
+            missing = sorted(set(required_keys) - set(actual_keys))
+            checks.append(
+                {
+                    "check": "memory_keys",
+                    "expected": required_keys,
+                    "actual": actual_keys,
+                    "match": not missing,
+                    "missing": missing,
+                }
+            )
+        forbidden_keys = _autonomy_string_list(expected_memory.get("forbidden_keys"))
+        if forbidden_keys:
+            actual_keys = sorted({str(key) for item in memory_list for key in item.keys()})
+            present = sorted(set(forbidden_keys) & set(actual_keys))
+            checks.append(
+                {
+                    "check": "memory_forbidden_keys",
+                    "expected": [],
+                    "actual": present,
+                    "match": not present,
+                }
+            )
+
+    for expected_skill in expected_skills:
+        expected = dict(expected_skill)
+        name = str(expected.get("name") or expected.get("skill") or "")
+        skill = dict(skills.get(name, {})) if name else {}
+        skill_steps = _autonomy_string_list(skill.get("steps"))
+        required_steps = _autonomy_string_list(expected.get("required_steps") or expected.get("steps"))
+        step_missing = [step for step in required_steps if not _autonomy_terms_present(skill_steps, step)]
+        checks.append(
+            {
+                "check": "skill_reuse",
+                "expected": expected,
+                "actual": skill,
+                "match": bool(skill) and not step_missing,
+                "missing": step_missing,
+            }
+        )
+
+    if expected_stop:
+        stop_records = [
+            _as_mapping(entry.get("arguments"))
+            for entry in entries_by_stage.get("verify", []) + entries_by_stage.get("reflect", [])
+            if any(key in _as_mapping(entry.get("arguments")) for key in ("stop", "should_stop", "continue", "should_continue", "decision"))
+        ]
+        actual = stop_records[-1] if stop_records else {}
+        should_stop = expected_stop.get("should_stop")
+        if should_stop is not None:
+            actual_stop = _autonomy_stop_value(actual)
+            checks.append(
+                {
+                    "check": "stop_decision",
+                    "expected": bool(should_stop),
+                    "actual": actual,
+                    "match": actual_stop is not None and actual_stop == bool(should_stop),
+                }
+            )
+    return checks
+
+
+def _normalize_expected_skills(
+    expected_skills: Optional[Iterable[str | Mapping[str, Any]]],
+) -> List[Dict[str, Any]]:
+    normalized: List[Dict[str, Any]] = []
+    for item in expected_skills or []:
+        if isinstance(item, Mapping):
+            normalized.append(copy.deepcopy(dict(item)))
+        else:
+            normalized.append({"name": str(item)})
+    return normalized
+
+
+def _normalize_expected_stop(expected_stop: Optional[Mapping[str, Any] | bool]) -> Dict[str, Any]:
+    if expected_stop is None:
+        return {}
+    if isinstance(expected_stop, Mapping):
+        return copy.deepcopy(dict(expected_stop))
+    return {"should_stop": bool(expected_stop)}
+
+
+def _autonomy_entries_by_stage(entries: Iterable[Mapping[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for entry in entries:
+        entry_dict = dict(entry)
+        stage = _normalize_autonomy_stage(entry_dict.get("stage") or entry_dict.get("name") or "")
+        if not stage:
+            continue
+        grouped.setdefault(stage, []).append(entry_dict)
+    return grouped
+
+
+def _autonomy_plan_steps(entries: Iterable[Mapping[str, Any]]) -> List[str]:
+    steps: List[str] = []
+    for entry in entries:
+        arguments = _as_mapping(entry.get("arguments"))
+        raw_steps = arguments.get("steps") or arguments.get("plan") or arguments.get("tasks")
+        steps.extend(_autonomy_string_list(raw_steps))
+    return steps
+
+
+def _autonomy_verification_checks(entries: Iterable[Mapping[str, Any]]) -> List[str]:
+    checks: List[str] = []
+    for entry in entries:
+        arguments = _as_mapping(entry.get("arguments"))
+        checks.extend(_autonomy_string_list(arguments.get("checks") or arguments.get("evidence")))
+    return checks
+
+
+def _autonomy_entry_passed(entry: Mapping[str, Any]) -> bool:
+    arguments = _as_mapping(entry.get("arguments"))
+    if "passed" in arguments:
+        return bool(arguments.get("passed"))
+    feedback = _as_mapping(entry.get("feedback"))
+    if "passed" in feedback:
+        return bool(feedback.get("passed"))
+    score = feedback.get("score", arguments.get("score"))
+    return isinstance(score, (int, float)) and score >= 1.0
+
+
+def _autonomy_entry_scores(entries: Iterable[Mapping[str, Any]]) -> List[float]:
+    scores: List[float] = []
+    for entry in entries:
+        arguments = _as_mapping(entry.get("arguments"))
+        feedback = _as_mapping(entry.get("feedback"))
+        for raw in (arguments.get("score"), feedback.get("score")):
+            if isinstance(raw, bool) or raw is None:
+                continue
+            try:
+                scores.append(float(raw))
+            except (TypeError, ValueError):
+                continue
+    return scores
+
+
+def _autonomy_entries_text(entries: Iterable[Mapping[str, Any]]) -> str:
+    parts: List[str] = []
+    for entry in entries:
+        parts.append(_stringify_dict(entry))
+    return " ".join(parts).lower()
+
+
+def _autonomy_terms_present(values: Iterable[str], expected: str) -> bool:
+    expected_text = str(expected).lower()
+    return any(expected_text in str(value).lower() for value in values)
+
+
+def _autonomy_string_list(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, Mapping):
+        return [str(key) for key in value.keys()]
+    if isinstance(value, Iterable) and not isinstance(value, (bytes, bytearray)):
+        return [str(item) for item in value if item not in (None, "")]
+    return [str(value)]
+
+
+def _autonomy_stop_value(record: Mapping[str, Any]) -> Optional[bool]:
+    if "should_stop" in record:
+        return bool(record.get("should_stop"))
+    if "stop" in record:
+        return bool(record.get("stop"))
+    if "should_continue" in record:
+        return not bool(record.get("should_continue"))
+    if "continue" in record:
+        return not bool(record.get("continue"))
+    decision = str(record.get("decision") or "").strip().lower()
+    if decision in {"stop", "done", "final", "finish"}:
+        return True
+    if decision in {"continue", "retry", "iterate"}:
+        return False
+    return None
+
+
+def _as_mapping(value: Any) -> Dict[str, Any]:
+    return dict(value) if isinstance(value, Mapping) else {}
 
 
 def _normalize_skill_library(
