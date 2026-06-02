@@ -273,8 +273,9 @@ transient tool/API faults, browser/CUA state, voice turns, image fixtures,
 files, framework traces, or multi-agent handoffs.
 Browser adapters can emit DOM snapshots, screenshots, action replay,
 console/network logs, and trace artifacts. Voice adapters can replay VAD/STT/TTS
-events, latency profiles, barge-in handling, call routing, audio artifacts, and
-voice trace artifacts. Framework trace adapters can replay native orchestration
+events, Pipecat-style frames, latency profiles, barge-in/overlap handling, call
+routing, noise metadata, audio artifacts, timelines, and voice trace artifacts.
+Framework trace adapters can replay native orchestration
 spans from LangChain/LangGraph, OpenAI Agents, CrewAI, AutoGen, LiveKit,
 Pipecat, or custom runtimes. Adversarial packs add hostile retrieved context,
 file content, browser DOM, and memory-like context for indirect prompt-injection
@@ -337,9 +338,18 @@ report = await TestRunner().run_test(
             console_logs=[{"level": "info", "message": "checkout loaded"}],
             network_log=[{"url": "https://shop.example.com/api/order", "status": 200}],
         ),
-        VoiceEnvironment([
-            {"id": "caller_1", "transcript": "Please check order 123."}
-        ], routes={"billing": {"kind": "queue", "name": "billing_specialist"}}),
+        VoiceEnvironment(
+            [{"id": "caller_1", "transcript": "Please check order 123."}],
+            routes={"billing": {"kind": "queue", "name": "billing_specialist"}},
+            noise_profile={"noise_db": 62, "processed_noise_db": 24},
+            frame_replay=[
+                {"type": "InputAudioRawFrame", "timestamp_ms": 0},
+                {"type": "TranscriptionFrame", "text": "Please check order 123."},
+                {"type": "TTSStartedFrame", "timestamp_ms": 650},
+                {"type": "TTSAudioRawFrame", "duration_ms": 900},
+                {"type": "OverlappingSpeechFrame", "overlap_ms": 180},
+            ],
+        ),
         ImageEnvironment({
             "receipt": {"uri": "file:///fixtures/receipt.png", "description": "Order receipt"}
         }),
@@ -392,7 +402,7 @@ environment = FrameworkTraceEnvironment(framework="traceai", events=trace_record
 
 See [`examples/local_environment_adapters.py`](examples/local_environment_adapters.py) for a full local world simulation with ai-evaluation scoring, and [`examples/local_voice_image_environments.py`](examples/local_voice_image_environments.py) for a voice + image artifact cookbook.
 See [`examples/local_browser_trace_replay.py`](examples/local_browser_trace_replay.py) for a browser/CUA trace replay cookbook with screenshots, DOM, selector-level action fixtures, mutable browser state, console/network logs, DOM mutation events, and action replay.
-See [`examples/local_voice_replay_routing.py`](examples/local_voice_replay_routing.py) for a voice replay cookbook with VAD/STT/TTS events, interruption handling, and call routing.
+See [`examples/local_voice_replay_routing.py`](examples/local_voice_replay_routing.py) for a voice replay cookbook with VAD/STT/TTS events, Pipecat-style frame replay, noise/overlap evidence, interruption handling, and call routing.
 See [`examples/local_framework_trace_replay.py`](examples/local_framework_trace_replay.py) for a framework trace replay cookbook with native spans/events from orchestration frameworks.
 See [`examples/local_retrieval_memory_attribution.py`](examples/local_retrieval_memory_attribution.py) for a retrieval/memory attribution cookbook with queries, ranked documents, retrieval scores, citations, memory reads/writes, and freshness evidence.
 See [`examples/local_autonomy_loop_trace.py`](examples/local_autonomy_loop_trace.py) for an autonomy-loop cookbook with observe/orient/plan/act/verify/reflect, feedback, memory, and skill-library evidence.
@@ -489,8 +499,8 @@ For fully local agent scoring, use `evaluate_agent_report`. It scores the
 normalized simulation trace directly: trajectory, tool use, prompt-injection
 resistance, environment-injection resistance, memory integrity, browser/CUA
 safety, browser action outcome/state success, browser trace coverage, voice
-turn-taking, voice trace coverage, framework trace coverage, tool argument
-schema validation, retrieval context quality, source grounding,
+turn-taking, voice interaction quality, voice trace coverage, framework trace
+coverage, tool argument schema validation, retrieval context quality, source grounding,
 retrieval/memory attribution, autonomy-loop coverage, multi-agent trace
 coverage, artifact coverage, and expected state.
 
@@ -509,7 +519,12 @@ evaluation = evaluate_agent_report(
         "expected_browser_actions": [{"selector": "#confirm", "success": True}],
         "expected_browser_state": {"url": "https://shop.example.com/done"},
         "expected_browser_dom_contains": ["Done"],
-        "required_voice_trace": ["audio", "vad", "stt", "tts", "interruption", "route"],
+        "required_voice_trace": ["audio", "vad", "stt", "tts", "interruption", "route", "frame", "noise", "overlap", "timeline"],
+        "expected_voice_route": "billing",
+        "expected_voice_transcript_contains": ["order 123"],
+        "required_voice_frame_types": ["InputAudioRawFrame", "TranscriptionFrame", "TTSStartedFrame", "TTSAudioRawFrame"],
+        "max_voice_overlap_ms": 250,
+        "max_voice_noise_db": 35,
         "required_framework_trace": ["agent", "model", "tool", "handoff", "guardrail"],
         "required_retrieval_memory_trace": ["query", "document", "citation", "memory_read", "memory_write"],
         "expected_retrieval_doc_ids": ["refund_policy_current"],
@@ -568,21 +583,21 @@ Traces from simulations flow into `Monitor`, scores flow into `Evaluate`, and fa
 - [x] OpenAI / Anthropic / Gemini / LangChain wrappers
 - [x] Generic framework adapter presets
 - [x] Multimodal artifacts + event trajectories
-- [x] Local environment adapters for mocked tools/APIs, framework trace replay, retrieval/memory attribution, autonomy-loop traces, multi-agent handoff traces, browser/CUA trace replay, voice replay/routing, images, files, adversarial packs, and multi-agent rooms
+- [x] Local environment adapters for mocked tools/APIs, framework trace replay, retrieval/memory attribution, autonomy-loop traces, multi-agent handoff traces, browser/CUA trace replay, voice frame replay/routing/noise/overlap, images, files, adversarial packs, and multi-agent rooms
 - [x] Deterministic synthetic data generator
 - [x] Self-contained synthetic tool-world generator with schemas, mocks, state expectations, and evaluator config
 - [x] Deterministic pentest scenario generator
 - [x] Per-speaker + combined audio capture
 - [x] Scenario auto-generation from a topic
 - [x] `evaluate_report` integration with `ai-evaluation`
-- [x] Local `evaluate_agent_report` scoring for trajectory, tools, memory, framework trace coverage, retrieval/memory attribution, autonomy-loop coverage, multi-agent trace coverage, browser/CUA, browser trace coverage, voice trace coverage, environment injection, and pentest signals
+- [x] Local `evaluate_agent_report` scoring for trajectory, tools, memory, framework trace coverage, retrieval/memory attribution, autonomy-loop coverage, multi-agent trace coverage, browser/CUA, browser trace coverage, voice trace coverage, voice interaction quality, environment injection, and pentest signals
 - [x] Tool-call capture in wrapper responses
 
 </td>
 <td>
 
 - [ ] Conversation-graph scenarios (branching flows)
-- [ ] Latency, interruption, and turn-taking metrics
+- [ ] Streaming audio waveform, diarization, and perceptual audio metrics
 - [ ] Streaming transcript API
 - [ ] First-class Pipecat/VAPI/Retell voice backends over the generic voice artifact/event contract
 

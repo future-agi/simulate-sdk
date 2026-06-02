@@ -3,7 +3,8 @@ Run a local voice replay simulation with routing and interruption checks.
 
 This models LiveKit/Pipecat-style realtime evidence without starting a room,
 pipeline, model, or media service. The report carries audio artifacts, VAD/STT
-events, TTS latency, barge-in handling, call routing, and a voice trace artifact.
+events, Pipecat-style frames, TTS latency, barge-in handling, call routing,
+noise-cancellation metadata, overlap evidence, and a voice trace artifact.
 
 Requires:
     pip install agent-simulate ai-evaluation
@@ -78,10 +79,28 @@ async def main():
         ],
         sample_rate_hz=24000,
         latency_profile={"stt": [120, 180], "tts": [420]},
+        noise_profile={
+            "noise_db": 62,
+            "processed_noise_db": 24,
+            "noise_cancellation": True,
+        },
         event_replay=[
             {"name": "vad_start", "timestamp_ms": 0},
             {"name": "stt_partial", "payload": {"transcript": "I need billing"}},
             {"name": "vad_end", "timestamp_ms": 1800},
+        ],
+        frame_replay=[
+            {"frame_type": "InputAudioRawFrame", "timestamp_ms": 0, "sample_rate": 24000},
+            {"frame_type": "UserStartedSpeakingFrame", "timestamp_ms": 10},
+            {
+                "frame_type": "TranscriptionFrame",
+                "timestamp_ms": 420,
+                "text": "I need billing help for order 123.",
+            },
+            {"frame_type": "TTSStartedFrame", "timestamp_ms": 2100},
+            {"frame_type": "TTSAudioRawFrame", "timestamp_ms": 2300, "duration_ms": 500},
+            {"frame_type": "OverlappingSpeechFrame", "timestamp_ms": 2400, "overlap_ms": 180},
+            {"frame_type": "InterruptionFrame", "timestamp_ms": 2420},
         ],
         routes={
             "default": {"kind": "agent", "name": "front_desk"},
@@ -125,8 +144,23 @@ async def main():
                 "interruption",
                 "route",
                 "latency",
+                "frame",
+                "noise",
+                "overlap",
+                "timeline",
             ],
             "max_voice_latency_ms": 1000,
+            "max_voice_overlap_ms": 250,
+            "max_voice_noise_db": 35,
+            "expected_voice_route": "billing",
+            "expected_voice_transcript_contains": ["order 123"],
+            "required_voice_frame_types": [
+                "InputAudioRawFrame",
+                "TranscriptionFrame",
+                "TTSStartedFrame",
+                "TTSAudioRawFrame",
+                "InterruptionFrame",
+            ],
             "success_criteria": ["voice support call resolved with replay evidence"],
         },
         threshold=0.85,
@@ -140,6 +174,7 @@ async def main():
     print("artifacts:", [artifact.type for artifact in result.artifacts])
     print("route_history:", voice_state["route_history"])
     print("voice_trace_coverage:", evaluation.summary["metric_averages"]["voice_trace_coverage"])
+    print("voice_interaction_quality:", evaluation.summary["metric_averages"]["voice_interaction_quality"])
 
 
 if __name__ == "__main__":

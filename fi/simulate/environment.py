@@ -867,7 +867,9 @@ class VoiceEnvironment(EnvironmentAdapter):
         tts_latency_ms: int = 320,
         state: Optional[Dict[str, Any]] = None,
         event_replay: Optional[Iterable[Mapping[str, Any]]] = None,
+        frame_replay: Optional[Iterable[Mapping[str, Any]]] = None,
         latency_profile: Optional[Mapping[str, Any]] = None,
+        noise_profile: Optional[Mapping[str, Any]] = None,
         allow_interruptions: bool = True,
         interruption_policy: Optional[Mapping[str, Any]] = None,
         routes: Optional[Mapping[str, Any] | Iterable[str]] = None,
@@ -880,11 +882,13 @@ class VoiceEnvironment(EnvironmentAdapter):
         self.state = copy.deepcopy(self.initial_state)
         self.utterances = _normalize_voice_utterances(utterances or [], audio_uris or [])
         self.event_replay = [_normalize_voice_event(item) for item in event_replay or []]
+        self.frame_replay = [_normalize_voice_frame(item) for item in frame_replay or []]
         self.latency_profile = _normalize_latency_profile(
             latency_profile,
             stt_latency_ms=stt_latency_ms,
             tts_latency_ms=tts_latency_ms,
         )
+        self.noise_profile = copy.deepcopy(dict(noise_profile or {}))
         self.latency_cursors = {"stt": 0, "tts": 0}
         self.allow_interruptions = allow_interruptions
         self.interruption_policy = {
@@ -896,6 +900,8 @@ class VoiceEnvironment(EnvironmentAdapter):
         self.route_history: List[Dict[str, Any]] = []
         self.transcript_history: List[Dict[str, Any]] = []
         self.tts_history: List[Dict[str, Any]] = []
+        self.timeline: List[Dict[str, Any]] = []
+        self.overlap_events: List[Dict[str, Any]] = []
 
     def reset(self, **context: Any) -> EnvironmentSnapshot:
         self.state = copy.deepcopy(self.initial_state)
@@ -903,6 +909,8 @@ class VoiceEnvironment(EnvironmentAdapter):
         self.route_history = []
         self.transcript_history = []
         self.tts_history = []
+        self.timeline = []
+        self.overlap_events = []
         artifacts = [
             artifact
             for artifact in (_voice_artifact_from_utterance(item, self.sample_rate_hz) for item in self.utterances)
@@ -919,6 +927,8 @@ class VoiceEnvironment(EnvironmentAdapter):
                     "allow_interruptions": self.allow_interruptions,
                     "routes": sorted(self.routes.keys()),
                     "initial_route": self.initial_route,
+                    "frame_count": len(self.frame_replay),
+                    "noise_profile": copy.deepcopy(self.noise_profile),
                 },
             )
         ]
@@ -930,6 +940,13 @@ class VoiceEnvironment(EnvironmentAdapter):
                 "start_ms": utterance.get("start_ms"),
                 "end_ms": utterance.get("end_ms"),
             }
+            self.timeline.append(
+                _voice_timeline_entry(
+                    "utterance",
+                    utterance,
+                    speaker=utterance.get("speaker", "user"),
+                )
+            )
             events.append(SimulationEvent(type="voice", name="vad_start", payload=vad_payload))
             payload = {
                 "id": utterance["id"],
@@ -937,7 +954,10 @@ class VoiceEnvironment(EnvironmentAdapter):
                 "transcript": utterance.get("transcript", ""),
                 "turn_index": utterance.get("turn_index"),
                 "latency_ms": utterance.get("latency_ms", self._next_latency("stt")),
+                "confidence": utterance.get("confidence"),
+                "language": utterance.get("language"),
             }
+            payload.update(_voice_noise_payload(self.noise_profile, utterance))
             if utterance.get("barge_in"):
                 payload["barge_in"] = True
                 events.append(
@@ -955,6 +975,13 @@ class VoiceEnvironment(EnvironmentAdapter):
             events.append(SimulationEvent(type="voice", name="vad_end", payload=vad_payload))
         for event in self.event_replay:
             events.append(_coerce_event(event))
+        for frame in self.frame_replay:
+            self.timeline.append(_voice_timeline_entry("frame", frame, speaker=frame.get("speaker")))
+            if _voice_frame_is_overlap(frame):
+                overlap = _voice_overlap_payload(frame)
+                self.overlap_events.append(overlap)
+                events.append(SimulationEvent(type="voice", name="overlapping_speech", payload=overlap))
+            events.extend(_voice_events_from_frame(frame, noise_profile=self.noise_profile))
         events.append(
             SimulationEvent(
                 type="voice_trace",
@@ -1010,6 +1037,7 @@ class VoiceEnvironment(EnvironmentAdapter):
             metadata={
                 "voice_trace": {
                     "utterances": len(self.utterances),
+                    "frames": len(self.frame_replay),
                     "events": len(events),
                     "routes": sorted(self.routes.keys()),
                 }
@@ -1032,7 +1060,14 @@ class VoiceEnvironment(EnvironmentAdapter):
             utterance = _find_by_id(self.utterances, utterance_id) or (self.utterances[0] if self.utterances else {})
             transcript = str(utterance.get("transcript", ""))
             latency_ms = int(utterance.get("latency_ms", self._next_latency("stt")))
-            record = {"id": utterance.get("id"), "transcript": transcript, "latency_ms": latency_ms}
+            record = {
+                "id": utterance.get("id"),
+                "transcript": transcript,
+                "latency_ms": latency_ms,
+                "confidence": utterance.get("confidence"),
+                "language": utterance.get("language"),
+            }
+            record.update(_voice_noise_payload(self.noise_profile, utterance))
             self.transcript_history.append(record)
             self.state["last_transcript"] = transcript
             return ToolExecutionResult(
@@ -1148,8 +1183,22 @@ class VoiceEnvironment(EnvironmentAdapter):
 
         text = str(arguments.get("text", arguments.get("content", "")))
         latency_ms = int(arguments.get("latency_ms", self._next_latency("tts")))
-        tts_record = {"text": text, "latency_ms": latency_ms, "route": self.state.get("current_route", self.initial_route)}
+        duration_ms = arguments.get("duration_ms")
+        start_ms = arguments.get("start_ms")
+        end_ms = arguments.get("end_ms")
+        if duration_ms is None and start_ms is not None and end_ms is not None:
+            duration_ms = max(0, int(end_ms) - int(start_ms))
+        tts_record = {
+            "text": text,
+            "latency_ms": latency_ms,
+            "duration_ms": int(duration_ms) if duration_ms is not None else None,
+            "start_ms": int(start_ms) if start_ms is not None else None,
+            "end_ms": int(end_ms) if end_ms is not None else None,
+            "route": self.state.get("current_route", self.initial_route),
+        }
+        tts_record.update(_voice_noise_payload(self.noise_profile, {}))
         self.tts_history.append(tts_record)
+        self.timeline.append(_voice_timeline_entry("tts", tts_record, speaker="agent"))
         self.state.update({"speaking": True, "last_tts_text": text, "last_tts_latency_ms": latency_ms})
         return ToolExecutionResult(
             tool_call_id=call_id,
@@ -1193,7 +1242,11 @@ class VoiceEnvironment(EnvironmentAdapter):
             "sample_rate_hz": self.sample_rate_hz,
             "utterances": copy.deepcopy(self.utterances),
             "event_replay": copy.deepcopy(self.event_replay),
+            "frame_replay": copy.deepcopy(self.frame_replay),
+            "timeline": copy.deepcopy(self.timeline),
+            "overlap_events": copy.deepcopy(self.overlap_events),
             "latency_profile": copy.deepcopy(self.latency_profile),
+            "noise_profile": copy.deepcopy(self.noise_profile),
             "interruption_policy": copy.deepcopy(self.interruption_policy),
             "routes": copy.deepcopy(self.routes),
             "route_history": copy.deepcopy(self.route_history),
@@ -1211,7 +1264,11 @@ class VoiceEnvironment(EnvironmentAdapter):
             "route_history": copy.deepcopy(self.route_history),
             "transcript_history": copy.deepcopy(self.transcript_history),
             "tts_history": copy.deepcopy(self.tts_history),
+            "frame_replay": copy.deepcopy(self.frame_replay),
+            "timeline": copy.deepcopy(self.timeline),
+            "overlap_events": copy.deepcopy(self.overlap_events),
             "latency_profile": copy.deepcopy(self.latency_profile),
+            "noise_profile": copy.deepcopy(self.noise_profile),
             "interruption_policy": copy.deepcopy(self.interruption_policy),
         }
 
@@ -3392,6 +3449,169 @@ def _normalize_voice_event(item: Mapping[str, Any]) -> Dict[str, Any]:
         "timestamp_ms": event.get("timestamp_ms"),
         "metadata": dict(event.get("metadata", {})),
     }
+
+
+def _normalize_voice_frame(item: Mapping[str, Any]) -> Dict[str, Any]:
+    frame = dict(item)
+    payload = dict(frame.get("payload", frame.get("data", {})) or {})
+    frame_type = str(
+        frame.get("frame_type")
+        or frame.get("type")
+        or frame.get("name")
+        or frame.get("event")
+        or "VoiceFrame"
+    )
+    name = str(frame.get("name") or frame.get("event") or frame_type)
+    for key in (
+        "text",
+        "transcript",
+        "speaker",
+        "speaker_id",
+        "language",
+        "confidence",
+        "latency_ms",
+        "duration_ms",
+        "start_ms",
+        "end_ms",
+        "overlap_ms",
+        "noise_db",
+        "sample_rate",
+        "sample_rate_hz",
+        "num_channels",
+        "num_frames",
+    ):
+        if key in frame and key not in payload:
+            payload[key] = frame[key]
+    return {
+        "id": str(frame.get("id") or frame.get("frame_id") or name),
+        "frame_type": frame_type,
+        "name": name,
+        "category": str(frame.get("category") or _voice_frame_category(frame_type)),
+        "direction": str(frame.get("direction") or frame.get("frame_direction") or ""),
+        "processor": frame.get("processor"),
+        "timestamp_ms": frame.get("timestamp_ms", frame.get("time_ms")),
+        "start_ms": frame.get("start_ms", payload.get("start_ms")),
+        "end_ms": frame.get("end_ms", payload.get("end_ms")),
+        "duration_ms": frame.get("duration_ms", payload.get("duration_ms")),
+        "speaker": frame.get("speaker", payload.get("speaker", payload.get("speaker_id"))),
+        "payload": payload,
+        "metadata": dict(frame.get("metadata", {})),
+    }
+
+
+def _voice_events_from_frame(
+    frame: Mapping[str, Any],
+    *,
+    noise_profile: Mapping[str, Any],
+) -> List[SimulationEvent]:
+    payload = {
+        **copy.deepcopy(dict(frame.get("payload", {}))),
+        "id": frame.get("id"),
+        "frame_type": frame.get("frame_type"),
+        "category": frame.get("category"),
+        "direction": frame.get("direction"),
+        "processor": frame.get("processor"),
+        "timestamp_ms": frame.get("timestamp_ms"),
+    }
+    payload.update(_voice_noise_payload(noise_profile, frame))
+    frame_type = str(frame.get("frame_type") or frame.get("name") or "").lower()
+    name = str(frame.get("name") or frame.get("frame_type") or "voice_frame")
+    events = [
+        SimulationEvent(
+            type="voice_frame",
+            name=name,
+            payload=copy.deepcopy(payload),
+            metadata={"frame_type": frame.get("frame_type"), **copy.deepcopy(dict(frame.get("metadata", {})))},
+            timestamp_ms=frame.get("timestamp_ms"),
+        )
+    ]
+    if "userstartedspeaking" in frame_type or "vad_start" in frame_type:
+        events.append(SimulationEvent(type="voice", name="vad_start", payload=copy.deepcopy(payload), timestamp_ms=frame.get("timestamp_ms")))
+    if "userstoppedspeaking" in frame_type or "vad_end" in frame_type:
+        events.append(SimulationEvent(type="voice", name="vad_end", payload=copy.deepcopy(payload), timestamp_ms=frame.get("timestamp_ms")))
+    if "transcription" in frame_type or "userinputtranscribed" in frame_type:
+        events.append(SimulationEvent(type="voice", name="stt_result", payload=copy.deepcopy(payload), timestamp_ms=frame.get("timestamp_ms")))
+    if "ttsstarted" in frame_type or "botstartedspeaking" in frame_type:
+        events.append(SimulationEvent(type="voice", name="tts_start", payload=copy.deepcopy(payload), timestamp_ms=frame.get("timestamp_ms")))
+    if "ttsaudio" in frame_type or "outputaudio" in frame_type:
+        events.append(SimulationEvent(type="voice", name="tts_output", payload=copy.deepcopy(payload), timestamp_ms=frame.get("timestamp_ms")))
+    if "interruption" in frame_type or "agent_false_interruption" in frame_type:
+        events.append(SimulationEvent(type="voice", name="barge_in", payload=copy.deepcopy(payload), timestamp_ms=frame.get("timestamp_ms")))
+    if "error" in frame_type:
+        events.append(SimulationEvent(type="voice", name="voice_error", payload=copy.deepcopy(payload), timestamp_ms=frame.get("timestamp_ms")))
+    return events
+
+
+def _voice_frame_category(frame_type: str) -> str:
+    lowered = frame_type.lower()
+    if any(token in lowered for token in ("system", "interruption", "userstartedspeaking", "userstoppedspeaking", "error")):
+        return "system"
+    if "control" in lowered or lowered.endswith("frame") and "end" in lowered:
+        return "control"
+    return "data"
+
+
+def _voice_frame_is_overlap(frame: Mapping[str, Any]) -> bool:
+    text = _stringify_dict(frame).lower()
+    return "overlap" in text or "agent_false_interruption" in text
+
+
+def _voice_overlap_payload(frame: Mapping[str, Any]) -> Dict[str, Any]:
+    payload = dict(frame.get("payload", {}))
+    overlap_ms = payload.get("overlap_ms", frame.get("overlap_ms", frame.get("duration_ms")))
+    return {
+        "id": frame.get("id"),
+        "frame_type": frame.get("frame_type"),
+        "overlap_ms": int(overlap_ms) if overlap_ms is not None else None,
+        "speaker": frame.get("speaker", payload.get("speaker")),
+        "timestamp_ms": frame.get("timestamp_ms"),
+        "metadata": copy.deepcopy(dict(frame.get("metadata", {}))),
+    }
+
+
+def _voice_timeline_entry(kind: str, item: Mapping[str, Any], *, speaker: Any = None) -> Dict[str, Any]:
+    payload = dict(item.get("payload", {})) if isinstance(item.get("payload"), Mapping) else {}
+    start_ms = item.get("start_ms", payload.get("start_ms", item.get("timestamp_ms")))
+    end_ms = item.get("end_ms", payload.get("end_ms"))
+    duration_ms = item.get("duration_ms", payload.get("duration_ms"))
+    if end_ms is None and start_ms is not None and duration_ms is not None:
+        end_ms = int(start_ms) + int(duration_ms)
+    return {
+        "kind": kind,
+        "id": item.get("id"),
+        "name": item.get("name", item.get("frame_type")),
+        "speaker": speaker,
+        "start_ms": start_ms,
+        "end_ms": end_ms,
+        "duration_ms": duration_ms,
+    }
+
+
+def _voice_noise_payload(
+    noise_profile: Mapping[str, Any],
+    item: Mapping[str, Any],
+) -> Dict[str, Any]:
+    payload = dict(item.get("payload", {})) if isinstance(item.get("payload"), Mapping) else {}
+    noise_db = item.get("noise_db", payload.get("noise_db", noise_profile.get("noise_db")))
+    processed_noise_db = item.get(
+        "processed_noise_db",
+        payload.get("processed_noise_db", noise_profile.get("processed_noise_db", noise_db)),
+    )
+    result: Dict[str, Any] = {}
+    if noise_db is not None:
+        result["noise_db"] = noise_db
+    if processed_noise_db is not None:
+        result["processed_noise_db"] = processed_noise_db
+    if noise_profile.get("noise_cancellation") is not None:
+        result["noise_cancellation"] = noise_profile.get("noise_cancellation")
+    return result
+
+
+def _stringify_dict(value: Any) -> str:
+    try:
+        return json.dumps(value, default=str)
+    except Exception:
+        return str(value)
 
 
 def _normalize_latency_profile(

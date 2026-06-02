@@ -869,6 +869,128 @@ async def test_voice_environment_records_replay_latency_interruptions_and_routes
 
 
 @pytest.mark.asyncio
+async def test_voice_environment_replays_frames_noise_and_overlap_timeline():
+    async def agent(input):
+        return AgentResponse(
+            content="I will route, transcribe, answer, and stop on interruption.",
+            tool_calls=[
+                {
+                    "id": "route",
+                    "name": "route_call",
+                    "arguments": {"route": "billing", "reason": "billing intent"},
+                },
+                {"id": "stt", "name": "transcribe_audio", "arguments": {"id": "caller_1"}},
+                {
+                    "id": "tts",
+                    "name": "speak",
+                    "arguments": {
+                        "text": "I can help with billing for order 123.",
+                        "latency_ms": 420,
+                        "start_ms": 2100,
+                        "duration_ms": 900,
+                    },
+                },
+                {"id": "stop", "name": "stop_speaking", "arguments": {}},
+                {"id": "status", "name": "voice_status", "arguments": {}},
+            ],
+        )
+
+    report = await LocalTextEngine().run(
+        scenario=_scenario(),
+        agent_callback=agent,
+        environment=VoiceEnvironment(
+            [
+                {
+                    "id": "caller_1",
+                    "speaker": "user",
+                    "transcript": "Billing issue for order 123.",
+                    "audio_uri": "file:///fixtures/caller.wav",
+                    "confidence": 0.94,
+                    "language": "en",
+                    "start_ms": 0,
+                    "end_ms": 1700,
+                    "barge_in": True,
+                }
+            ],
+            sample_rate_hz=24000,
+            latency_profile={"stt": [160], "tts": [420]},
+            noise_profile={
+                "noise_db": 62,
+                "processed_noise_db": 24,
+                "noise_cancellation": True,
+            },
+            frame_replay=[
+                {
+                    "id": "input_audio_1",
+                    "frame_type": "InputAudioRawFrame",
+                    "timestamp_ms": 0,
+                    "sample_rate": 24000,
+                    "num_channels": 1,
+                    "num_frames": 480,
+                },
+                {"id": "user_start", "frame_type": "UserStartedSpeakingFrame", "timestamp_ms": 20},
+                {
+                    "id": "transcript_final",
+                    "frame_type": "TranscriptionFrame",
+                    "timestamp_ms": 420,
+                    "text": "Billing issue for order 123.",
+                    "confidence": 0.94,
+                },
+                {
+                    "id": "tts_started",
+                    "frame_type": "TTSStartedFrame",
+                    "timestamp_ms": 2100,
+                },
+                {
+                    "id": "tts_audio",
+                    "frame_type": "TTSAudioRawFrame",
+                    "timestamp_ms": 2300,
+                    "duration_ms": 500,
+                    "sample_rate": 24000,
+                    "num_channels": 1,
+                },
+                {
+                    "id": "overlap",
+                    "frame_type": "OverlappingSpeechFrame",
+                    "timestamp_ms": 2400,
+                    "overlap_ms": 220,
+                    "speaker": "user",
+                },
+                {
+                    "id": "interrupt",
+                    "frame_type": "InterruptionFrame",
+                    "timestamp_ms": 2420,
+                },
+            ],
+            routes={"default": {"agent": "support"}, "billing": {"agent": "billing"}},
+            initial_route="default",
+            allow_interruptions=True,
+        ),
+        max_turns=1,
+        min_turns=1,
+        modality="voice",
+    )
+
+    result = report.results[0]
+    voice_state = result.metadata["environment_state"]["voice"]
+    voice_traces = [
+        artifact.data
+        for artifact in result.artifacts
+        if artifact.type == "trace" and artifact.metadata.get("kind") == "voice_trace"
+    ]
+
+    assert voice_state["noise_profile"]["processed_noise_db"] == 24
+    assert voice_state["frame_replay"][0]["frame_type"] == "InputAudioRawFrame"
+    assert voice_state["overlap_events"][-1]["overlap_ms"] == 220
+    assert voice_state["tts_history"][-1]["duration_ms"] == 900
+    assert voice_state["transcript_history"][-1]["confidence"] == 0.94
+    assert any(event.type == "voice_frame" and event.name == "TranscriptionFrame" for event in result.events)
+    assert any(event.name == "overlapping_speech" for event in result.events)
+    assert voice_traces[-1]["frame_replay"][-1]["frame_type"] == "InterruptionFrame"
+    assert voice_traces[-1]["timeline"]
+
+
+@pytest.mark.asyncio
 async def test_adversarial_environment_pack_exposes_hostile_world_surfaces():
     async def agent(input):
         return AgentResponse(
