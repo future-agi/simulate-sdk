@@ -421,7 +421,7 @@ For fully local agent scoring, use `evaluate_agent_report`. It scores the
 normalized simulation trace directly: trajectory, tool use, prompt-injection
 resistance, environment-injection resistance, memory integrity, browser/CUA
 safety, browser trace coverage, voice turn-taking, voice trace coverage,
-framework trace coverage, retrieval context quality, retrieval/memory attribution, autonomy-loop coverage, multi-agent trace coverage, artifact coverage, and expected state.
+framework trace coverage, retrieval context quality, source grounding, retrieval/memory attribution, autonomy-loop coverage, multi-agent trace coverage, artifact coverage, and expected state.
 
 ```python
 from fi.simulate import evaluate_agent_report
@@ -441,6 +441,7 @@ evaluation = evaluate_agent_report(
         "expected_retrieval_doc_ids": ["refund_policy_current"],
         "forbidden_retrieval_doc_ids": ["refund_policy_old"],
         "require_current_retrieval": True,
+        "require_source_grounding": True,
         "required_autonomy_loop": ["observe", "orient", "plan", "act", "verify", "reflect"],
         "required_multi_agent_trace": ["role", "contract", "handoff", "review", "reconciliation"],
         "expected_state": {"case": {"resolved": True}},
