@@ -34,6 +34,7 @@ from fi.simulate import (
     load_autogen_groupchat_transcript,
     load_crewai_event_log,
     load_openai_agents_trace,
+    load_openai_responses_trace,
     load_langchain_event_stream,
     load_langgraph_event_stream,
     normalize_orchestration_trace_export,
@@ -41,6 +42,7 @@ from fi.simulate import (
     normalize_adversarial_attack_pack,
     normalize_framework_trace_events,
     normalize_framework_trace_export,
+    normalize_openai_responses_trace,
     normalize_browser_mutation_pack,
     normalize_browser_trace_export,
     normalize_voice_export,
@@ -2257,6 +2259,86 @@ def test_multi_agent_framework_transcript_loaders_preserve_speakers_handoffs_and
     assert openai_state["framework"] == "openai_agents"
     assert openai_state["events"][0]["handoff_from"] == "triage_agent"
     assert openai_state["events"][0]["handoff_to"] == "refund_agent"
+
+
+def test_openai_responses_trace_loader_preserves_tool_calls_outputs_and_stream_events():
+    response = {
+        "id": "resp_123",
+        "object": "response",
+        "model": "gpt-4o-mini",
+        "status": "completed",
+        "usage": {"input_tokens": 18, "output_tokens": 7, "total_tokens": 25},
+        "output": [
+            {
+                "id": "fc_1",
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "read_document",
+                "arguments": "{\"id\":\"refund_policy_current\"}",
+                "status": "completed",
+            },
+            {
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": "I will read the current refund policy.",
+                    }
+                ],
+            },
+        ],
+    }
+    tool_output = {
+        "type": "function_call_output",
+        "call_id": "call_1",
+        "output": "{\"title\":\"Refund Policy v2\",\"current\":true}",
+    }
+    stream_event = {
+        "type": "response.function_call_arguments.done",
+        "response_id": "resp_stream",
+        "output_index": 0,
+        "item": {
+            "id": "fc_stream",
+            "type": "function_call",
+            "call_id": "call_stream",
+            "name": "read_document",
+            "arguments": "{\"id\":\"refund_policy_current\"}",
+        },
+    }
+
+    normalized = normalize_openai_responses_trace([response, tool_output, stream_event])
+    environment = load_openai_responses_trace([response, tool_output, stream_event])
+    trace_state = environment.reset().state["framework_trace"]
+    records = trace_state["events"]
+    signals = {signal for record in records for signal in record["signals"]}
+
+    tool_record = next(
+        record
+        for record in records
+        if record["type"] == "function_call" and record["tool_name"] == "read_document"
+    )
+    output_record = next(
+        record
+        for record in records
+        if record["type"] == "function_call_output" and record["tool_name"] == "read_document"
+    )
+    stream_record = next(
+        record
+        for record in records
+        if record["attributes"].get("stream_event_type") == "response.function_call_arguments.done"
+    )
+
+    assert trace_state["framework"] == "openai_responses"
+    assert trace_state["metadata"]["responses_trace"]["record_count"] == 5
+    assert {"framework", "model", "tool", "cost", "span"} <= signals
+    assert tool_record["attributes"]["arguments"] == {"id": "refund_policy_current"}
+    assert output_record["output"] == {"title": "Refund Policy v2", "current": True}
+    assert output_record["attributes"]["call_id"] == "call_1"
+    assert stream_record["attributes"]["arguments"] == {"id": "refund_policy_current"}
+    assert any(record.get("message_text") == "I will read the current refund policy." for record in records)
+    assert any(record["tool_name"] == "read_document" for record in normalized)
 
 
 def test_normalize_framework_trace_export_flattens_otlp_resource_spans():

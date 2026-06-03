@@ -3557,6 +3557,7 @@ class RetrievalMemoryEnvironment(EnvironmentAdapter):
         success: bool = True,
         error: Optional[str] = None,
     ) -> ToolExecutionResult:
+        state_updates = {"retrieval_memory": self._state_payload()}
         return ToolExecutionResult(
             tool_call_id=call_id,
             tool_name=tool_name,
@@ -3564,13 +3565,24 @@ class RetrievalMemoryEnvironment(EnvironmentAdapter):
             result=result,
             success=success,
             error=error,
-            state_updates={"retrieval_memory": self._state_payload()},
+            state_updates=state_updates,
             artifacts=[self._trace_artifact()],
             events=[
                 SimulationEvent(
                     type="retrieval_memory",
                     name=event_name,
                     payload=result if isinstance(result, dict) else {"result": result},
+                ),
+                SimulationEvent(
+                    type="tool_execution",
+                    name=tool_name,
+                    payload={
+                        "tool_name": tool_name,
+                        "result": copy.deepcopy(result),
+                        "success": success,
+                        "error": error,
+                        "state_updates": copy.deepcopy(state_updates),
+                    },
                 )
             ],
         )
@@ -4530,6 +4542,53 @@ def load_openai_agents_trace(
         timeout=timeout,
         state=state,
         metadata=metadata,
+    )
+
+
+def normalize_openai_responses_trace(
+    source: str | os.PathLike[str] | Mapping[str, Any] | Iterable[Any],
+    *,
+    headers: Optional[Mapping[str, str]] = None,
+    timeout: float = 30.0,
+) -> List[Dict[str, Any]]:
+    """Normalize OpenAI Responses API output/tool records into trace events."""
+
+    records, _ = _load_openai_responses_trace_records(
+        source,
+        headers=headers,
+        timeout=timeout,
+    )
+    return normalize_framework_trace_events(
+        "openai_responses",
+        records,
+        category="event",
+    )
+
+
+def load_openai_responses_trace(
+    source: str | os.PathLike[str] | Mapping[str, Any] | Iterable[Any],
+    *,
+    headers: Optional[Mapping[str, str]] = None,
+    timeout: float = 30.0,
+    state: Optional[Mapping[str, Any]] = None,
+    metadata: Optional[Mapping[str, Any]] = None,
+) -> FrameworkTraceEnvironment:
+    """Load OpenAI Responses API responses/output items into a trace environment."""
+
+    records, source_metadata = _load_openai_responses_trace_records(
+        source,
+        headers=headers,
+        timeout=timeout,
+    )
+    merged_metadata = copy.deepcopy(dict(metadata or {}))
+    merged_metadata.setdefault("responses_trace", {}).update(
+        {"framework": "openai_responses", **source_metadata}
+    )
+    return FrameworkTraceEnvironment(
+        framework="openai_responses",
+        events=records,
+        state=state,
+        metadata=merged_metadata,
     )
 
 
@@ -6367,6 +6426,432 @@ def _load_framework_event_stream_records(
         loaded = source
         metadata["source"] = "inline"
     return _framework_trace_export_records(loaded), metadata
+
+
+def _load_openai_responses_trace_records(
+    source: str | os.PathLike[str] | Mapping[str, Any] | Iterable[Any],
+    *,
+    headers: Optional[Mapping[str, str]] = None,
+    timeout: float = 30.0,
+) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    metadata: Dict[str, Any] = {}
+    if isinstance(source, (str, os.PathLike)):
+        source_text = os.fspath(source)
+        stripped = source_text.strip() if isinstance(source, str) else ""
+        if stripped.startswith(("{", "[")) or "\n" in stripped:
+            loaded = _parse_framework_trace_export_text(stripped)
+            metadata["source"] = "inline_json"
+        else:
+            loaded = _load_framework_trace_export_source(
+                source,
+                headers=headers,
+                timeout=timeout,
+            )
+            metadata["source"] = _framework_trace_source_label(source)
+    else:
+        loaded = source
+        metadata["source"] = "inline"
+
+    records = _openai_responses_trace_records(loaded)
+    metadata["record_count"] = len(records)
+    response_ids = sorted({str(record.get("response_id")) for record in records if record.get("response_id")})
+    if response_ids:
+        metadata["response_ids"] = response_ids
+    return records, metadata
+
+
+def _openai_responses_trace_records(source: Any) -> List[Dict[str, Any]]:
+    records: List[Dict[str, Any]] = []
+    call_names: Dict[str, str] = {}
+
+    def walk(value: Any, context: Mapping[str, Any]) -> None:
+        value = _openai_plain_value(value)
+        if value is None:
+            return
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return
+            if stripped.startswith(("{", "[")):
+                try:
+                    walk(json.loads(stripped), context)
+                    return
+                except json.JSONDecodeError:
+                    pass
+            records.append(_openai_responses_message_record({"text": value}, context))
+            return
+        if isinstance(value, Mapping):
+            raw = copy.deepcopy(dict(value))
+            if _looks_like_openai_responses_response(raw):
+                response_context = _openai_response_context(raw, context)
+                output_text = _openai_response_text(raw)
+                records.append(
+                    {
+                        "id": response_context.get("response_id") or raw.get("id") or "response",
+                        "name": "response.completed",
+                        "type": raw.get("object") or raw.get("type") or "response",
+                        "framework": "openai_responses",
+                        "response_id": response_context.get("response_id"),
+                        "trace_id": response_context.get("response_id"),
+                        "model": response_context.get("model"),
+                        "usage": _openai_response_usage(raw),
+                        "status": raw.get("status"),
+                        "output": output_text,
+                        "message_text": output_text,
+                        "payload": {
+                            key: value
+                            for key, value in {
+                                "response_id": response_context.get("response_id"),
+                                "model": response_context.get("model"),
+                                "status": raw.get("status"),
+                                "usage": _openai_response_usage(raw),
+                            }.items()
+                            if value not in (None, "", {}, [])
+                        },
+                    }
+                )
+                for item in _as_iterable(raw.get("output")):
+                    walk(item, response_context)
+                return
+
+            event_type = str(raw.get("type") or raw.get("event") or "")
+            if event_type in {"response.output_item.added", "response.function_call_arguments.done"}:
+                event_context = _openai_response_context(raw, context)
+                event_context["output_index"] = raw.get("output_index")
+                event_context["stream_event_type"] = event_type
+                walk(raw.get("item"), event_context)
+                return
+            if event_type == "response.function_call_arguments.delta":
+                records.append(_openai_responses_argument_delta_record(raw, context))
+                return
+            if _looks_like_openai_responses_output_item(raw):
+                item_record = _openai_responses_output_item_record(raw, context, call_names)
+                if item_record:
+                    records.append(item_record)
+                return
+
+            nested_keys = ("responses", "output", "items", "events", "records", "input", "data", "result", "payload")
+            nested_found = False
+            for key in nested_keys:
+                nested = raw.get(key)
+                if isinstance(nested, (Mapping, list, tuple)):
+                    nested_found = True
+                    walk(nested, _openai_response_context(raw, context))
+            if nested_found:
+                return
+            records.append(_openai_responses_message_record(raw, context))
+            return
+        if isinstance(value, Iterable):
+            for item in value:
+                walk(item, context)
+            return
+        records.append(_openai_responses_message_record({"text": str(value)}, context))
+
+    walk(source, {})
+    return [record for record in records if record]
+
+
+def _openai_plain_value(value: Any) -> Any:
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    if isinstance(value, (str, Mapping)):
+        return value
+    if hasattr(value, "model_dump"):
+        return value.model_dump()
+    if hasattr(value, "dict"):
+        return value.dict()
+    if isinstance(value, Iterable):
+        return value
+    if hasattr(value, "__dict__"):
+        return vars(value)
+    return value
+
+
+def _looks_like_openai_responses_response(value: Mapping[str, Any]) -> bool:
+    if "output" not in value:
+        return False
+    object_type = str(value.get("object") or value.get("type") or "").lower()
+    if object_type in {"response", "responses.response"}:
+        return True
+    response_id = str(value.get("id") or "")
+    return response_id.startswith("resp_") or bool(value.get("model"))
+
+
+def _looks_like_openai_responses_output_item(value: Mapping[str, Any]) -> bool:
+    item_type = str(value.get("type") or "").lower()
+    if item_type in {"message", "function_call", "function_call_output"}:
+        return True
+    if value.get("call_id") and (value.get("name") or value.get("output") is not None):
+        return True
+    if "content" in value and (value.get("role") or value.get("id")):
+        return True
+    return False
+
+
+def _openai_response_context(
+    raw: Mapping[str, Any],
+    parent: Mapping[str, Any],
+) -> Dict[str, Any]:
+    context = copy.deepcopy(dict(parent or {}))
+    for source_key, target_key in (
+        ("response_id", "response_id"),
+        ("id", "response_id"),
+        ("model", "model"),
+        ("created_at", "created_at"),
+        ("created", "created_at"),
+        ("output_index", "output_index"),
+        ("sequence", "sequence"),
+        ("index", "sequence"),
+        ("stream_event_type", "stream_event_type"),
+    ):
+        value = raw.get(source_key)
+        if value not in (None, "", {}, []):
+            context.setdefault(target_key, value)
+    return context
+
+
+def _openai_responses_output_item_record(
+    raw: Mapping[str, Any],
+    context: Mapping[str, Any],
+    call_names: Dict[str, str],
+) -> Dict[str, Any]:
+    item_type = str(raw.get("type") or "").lower()
+    if item_type == "function_call" or (raw.get("call_id") and raw.get("name")):
+        return _openai_responses_function_call_record(raw, context, call_names)
+    if item_type == "function_call_output" or (raw.get("call_id") and raw.get("output") is not None):
+        return _openai_responses_function_output_record(raw, context, call_names)
+    return _openai_responses_message_record(raw, context)
+
+
+def _openai_responses_function_call_record(
+    raw: Mapping[str, Any],
+    context: Mapping[str, Any],
+    call_names: Dict[str, str],
+) -> Dict[str, Any]:
+    tool_name = str(raw.get("name") or raw.get("tool_name") or "")
+    call_id = str(raw.get("call_id") or raw.get("id") or "")
+    if call_id and tool_name:
+        call_names[call_id] = tool_name
+    arguments = _openai_jsonish(raw.get("arguments"), object_default=True)
+    payload = _openai_response_context_payload(context)
+    payload.update(
+        {
+            key: value
+            for key, value in {
+                "tool_name": tool_name,
+                "call_id": call_id,
+                "arguments": arguments,
+                "raw_arguments": raw.get("arguments"),
+                "status": raw.get("status"),
+                "stream_event_type": context.get("stream_event_type"),
+                "output_index": context.get("output_index"),
+            }.items()
+            if value not in (None, "", {}, [])
+        }
+    )
+    return {
+        "id": raw.get("id") or call_id or f"{context.get('response_id', 'response')}:function_call",
+        "name": f"function_call {tool_name}".strip(),
+        "type": "function_call",
+        "framework": "openai_responses",
+        "response_id": context.get("response_id"),
+        "trace_id": context.get("response_id"),
+        "parent_id": context.get("response_id"),
+        "tool_name": tool_name,
+        "input": arguments,
+        "model": context.get("model"),
+        "status": raw.get("status"),
+        "payload": payload,
+    }
+
+
+def _openai_responses_function_output_record(
+    raw: Mapping[str, Any],
+    context: Mapping[str, Any],
+    call_names: Mapping[str, str],
+) -> Dict[str, Any]:
+    call_id = str(raw.get("call_id") or raw.get("id") or "")
+    tool_name = str(raw.get("name") or raw.get("tool_name") or call_names.get(call_id, ""))
+    output = _openai_jsonish(raw.get("output"), object_default=False)
+    payload = _openai_response_context_payload(context)
+    payload.update(
+        {
+            key: value
+            for key, value in {
+                "tool_name": tool_name,
+                "call_id": call_id,
+                "output": output,
+                "status": raw.get("status"),
+                "stream_event_type": context.get("stream_event_type"),
+                "output_index": context.get("output_index"),
+            }.items()
+            if value not in (None, "", {}, [])
+        }
+    )
+    record_id = (
+        raw.get("id")
+        or (f"{call_id}:output" if call_id else f"{context.get('response_id', 'response')}:function_call_output")
+    )
+    return {
+        "id": record_id,
+        "name": f"function_call_output {tool_name}".strip(),
+        "type": "function_call_output",
+        "framework": "openai_responses",
+        "response_id": context.get("response_id"),
+        "trace_id": context.get("response_id"),
+        "parent_id": context.get("response_id"),
+        "tool_name": tool_name,
+        "output": output,
+        "model": context.get("model"),
+        "status": raw.get("status"),
+        "payload": payload,
+    }
+
+
+def _openai_responses_message_record(
+    raw: Mapping[str, Any],
+    context: Mapping[str, Any],
+) -> Dict[str, Any]:
+    text = _openai_response_text(raw)
+    role = raw.get("role")
+    payload = _openai_response_context_payload(context)
+    payload.update(
+        {
+            key: value
+            for key, value in {
+                "role": role,
+                "message_text": text,
+                "status": raw.get("status"),
+                "output_index": context.get("output_index"),
+            }.items()
+            if value not in (None, "", {}, [])
+        }
+    )
+    return {
+        "id": raw.get("id") or f"{context.get('response_id', 'response')}:message",
+        "name": f"message {role or 'assistant'}",
+        "type": raw.get("type") or "message",
+        "framework": "openai_responses",
+        "response_id": context.get("response_id"),
+        "trace_id": context.get("response_id"),
+        "parent_id": context.get("response_id"),
+        "model": context.get("model"),
+        "message_text": text,
+        "output": text,
+        "status": raw.get("status"),
+        "payload": payload,
+    }
+
+
+def _openai_responses_argument_delta_record(
+    raw: Mapping[str, Any],
+    context: Mapping[str, Any],
+) -> Dict[str, Any]:
+    event_context = _openai_response_context(raw, context)
+    payload = _openai_response_context_payload(event_context)
+    payload.update(
+        {
+            key: value
+            for key, value in {
+                "item_id": raw.get("item_id"),
+                "delta": raw.get("delta"),
+                "output_index": raw.get("output_index"),
+            }.items()
+            if value not in (None, "", {}, [])
+        }
+    )
+    return {
+        "id": raw.get("item_id") or f"{event_context.get('response_id', 'response')}:arguments_delta",
+        "name": "response.function_call_arguments.delta",
+        "type": "function_call_arguments_delta",
+        "framework": "openai_responses",
+        "response_id": event_context.get("response_id"),
+        "trace_id": event_context.get("response_id"),
+        "parent_id": event_context.get("response_id"),
+        "message_text": str(raw.get("delta") or ""),
+        "payload": payload,
+    }
+
+
+def _openai_response_context_payload(context: Mapping[str, Any]) -> Dict[str, Any]:
+    return {
+        key: copy.deepcopy(value)
+        for key, value in {
+            "response_id": context.get("response_id"),
+            "model": context.get("model"),
+            "created_at": context.get("created_at"),
+            "sequence": context.get("sequence"),
+            "stream_event_type": context.get("stream_event_type"),
+        }.items()
+        if value not in (None, "", {}, [])
+    }
+
+
+def _openai_response_text(raw: Mapping[str, Any]) -> str:
+    output_text = raw.get("output_text")
+    if isinstance(output_text, str) and output_text:
+        return output_text
+    for key in ("text", "message_text", "delta"):
+        value = raw.get(key)
+        if isinstance(value, str) and value:
+            return value
+    content = raw.get("content")
+    if isinstance(content, str):
+        return content
+    chunks: List[str] = []
+    for item in _as_iterable(content):
+        item_dict = _coerce_plain_dict(item)
+        if not item_dict:
+            if isinstance(item, str):
+                chunks.append(item)
+            continue
+        for key in ("text", "content", "message_text", "delta"):
+            value = item_dict.get(key)
+            if isinstance(value, str) and value:
+                chunks.append(value)
+                break
+    if chunks:
+        return "".join(chunks)
+
+    output = raw.get("output")
+    for item in _as_iterable(output):
+        item_dict = _coerce_plain_dict(item)
+        if item_dict.get("type") == "message":
+            text = _openai_response_text(item_dict)
+            if text:
+                chunks.append(text)
+    return "\n".join(chunks)
+
+
+def _openai_response_usage(raw: Mapping[str, Any]) -> Any:
+    usage = raw.get("usage")
+    if usage is None:
+        return None
+    if hasattr(usage, "model_dump"):
+        return usage.model_dump()
+    if hasattr(usage, "dict"):
+        return usage.dict()
+    if isinstance(usage, Mapping):
+        return copy.deepcopy(dict(usage))
+    return usage
+
+
+def _openai_jsonish(value: Any, *, object_default: bool) -> Any:
+    if value in (None, ""):
+        return {} if object_default else value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return {"value": value} if object_default else value
+        if object_default and not isinstance(parsed, Mapping):
+            return {"value": parsed}
+        return parsed
+    if isinstance(value, Mapping):
+        return copy.deepcopy(dict(value))
+    if isinstance(value, (list, tuple)):
+        return copy.deepcopy(list(value))
+    return {"value": value} if object_default else value
 
 
 def _flatten_otlp_resource_spans(export: Mapping[str, Any]) -> List[Dict[str, Any]]:
