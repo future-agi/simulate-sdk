@@ -1888,6 +1888,136 @@ async def test_orchestration_trace_environment_replays_graph_runtime_evidence():
 
 
 @pytest.mark.asyncio
+async def test_orchestration_trace_environment_replays_multi_agent_control_loop():
+    async def agent(input):
+        return AgentResponse(
+            content="The multi-agent orchestration spawned specialists, delegated work, aggregated consensus, and stopped.",
+            tool_calls=[
+                {"id": "status", "name": "orchestration_trace_status", "arguments": {}},
+                {"id": "spawn", "name": "list_orchestration_steps", "arguments": {"signal": "spawn"}},
+                {
+                    "id": "delegate",
+                    "name": "inspect_orchestration_edge",
+                    "arguments": {"from": "coordinator", "to": "policy_agent"},
+                },
+            ],
+        )
+
+    records = [
+        {
+            "id": "spawn_policy",
+            "name": "spawn policy_agent",
+            "node": "coordinator",
+            "route_from": "coordinator",
+            "route_to": "policy_agent",
+            "type": "spawn",
+            "latency_ms": 10,
+        },
+        {
+            "id": "delegate_policy",
+            "name": "delegate refund policy review",
+            "node": "coordinator",
+            "delegator": "coordinator",
+            "delegate_to": "policy_agent",
+            "task": "review refund policy",
+            "latency_ms": 12,
+        },
+        {
+            "id": "delegate_retrieval",
+            "name": "delegate evidence retrieval",
+            "node": "coordinator",
+            "delegator": "coordinator",
+            "delegate_to": "retrieval_agent",
+            "task": "retrieve order evidence",
+            "latency_ms": 12,
+        },
+        {
+            "id": "agent_message",
+            "name": "message retrieval_agent to policy_agent",
+            "node": "retrieval_agent",
+            "sender": "retrieval_agent",
+            "receiver": "policy_agent",
+            "type": "message",
+            "latency_ms": 8,
+        },
+        {
+            "id": "consensus",
+            "name": "aggregate policy and evidence consensus",
+            "node": "coordinator",
+            "type": "aggregate",
+            "status": "success",
+            "usage": {"total_tokens": 64},
+        },
+        {
+            "id": "stop",
+            "name": "terminate orchestration after consensus",
+            "node": "coordinator",
+            "type": "stop",
+            "status": "success",
+            "state": {"decision": {"status": "approved"}},
+        },
+    ]
+
+    report = await LocalTextEngine().run(
+        scenario=_scenario(),
+        agent_callback=agent,
+        environment=OrchestrationTraceEnvironment(
+            framework="autogen",
+            records=records,
+            state={"decision": {"status": "approved"}},
+        ),
+        max_turns=1,
+        min_turns=1,
+    )
+    result = report.results[0]
+    trace_state = result.metadata["environment_state"]["orchestration_trace"]
+
+    assert {"spawn", "delegate", "communicate", "aggregate", "stop"} <= set(trace_state["signals"])
+    assert trace_state["summary"]["agent_count"] >= 3
+    assert trace_state["summary"]["spawn_count"] == 1
+    assert trace_state["summary"]["delegation_count"] == 2
+    assert trace_state["summary"]["communication_count"] == 1
+    assert trace_state["summary"]["aggregation_count"] >= 1
+    assert trace_state["summary"]["stop_count"] == 1
+    assert any(edge["type"] == "delegate" and edge["to"] == "policy_agent" for edge in trace_state["edges"])
+
+    evaluation = evaluate_agent_report(
+        report,
+        config={
+            "required_orchestration_trace": [
+                "agent",
+                "spawn",
+                "delegate",
+                "communicate",
+                "aggregate",
+                "stop",
+                "state",
+            ],
+            "orchestration_trace_quality": {
+                "required_nodes": ["coordinator", "policy_agent", "retrieval_agent"],
+                "required_step_types": ["spawn", "delegate", "communicate", "aggregate", "stop"],
+                "expected_routes": [
+                    {"from": "coordinator", "to": "policy_agent", "type": "delegate"},
+                    {"from": "coordinator", "to": "retrieval_agent", "type": "delegate"},
+                ],
+                "min_agent_count": 3,
+                "min_spawn_count": 1,
+                "min_delegation_count": 2,
+                "min_communication_count": 1,
+                "require_aggregation": True,
+                "require_stop_decision": True,
+                "required_terminal_status": "success",
+                "expected_state": {"decision": {"status": "approved"}},
+            },
+        },
+        threshold=0.85,
+    )
+    metrics = evaluation.summary["metric_averages"]
+    assert metrics["orchestration_trace_coverage"] == 1.0
+    assert metrics["orchestration_flow_quality"] == 1.0
+
+
+@pytest.mark.asyncio
 async def test_streaming_trace_environment_replays_chunks_tools_and_interruptions():
     seen_tools = []
 

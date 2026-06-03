@@ -10386,7 +10386,27 @@ ORCHESTRATION_TRACE_ALIASES = {
     "edge": "route",
     "handoff": "handoff",
     "transfer": "handoff",
-    "delegation": "handoff",
+    "delegation": "delegate",
+    "delegate": "delegate",
+    "delegated": "delegate",
+    "delegation_request": "delegate",
+    "spawn": "spawn",
+    "spawn_agent": "spawn",
+    "create_agent": "spawn",
+    "agent_created": "spawn",
+    "message": "communicate",
+    "communicate": "communicate",
+    "communication": "communicate",
+    "broadcast": "communicate",
+    "aggregate": "aggregate",
+    "aggregation": "aggregate",
+    "synthesize": "aggregate",
+    "consensus": "aggregate",
+    "vote": "aggregate",
+    "stop": "stop",
+    "finish": "stop",
+    "terminate": "stop",
+    "termination": "stop",
     "retry": "retry",
     "attempt": "retry",
     "recover": "recovered",
@@ -10612,7 +10632,20 @@ def _orchestration_route_source(*sources: Mapping[str, Any]) -> str:
     return str(
         _framework_value_from_sources(
             sources,
-            ("route_from", "from", "from_node", "source_node", "source", "old_state", "handoff_from", "parent_node"),
+            (
+                "route_from",
+                "from",
+                "from_node",
+                "source_node",
+                "source",
+                "sender",
+                "delegator",
+                "delegate_from",
+                "from_agent",
+                "old_state",
+                "handoff_from",
+                "parent_node",
+            ),
         )
         or ""
     )
@@ -10622,7 +10655,20 @@ def _orchestration_route_target(*sources: Mapping[str, Any]) -> str:
     return str(
         _framework_value_from_sources(
             sources,
-            ("route_to", "to", "to_node", "target_node", "target", "new_state", "handoff_to", "recipient", "next_node"),
+            (
+                "route_to",
+                "to",
+                "to_node",
+                "target_node",
+                "target",
+                "recipient",
+                "receiver",
+                "delegate_to",
+                "to_agent",
+                "new_state",
+                "handoff_to",
+                "next_node",
+            ),
         )
         or ""
     )
@@ -10787,6 +10833,19 @@ def _orchestration_text_signals(text: str) -> set[str]:
         "edge": "route",
         "handoff": "handoff",
         "transfer": "handoff",
+        "delegate": "delegate",
+        "delegation": "delegate",
+        "spawn": "spawn",
+        "create_agent": "spawn",
+        "message": "communicate",
+        "communicate": "communicate",
+        "broadcast": "communicate",
+        "aggregate": "aggregate",
+        "synthesize": "aggregate",
+        "consensus": "aggregate",
+        "vote": "aggregate",
+        "stop": "stop",
+        "terminate": "stop",
         "retry": "retry",
         "recover": "recovered",
         "error": "error",
@@ -10841,12 +10900,14 @@ def _orchestration_graph_from_steps(
                     )
                 )
         if route_from and route_to:
+            step_signals = set(step.get("signals", []))
+            edge_type = "delegate" if "delegate" in step_signals else "handoff" if "handoff" in step_signals else "route"
             edges.append(
                 _normalize_orchestration_edge(
                     {
                         "from": route_from,
                         "to": route_to,
-                        "type": "handoff" if "handoff" in set(step.get("signals", [])) else "route",
+                        "type": edge_type,
                         "framework": framework,
                         "signals": ["route", *list(step.get("signals", []))],
                     },
@@ -10918,10 +10979,29 @@ def _orchestration_trace_summary(
         for step in steps
         if step.get("cost") not in (None, "", [], {})
     ]
+    signal_counts = {
+        signal: sum(1 for step in steps if signal in set(step.get("signals", [])))
+        for signal in ("spawn", "delegate", "communicate", "aggregate", "stop")
+    }
+    agent_nodes: set[str] = set()
+    for step in steps:
+        signals = set(step.get("signals", []))
+        if not ({"agent", "spawn", "delegate", "communicate"} & signals):
+            continue
+        for key in ("node", "route_from", "route_to"):
+            name = _normalize_orchestration_name(step.get(key))
+            if name:
+                agent_nodes.add(name)
     summary = {
         "node_count": len({_normalize_orchestration_name(step.get("node")) for step in steps if step.get("node")}),
         "edge_count": len(edges),
         "step_count": len(steps),
+        "agent_count": len(agent_nodes),
+        "spawn_count": signal_counts["spawn"],
+        "delegation_count": signal_counts["delegate"] + sum(1 for step in steps if "handoff" in set(step.get("signals", []))),
+        "communication_count": signal_counts["communicate"],
+        "aggregation_count": signal_counts["aggregate"],
+        "stop_count": signal_counts["stop"],
         "failure_count": len(failures),
         "retry_count": len(retry_steps),
         "recovered_failures": len(_dedupe_orchestration_records(recovered)),
@@ -10995,6 +11075,8 @@ def _dedupe_orchestration_records(records: Iterable[Mapping[str, Any]]) -> List[
             existing_signals = set(_as_iterable(existing.get("signals")))
             existing_signals.update(_as_iterable(record_dict.get("signals")))
             existing["signals"] = sorted(str(signal) for signal in existing_signals if signal)
+            if "delegate" in {_normalize_orchestration_trace_key(signal) for signal in existing_signals}:
+                existing["type"] = "delegate"
             for item_key, item_value in record_dict.items():
                 if item_value not in (None, "", [], {}) and existing.get(item_key) in (None, "", [], {}):
                     existing[item_key] = item_value
