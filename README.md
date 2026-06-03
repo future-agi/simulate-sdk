@@ -896,6 +896,7 @@ See [`examples/local_evidence_grounding.py`](examples/local_evidence_grounding.p
 See [`examples/local_structured_artifact_semantics.py`](examples/local_structured_artifact_semantics.py) for parsed receipt/form/table/log-style structured artifacts with semantic field, row, event-sequence, and answer-claim checks.
 See [`examples/local_domain_package_quality.py`](examples/local_domain_package_quality.py) for support ticket, ledger, calendar, and email-thread package fixtures with deterministic workflow-invariant scoring.
 See [`examples/local_domain_package_presets.py`](examples/local_domain_package_presets.py) for claim, contract, CRM account-plan, procurement, clinical-intake, and incident-response package fixtures scored through preset invariants.
+See [`examples/local_domain_package_registry.py`](examples/local_domain_package_registry.py) for a versioned registry that overrides package aliases, required fields, statuses, required documents, and tolerances.
 
 50+ metrics are available out of the box — groundedness, faithfulness, tool-use correctness, RAG context relevance, hallucination, PII, toxicity, bias, audio quality, and custom rubrics. See the [evaluation docs](https://docs.futureagi.com/docs/evaluation) for the full catalog.
 
