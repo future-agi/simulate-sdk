@@ -3000,6 +3000,94 @@ def load_langgraph_event_stream(
     )
 
 
+def load_framework_multi_agent_transcript(
+    source: str | os.PathLike[str] | Mapping[str, Any] | Iterable[Any],
+    *,
+    framework: str,
+    headers: Optional[Mapping[str, str]] = None,
+    timeout: float = 30.0,
+    state: Optional[Mapping[str, Any]] = None,
+    metadata: Optional[Mapping[str, Any]] = None,
+) -> FrameworkTraceEnvironment:
+    """Load framework-native multi-agent transcript records into a trace environment."""
+
+    records, source_metadata = _load_framework_event_stream_records(
+        source,
+        headers=headers,
+        timeout=timeout,
+    )
+    merged_metadata = copy.deepcopy(dict(metadata or {}))
+    merged_metadata.setdefault("multi_agent_transcript", {}).update(
+        {"framework": str(framework), **source_metadata}
+    )
+    return FrameworkTraceEnvironment(
+        framework=str(framework),
+        events=records,
+        state=state,
+        metadata=merged_metadata,
+    )
+
+
+def load_autogen_groupchat_transcript(
+    source: str | os.PathLike[str] | Mapping[str, Any] | Iterable[Any],
+    *,
+    headers: Optional[Mapping[str, str]] = None,
+    timeout: float = 30.0,
+    state: Optional[Mapping[str, Any]] = None,
+    metadata: Optional[Mapping[str, Any]] = None,
+) -> FrameworkTraceEnvironment:
+    """Load AutoGen AgentChat/GroupChat message events into a trace environment."""
+
+    return load_framework_multi_agent_transcript(
+        source,
+        framework="autogen",
+        headers=headers,
+        timeout=timeout,
+        state=state,
+        metadata=metadata,
+    )
+
+
+def load_crewai_event_log(
+    source: str | os.PathLike[str] | Mapping[str, Any] | Iterable[Any],
+    *,
+    headers: Optional[Mapping[str, str]] = None,
+    timeout: float = 30.0,
+    state: Optional[Mapping[str, Any]] = None,
+    metadata: Optional[Mapping[str, Any]] = None,
+) -> FrameworkTraceEnvironment:
+    """Load CrewAI event-listener or JSON log records into a trace environment."""
+
+    return load_framework_multi_agent_transcript(
+        source,
+        framework="crewai",
+        headers=headers,
+        timeout=timeout,
+        state=state,
+        metadata=metadata,
+    )
+
+
+def load_openai_agents_trace(
+    source: str | os.PathLike[str] | Mapping[str, Any] | Iterable[Any],
+    *,
+    headers: Optional[Mapping[str, str]] = None,
+    timeout: float = 30.0,
+    state: Optional[Mapping[str, Any]] = None,
+    metadata: Optional[Mapping[str, Any]] = None,
+) -> FrameworkTraceEnvironment:
+    """Load OpenAI Agents SDK trace/span records into a trace environment."""
+
+    return load_framework_multi_agent_transcript(
+        source,
+        framework="openai_agents",
+        headers=headers,
+        timeout=timeout,
+        state=state,
+        metadata=metadata,
+    )
+
+
 class AutonomyLoopEnvironment(EnvironmentAdapter):
     """
     Local autonomy-loop harness for observe/orient/plan/act/verify/reflect traces.
@@ -4162,7 +4250,14 @@ def _normalize_framework_span(
             ("namespace", "namespace"),
             ("node", "node"),
             ("subgraph", "subgraph"),
+            ("speaker", "speaker"),
+            ("recipient", "recipient"),
+            ("message_type", "message_type"),
             ("tool_name", "tool_name"),
+            ("handoff_from", "handoff_from"),
+            ("handoff_to", "handoff_to"),
+            ("task", "task"),
+            ("termination", "termination"),
             ("message_text", "message_text"),
             ("state", "state"),
             ("final_output", "final_output"),
@@ -4227,6 +4322,7 @@ def _framework_protocol_event(
     payload: Mapping[str, Any],
     attributes: Mapping[str, Any],
 ) -> Dict[str, Any]:
+    span_data = _coerce_plain_dict(raw.get("span_data") or raw.get("span"))
     params = _coerce_plain_dict(raw.get("params") or data.get("params") or payload.get("params"))
     params_data = _coerce_plain_dict(params.get("data"))
     if not params_data:
@@ -4260,8 +4356,61 @@ def _framework_protocol_event(
     )
     if not subgraph and len(segments) > 1:
         subgraph = segments[-2]
-    tool_name = _framework_tool_name_from_payload(params_data) or _framework_tool_name_from_payload(data)
-    message_text = _framework_text_from_payload(params_data)
+    speaker = _framework_agent_name_from_sources(
+        raw,
+        params,
+        params_data,
+        data,
+        payload,
+        span_data,
+        attributes,
+    )
+    if not node and speaker:
+        node = speaker
+    message_type = _framework_message_type_from_sources(raw, params_data, data, payload, span_data)
+    tool_name = (
+        _framework_tool_name_from_payload(params_data)
+        or _framework_tool_name_from_payload(raw)
+        or _framework_tool_name_from_payload(data)
+        or _framework_tool_name_from_payload(payload)
+        or _framework_tool_name_from_payload(span_data)
+        or _framework_tool_name_from_payload(attributes)
+    )
+    message_text = (
+        _framework_text_from_payload(params_data)
+        or _framework_text_from_payload(raw)
+        or _framework_text_from_payload(data)
+        or _framework_text_from_payload(payload)
+        or _framework_text_from_payload(span_data)
+    )
+    handoff_from, handoff_to = _framework_handoff_agents_from_sources(
+        raw,
+        params_data,
+        data,
+        payload,
+        span_data,
+        attributes,
+        fallback_speaker=speaker,
+    )
+    recipient = _first_present(
+        (params_data, data, payload, span_data, raw, attributes),
+        ("recipient", "target", "to", "to_agent", "handoff_to"),
+    )
+    if handoff_to and not recipient:
+        recipient = handoff_to
+    task = _first_present(
+        (params_data, data, payload, span_data, raw, attributes),
+        ("task", "task_description", "description", "handoff_task", "assignment"),
+    )
+    termination = _framework_termination_from_sources(
+        raw,
+        params_data,
+        data,
+        payload,
+        span_data,
+        attributes,
+        text=message_text,
+    )
     final_output = _first_present(
         (params_data, data, payload, raw),
         ("final_output", "output", "result"),
@@ -4279,7 +4428,14 @@ def _framework_protocol_event(
         "namespace": namespace,
         "node": node,
         "subgraph": subgraph,
+        "speaker": speaker,
+        "recipient": recipient,
+        "message_type": message_type,
         "tool_name": tool_name,
+        "handoff_from": handoff_from,
+        "handoff_to": handoff_to,
+        "task": task,
+        "termination": termination,
         "message_text": message_text,
         "state": state,
         "final_output": final_output,
@@ -4314,12 +4470,20 @@ def _framework_tool_name_from_payload(value: Mapping[str, Any]) -> str:
         nested = _coerce_plain_dict(value.get(key))
         if nested.get("name") or nested.get("tool_name"):
             return str(nested.get("name") or nested.get("tool_name"))
+    for key in ("content", "tool_calls", "function_calls", "calls"):
+        for item in _as_iterable(value.get(key)):
+            item_dict = _coerce_plain_dict(item)
+            if item_dict.get("name") or item_dict.get("tool_name"):
+                return str(item_dict.get("name") or item_dict.get("tool_name"))
+            function = _coerce_plain_dict(item_dict.get("function"))
+            if function.get("name"):
+                return str(function.get("name"))
     return ""
 
 
 def _framework_text_from_payload(value: Mapping[str, Any]) -> str:
     for key in ("text", "content", "message_text", "delta"):
-        if value.get(key):
+        if isinstance(value.get(key), str) and value.get(key):
             return str(value.get(key))
     chunk = value.get("chunk")
     if isinstance(chunk, str):
@@ -4328,6 +4492,108 @@ def _framework_text_from_payload(value: Mapping[str, Any]) -> str:
     for key in ("content", "text", "message_text"):
         if chunk_dict.get(key):
             return str(chunk_dict.get(key))
+    return ""
+
+
+def _framework_agent_name_from_sources(*sources: Mapping[str, Any]) -> str:
+    keys = (
+        "speaker",
+        "source",
+        "sender",
+        "agent",
+        "agent_name",
+        "agent_role",
+        "role",
+        "from_agent",
+        "gen_ai.agent.name",
+        "agent.name",
+        "autogen.agent.name",
+        "crewai.agent.role",
+        "crewai.agent.name",
+        "openai.agent.name",
+    )
+    for source in sources:
+        if not isinstance(source, Mapping):
+            continue
+        for key in keys:
+            value = source.get(key)
+            if value not in (None, "", [], {}):
+                return str(value)
+    return ""
+
+
+def _framework_message_type_from_sources(*sources: Mapping[str, Any]) -> str:
+    for source in sources:
+        if not isinstance(source, Mapping):
+            continue
+        for key in ("message_type", "type", "event", "class_name", "kind"):
+            value = source.get(key)
+            if value not in (None, "", [], {}):
+                return str(value)
+    return ""
+
+
+def _framework_handoff_agents_from_sources(
+    *sources: Mapping[str, Any],
+    fallback_speaker: str = "",
+) -> tuple[str, str]:
+    from_agent = ""
+    to_agent = ""
+    for source in sources:
+        if not isinstance(source, Mapping):
+            continue
+        from_agent = from_agent or str(
+            source.get("from_agent")
+            or source.get("handoff_from")
+            or source.get("source_agent")
+            or source.get("source")
+            or ""
+        )
+        to_agent = to_agent or str(
+            source.get("to_agent")
+            or source.get("handoff_to")
+            or source.get("target_agent")
+            or source.get("recipient")
+            or source.get("target")
+            or source.get("to")
+            or ""
+        )
+    text = " ".join(
+        str(source.get(key, ""))
+        for source in sources
+        if isinstance(source, Mapping)
+        for key in ("event", "type", "name", "class_name")
+    ).lower()
+    if "handoff" not in text and "transfer" not in text and not to_agent:
+        return "", ""
+    return from_agent or fallback_speaker, to_agent
+
+
+def _framework_termination_from_sources(
+    *sources: Mapping[str, Any],
+    text: str = "",
+) -> str:
+    for source in sources:
+        if not isinstance(source, Mapping):
+            continue
+        for key in ("termination", "stop_reason", "finish_reason", "finish", "terminated"):
+            value = source.get(key)
+            if value not in (None, "", [], {}):
+                return str(value)
+    combined = " ".join(
+        [
+            text,
+            *[
+                str(source.get(key, ""))
+                for source in sources
+                if isinstance(source, Mapping)
+                for key in ("event", "type", "name", "class_name", "status")
+            ],
+        ]
+    )
+    lowered = combined.lower()
+    if "terminate" in lowered or "termination" in lowered or "completed" in lowered or "final_answer" in lowered:
+        return combined.strip()
     return ""
 
 

@@ -286,6 +286,9 @@ from LangChain/LangGraph, OpenAI Agents, CrewAI, AutoGen, LiveKit, Pipecat, or
 custom runtimes. `load_langchain_event_stream` and
 `load_langgraph_event_stream` preserve typed `messages`, `tools`, `updates`,
 subgraph/node, final-output, and state evidence from stream exports.
+`load_autogen_groupchat_transcript`, `load_crewai_event_log`, and
+`load_openai_agents_trace` preserve multi-agent speaker, handoff, tool-owner,
+turn, and termination evidence from exported framework transcripts.
 Adversarial packs add hostile retrieved context,
 file content, browser DOM, and memory-like context for indirect prompt-injection
 tests. The local engine exposes environment tools through `AgentInput.tools`,
@@ -311,6 +314,9 @@ from fi.simulate import (
     VoiceEnvironment,
     load_browser_trace_export,
     load_framework_trace_export,
+    load_autogen_groupchat_transcript,
+    load_crewai_event_log,
+    load_openai_agents_trace,
     load_langchain_event_stream,
     load_langgraph_event_stream,
     normalize_framework_trace_events,
@@ -350,6 +356,13 @@ report = await TestRunner().run_test(
             "events": [
                 {"method": "messages", "params": {"data": {"node": "support_agent", "text": "planning"}}},
                 {"method": "tools", "params": {"data": {"tool_name": "search_order"}}},
+            ]
+        }),
+        load_autogen_groupchat_transcript({
+            "events": [
+                {"type": "TextMessage", "source": "PlanningAgent", "content": "1. WebSearchAgent: search order 123."},
+                {"type": "ToolCallRequestEvent", "source": "WebSearchAgent", "content": [{"name": "search_policy"}]},
+                {"type": "TextMessage", "source": "DataAnalystAgent", "content": "Policy-compliant. TERMINATE"},
             ]
         }),
         RetrievalMemoryEnvironment({
@@ -439,6 +452,11 @@ environment = FrameworkTraceEnvironment.from_export(framework="traceai", export=
 
 # LangChain/LangGraph stream_events replay:
 environment = load_langgraph_event_stream({"events": langgraph_stream_events})
+
+# Multi-agent framework transcript replay:
+environment = load_autogen_groupchat_transcript({"events": autogen_groupchat_events})
+environment = load_crewai_event_log("crewai-events.jsonl")
+environment = load_openai_agents_trace(openai_agents_spans)
 ```
 
 See [`examples/local_environment_adapters.py`](examples/local_environment_adapters.py) for a full local world simulation with ai-evaluation scoring, and [`examples/local_voice_image_environments.py`](examples/local_voice_image_environments.py) for a voice + image artifact cookbook.
@@ -450,6 +468,7 @@ See [`examples/local_voice_replay_routing.py`](examples/local_voice_replay_routi
 See [`examples/local_voice_export_replay.py`](examples/local_voice_export_replay.py) for a voice export replay cookbook with LiveKit-style events, Pipecat-style frames, waveform fixtures, diarization, MOS/SNR/clipping/jitter/packet-loss checks, and `load_voice_export`.
 See [`examples/local_framework_trace_replay.py`](examples/local_framework_trace_replay.py) for a framework trace replay cookbook with native spans/events and TraceAI/OpenTelemetry export payloads from orchestration frameworks.
 See [`examples/local_langgraph_event_stream_replay.py`](examples/local_langgraph_event_stream_replay.py) for a LangGraph/LangChain event-stream replay cookbook with message/tool/state projections and transcript-quality scoring.
+See [`examples/local_multi_agent_framework_transcript.py`](examples/local_multi_agent_framework_transcript.py) for an AutoGen/CrewAI/OpenAI Agents-style multi-agent transcript replay cookbook with speaker, handoff, tool-owner, turn, and termination scoring.
 See [`examples/local_retrieval_memory_attribution.py`](examples/local_retrieval_memory_attribution.py) for a retrieval/memory attribution cookbook with queries, ranked documents, retrieval scores, citations, memory reads/writes, and freshness evidence.
 See [`examples/local_autonomy_loop_trace.py`](examples/local_autonomy_loop_trace.py) for an autonomy-loop cookbook with observe/orient/plan/act/verify/reflect, feedback, memory, skill-library evidence, and plan/verifier/reflection/memory/skill/stop quality checks.
 See [`examples/local_multi_agent_handoff_trace.py`](examples/local_multi_agent_handoff_trace.py) for a multi-agent handoff cookbook with roles, contracts, delegated work, review, reconciliation, trace coverage, and coordination-quality scoring.
@@ -606,6 +625,11 @@ evaluation = evaluate_agent_report(
             "required_nodes": ["support_agent", "policy_node"],
             "required_subgraphs": ["refund_graph"],
             "expected_tool_sequence": ["lookup_order", "issue_refund"],
+            "required_speakers": ["PlanningAgent", "WebSearchAgent", "DataAnalystAgent"],
+            "expected_speaker_sequence": ["PlanningAgent", "WebSearchAgent", "DataAnalystAgent"],
+            "expected_handoffs": [{"from_agent": "triage_agent", "to_agent": "refund_agent"}],
+            "required_tools_by_speaker": {"WebSearchAgent": ["search_policy"]},
+            "termination_contains": ["TERMINATE"],
             "expected_state": {"case": {"status": "resolved"}},
             "output_contains": ["refund approved"],
         },
@@ -696,7 +720,7 @@ Traces from simulations flow into `Monitor`, scores flow into `Evaluate`, and fa
 - [x] OpenAI / Anthropic / Gemini / LangChain wrappers
 - [x] Generic framework adapter presets
 - [x] Multimodal artifacts + event trajectories
-- [x] Local environment adapters for mocked tools/APIs, framework trace replay with TraceAI/OpenTelemetry export ingestion and LangChain/LangGraph event-stream replay, retrieval/memory attribution, autonomy-loop traces, multi-agent handoff traces, browser/CUA trace replay with Playwright trace/video import, HAR/resource bodies, OpenAI Computer Use and Browser Use trace import, actionability timelines, coordinate regions, image-derived pixel screenshot diffs, layout-shift distributions, stale-screenshot and layout-shift perturbations, voice frame replay/routing/noise/overlap/export replay/waveform/diarization/perceptual metrics, images, files, adversarial packs, and multi-agent rooms
+- [x] Local environment adapters for mocked tools/APIs, framework trace replay with TraceAI/OpenTelemetry export ingestion, LangChain/LangGraph event-stream replay, AutoGen/CrewAI/OpenAI Agents-style multi-agent transcript replay, retrieval/memory attribution, autonomy-loop traces, multi-agent handoff traces, browser/CUA trace replay with Playwright trace/video import, HAR/resource bodies, OpenAI Computer Use and Browser Use trace import, actionability timelines, coordinate regions, image-derived pixel screenshot diffs, layout-shift distributions, stale-screenshot and layout-shift perturbations, voice frame replay/routing/noise/overlap/export replay/waveform/diarization/perceptual metrics, images, files, adversarial packs, and multi-agent rooms
 - [x] Deterministic synthetic data generator
 - [x] Self-contained synthetic tool-world generator with schemas, mocks, state expectations, and evaluator config
 - [x] Self-contained synthetic trajectory-template generator with ordered tool calls, policy, browser action safety, memory correctness, state, and multimodal faithfulness expectations

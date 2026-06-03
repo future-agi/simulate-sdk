@@ -22,6 +22,9 @@ from fi.simulate import (
     load_voice_export,
     load_playwright_trace_export,
     load_framework_trace_export,
+    load_autogen_groupchat_transcript,
+    load_crewai_event_log,
+    load_openai_agents_trace,
     load_langchain_event_stream,
     load_langgraph_event_stream,
     normalize_framework_trace_events,
@@ -1267,6 +1270,89 @@ def test_langgraph_event_stream_loader_preserves_transcript_fields():
 
     langchain_snapshot = load_langchain_event_stream(events).reset()
     assert langchain_snapshot.state["framework_trace"]["framework"] == "langchain"
+
+
+def test_multi_agent_framework_transcript_loaders_preserve_speakers_handoffs_and_tools():
+    autogen_events = [
+        {
+            "type": "TextMessage",
+            "source": "PlanningAgent",
+            "content": "1. WebSearchAgent: find order policy. 2. DataAnalystAgent: verify refund.",
+        },
+        {
+            "type": "ToolCallRequestEvent",
+            "source": "WebSearchAgent",
+            "content": [
+                {
+                    "id": "call_search",
+                    "name": "search_policy",
+                    "arguments": {"order_id": "ord_123"},
+                }
+            ],
+        },
+        {
+            "type": "ToolCallExecutionEvent",
+            "source": "WebSearchAgent",
+            "content": [{"name": "search_policy", "content": "Order 123 policy found."}],
+        },
+        {
+            "type": "TextMessage",
+            "source": "DataAnalystAgent",
+            "content": "The refund is policy-compliant. TERMINATE",
+        },
+    ]
+    autogen_state = load_autogen_groupchat_transcript({"events": autogen_events}).reset().state["framework_trace"]
+    autogen_records = autogen_state["events"]
+
+    assert autogen_state["framework"] == "autogen"
+    assert autogen_state["metadata"]["multi_agent_transcript"]["framework"] == "autogen"
+    assert autogen_records[0]["speaker"] == "PlanningAgent"
+    assert autogen_records[0]["message_text"].startswith("1. WebSearchAgent")
+    assert autogen_records[1]["tool_name"] == "search_policy"
+    assert autogen_records[-1]["termination"]
+
+    crewai_state = load_crewai_event_log(
+        [
+            {
+                "event": "TaskStartedEvent",
+                "agent_role": "Policy Specialist",
+                "task": "Review order policy",
+            },
+            {
+                "event": "ToolUsageStartedEvent",
+                "agent_role": "Policy Specialist",
+                "tool_name": "policy_lookup",
+            },
+            {
+                "event": "TaskCompletedEvent",
+                "agent_role": "QA Reviewer",
+                "output": "Approved policy-backed answer.",
+            },
+        ]
+    ).reset().state["framework_trace"]
+
+    assert crewai_state["framework"] == "crewai"
+    assert crewai_state["events"][0]["speaker"] == "Policy Specialist"
+    assert crewai_state["events"][1]["tool_name"] == "policy_lookup"
+    assert crewai_state["events"][2]["termination"]
+
+    openai_state = load_openai_agents_trace(
+        [
+            {
+                "span_id": "handoff_span",
+                "name": "handoff_span",
+                "span_data": {
+                    "type": "handoff",
+                    "from_agent": "triage_agent",
+                    "to_agent": "refund_agent",
+                },
+            }
+        ]
+    ).reset().state["framework_trace"]
+
+    assert openai_state["framework"] == "openai_agents"
+    assert openai_state["events"][0]["handoff_from"] == "triage_agent"
+    assert openai_state["events"][0]["handoff_to"] == "refund_agent"
 
 
 def test_normalize_framework_trace_export_flattens_otlp_resource_spans():
