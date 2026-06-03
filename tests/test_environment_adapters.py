@@ -22,6 +22,8 @@ from fi.simulate import (
     load_voice_export,
     load_playwright_trace_export,
     load_framework_trace_export,
+    load_langchain_event_stream,
+    load_langgraph_event_stream,
     normalize_framework_trace_events,
     normalize_framework_trace_export,
     normalize_browser_trace_export,
@@ -1198,6 +1200,73 @@ def test_normalize_framework_trace_events_accepts_traceai_and_native_records():
     assert normalized[0]["input"] == "order 123"
     assert normalized[0]["output"] == "planned tool call"
     assert normalized[2]["id"] == "lc_tool"
+
+
+def test_langgraph_event_stream_loader_preserves_transcript_fields():
+    events = [
+        {
+            "seq": 1,
+            "method": "messages",
+            "params": {
+                "namespace": ["refund_graph:run_1", "support_agent:task_1"],
+                "data": {"node": "support_agent", "text": "I will look up order ord_123."},
+            },
+        },
+        {
+            "seq": 2,
+            "method": "tools",
+            "params": {
+                "namespace": ["refund_graph:run_1", "support_agent:task_1"],
+                "data": {
+                    "event": "tool-start",
+                    "tool_name": "lookup_order",
+                    "input": {"order_id": "ord_123"},
+                },
+            },
+        },
+        {
+            "seq": 3,
+            "method": "tools",
+            "params": {
+                "namespace": ["refund_graph:run_1", "support_agent:task_1"],
+                "data": {
+                    "event": "tool-finish",
+                    "tool_name": "issue_refund",
+                    "output": {"status": "resolved"},
+                },
+            },
+        },
+        {
+            "seq": 4,
+            "method": "updates",
+            "params": {
+                "namespace": ["refund_graph:run_1", "policy_node:task_2"],
+                "data": {"case": {"status": "resolved", "approval": "captured"}},
+            },
+        },
+    ]
+
+    environment = load_langgraph_event_stream(
+        {"events": events},
+        metadata={"source": "langgraph stream_events v3"},
+    )
+    snapshot = environment.reset()
+    trace_state = snapshot.state["framework_trace"]
+    records = trace_state["events"]
+    signals = {signal for record in records for signal in record["signals"]}
+
+    assert trace_state["framework"] == "langgraph"
+    assert trace_state["metadata"]["event_stream"]["framework"] == "langgraph"
+    assert {"model", "tool", "state", "span"} <= signals
+    assert records[0]["method"] == "messages"
+    assert records[0]["node"] == "support_agent"
+    assert records[0]["subgraph"] == "refund_graph"
+    assert records[0]["message_text"] == "I will look up order ord_123."
+    assert records[1]["tool_name"] == "lookup_order"
+    assert records[3]["state"] == {"case": {"status": "resolved", "approval": "captured"}}
+
+    langchain_snapshot = load_langchain_event_stream(events).reset()
+    assert langchain_snapshot.state["framework_trace"]["framework"] == "langchain"
 
 
 def test_normalize_framework_trace_export_flattens_otlp_resource_spans():

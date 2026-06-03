@@ -2946,6 +2946,60 @@ def load_framework_trace_export(
     )
 
 
+def load_langchain_event_stream(
+    source: str | os.PathLike[str] | Mapping[str, Any] | Iterable[Any],
+    *,
+    headers: Optional[Mapping[str, str]] = None,
+    timeout: float = 30.0,
+    state: Optional[Mapping[str, Any]] = None,
+    metadata: Optional[Mapping[str, Any]] = None,
+) -> FrameworkTraceEnvironment:
+    """Load LangChain `stream_events` records into a framework trace environment."""
+
+    records, source_metadata = _load_framework_event_stream_records(
+        source,
+        headers=headers,
+        timeout=timeout,
+    )
+    merged_metadata = copy.deepcopy(dict(metadata or {}))
+    merged_metadata.setdefault("event_stream", {}).update(
+        {"framework": "langchain", **source_metadata}
+    )
+    return FrameworkTraceEnvironment(
+        framework="langchain",
+        events=records,
+        state=state,
+        metadata=merged_metadata,
+    )
+
+
+def load_langgraph_event_stream(
+    source: str | os.PathLike[str] | Mapping[str, Any] | Iterable[Any],
+    *,
+    headers: Optional[Mapping[str, str]] = None,
+    timeout: float = 30.0,
+    state: Optional[Mapping[str, Any]] = None,
+    metadata: Optional[Mapping[str, Any]] = None,
+) -> FrameworkTraceEnvironment:
+    """Load LangGraph `stream_events` records into a framework trace environment."""
+
+    records, source_metadata = _load_framework_event_stream_records(
+        source,
+        headers=headers,
+        timeout=timeout,
+    )
+    merged_metadata = copy.deepcopy(dict(metadata or {}))
+    merged_metadata.setdefault("event_stream", {}).update(
+        {"framework": "langgraph", **source_metadata}
+    )
+    return FrameworkTraceEnvironment(
+        framework="langgraph",
+        events=records,
+        state=state,
+        metadata=merged_metadata,
+    )
+
+
 class AutonomyLoopEnvironment(EnvironmentAdapter):
     """
     Local autonomy-loop harness for observe/orient/plan/act/verify/reflect traces.
@@ -3746,6 +3800,8 @@ def _framework_trace_export_records(trace_export: Any) -> List[Any]:
 def _looks_like_framework_export_record(export: Mapping[str, Any]) -> bool:
     if "spans" in export and not any(key in export for key in ("spanId", "span_id", "id", "run_id")):
         return False
+    if "method" in export and "params" in export:
+        return True
     if any(key in export for key in ("spanId", "span_id", "id", "run_id", "parentSpanId", "parent_span_id")):
         return True
     if any(key in export for key in ("event", "frame_type", "span_data")):
@@ -3755,6 +3811,26 @@ def _looks_like_framework_export_record(export: Mapping[str, Any]) -> bool:
     if "attributes" in export and any(key in export for key in ("type", "kind", "traceId", "trace_id")):
         return True
     return False
+
+
+def _load_framework_event_stream_records(
+    source: str | os.PathLike[str] | Mapping[str, Any] | Iterable[Any],
+    *,
+    headers: Optional[Mapping[str, str]] = None,
+    timeout: float = 30.0,
+) -> tuple[List[Any], Dict[str, Any]]:
+    metadata: Dict[str, Any] = {}
+    if isinstance(source, (str, os.PathLike)):
+        loaded = _load_framework_trace_export_source(
+            source,
+            headers=headers,
+            timeout=timeout,
+        )
+        metadata["source"] = _framework_trace_source_label(source)
+    else:
+        loaded = source
+        metadata["source"] = "inline"
+    return _framework_trace_export_records(loaded), metadata
 
 
 def _flatten_otlp_resource_spans(export: Mapping[str, Any]) -> List[Dict[str, Any]]:
@@ -4023,6 +4099,7 @@ def _normalize_framework_span(
         or name
     )
     signals = _framework_signals(raw, attributes, name, span_data=span_data, data=data, payload=payload)
+    protocol_event = _framework_protocol_event(raw, data=data, payload=payload, attributes=attributes)
     latency_ms = _first_number(
         raw,
         attributes,
@@ -4030,6 +4107,20 @@ def _normalize_framework_span(
     )
     if latency_ms is None:
         latency_ms = _duration_ms_from_span(raw, attributes)
+    output = _first_present(
+        (raw, span_data, data, payload, attributes),
+        (
+            "output",
+            "output.value",
+            "chunk",
+            "gen_ai.completion",
+            "gen_ai.output",
+            "gen_ai.output.messages",
+            "llm.completions",
+        ),
+    )
+    if output is None:
+        output = protocol_event.get("message_text") or protocol_event.get("final_output")
     normalized = {
         "id": span_id,
         "name": name,
@@ -4058,23 +4149,28 @@ def _normalize_framework_span(
                 "llm.prompts",
             ),
         ),
-        "output": _first_present(
-            (raw, span_data, data, payload, attributes),
-            (
-                "output",
-                "output.value",
-                "chunk",
-                "gen_ai.completion",
-                "gen_ai.output",
-                "gen_ai.output.messages",
-                "llm.completions",
-            ),
-        ),
+        "output": output,
         "error": _framework_error(raw, data=data, payload=payload, attributes=attributes),
         "latency_ms": latency_ms,
         "cost": _framework_usage(raw, span_data=span_data, data=data, attributes=attributes),
         "attributes": attributes,
     }
+    if protocol_event:
+        normalized["framework_event"] = protocol_event
+        for source_key, target_key in (
+            ("method", "method"),
+            ("namespace", "namespace"),
+            ("node", "node"),
+            ("subgraph", "subgraph"),
+            ("tool_name", "tool_name"),
+            ("message_text", "message_text"),
+            ("state", "state"),
+            ("final_output", "final_output"),
+            ("sequence", "sequence"),
+        ):
+            value = protocol_event.get(source_key)
+            if value not in (None, "", [], {}):
+                normalized[target_key] = copy.deepcopy(value)
     for key in (
         "start_time",
         "end_time",
@@ -4122,6 +4218,117 @@ def _coerce_plain_dict(value: Any) -> Dict[str, Any]:
     if hasattr(value, "__dict__"):
         return copy.deepcopy(dict(vars(value)))
     return {}
+
+
+def _framework_protocol_event(
+    raw: Mapping[str, Any],
+    *,
+    data: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    attributes: Mapping[str, Any],
+) -> Dict[str, Any]:
+    params = _coerce_plain_dict(raw.get("params") or data.get("params") or payload.get("params"))
+    params_data = _coerce_plain_dict(params.get("data"))
+    if not params_data:
+        params_data = _coerce_plain_dict(data.get("data") or payload.get("data"))
+
+    method = raw.get("method") or params.get("method") or data.get("method") or payload.get("method")
+    namespace = (
+        params.get("namespace")
+        or raw.get("namespace")
+        or raw.get("ns")
+        or data.get("namespace")
+        or attributes.get("namespace")
+    )
+    node = (
+        raw.get("node")
+        or params_data.get("node")
+        or params_data.get("langgraph_node")
+        or attributes.get("node")
+        or attributes.get("langgraph_node")
+    )
+    segments = _framework_namespace_segments(namespace)
+    if not node and segments:
+        node = segments[-1]
+    subgraph = (
+        raw.get("subgraph")
+        or raw.get("graph_name")
+        or params_data.get("subgraph")
+        or params_data.get("graph_name")
+        or attributes.get("subgraph")
+        or attributes.get("graph_name")
+    )
+    if not subgraph and len(segments) > 1:
+        subgraph = segments[-2]
+    tool_name = _framework_tool_name_from_payload(params_data) or _framework_tool_name_from_payload(data)
+    message_text = _framework_text_from_payload(params_data)
+    final_output = _first_present(
+        (params_data, data, payload, raw),
+        ("final_output", "output", "result"),
+    )
+    state: Any = None
+    normalized_method = str(method or "").lower()
+    if normalized_method in {"values", "updates", "state", "checkpoints", "tasks"}:
+        state = params_data or data or payload
+    elif params_data.get("state") is not None:
+        state = params_data.get("state")
+
+    event = {
+        "sequence": raw.get("seq") or raw.get("sequence") or raw.get("index"),
+        "method": method,
+        "namespace": namespace,
+        "node": node,
+        "subgraph": subgraph,
+        "tool_name": tool_name,
+        "message_text": message_text,
+        "state": state,
+        "final_output": final_output,
+        "data": params_data,
+    }
+    return {key: copy.deepcopy(value) for key, value in event.items() if value not in (None, "", [], {})}
+
+
+def _framework_namespace_segments(value: Any) -> List[str]:
+    if isinstance(value, (list, tuple)):
+        raw_segments = [str(item) for item in value]
+    elif isinstance(value, str):
+        raw_segments = value.replace(">", "/").replace(".", "/").split("/")
+    else:
+        return []
+    segments: List[str] = []
+    for segment in raw_segments:
+        segment = segment.strip()
+        if not segment:
+            continue
+        if ":" in segment:
+            segment = segment.split(":", 1)[0]
+        segments.append(segment)
+    return segments
+
+
+def _framework_tool_name_from_payload(value: Mapping[str, Any]) -> str:
+    for key in ("tool_name", "tool", "name"):
+        if value.get(key):
+            return str(value.get(key))
+    for key in ("tool_call", "call"):
+        nested = _coerce_plain_dict(value.get(key))
+        if nested.get("name") or nested.get("tool_name"):
+            return str(nested.get("name") or nested.get("tool_name"))
+    return ""
+
+
+def _framework_text_from_payload(value: Mapping[str, Any]) -> str:
+    for key in ("text", "content", "message_text", "delta"):
+        if value.get(key):
+            return str(value.get(key))
+    chunk = value.get("chunk")
+    if isinstance(chunk, str):
+        return chunk
+    chunk_dict = _coerce_plain_dict(chunk)
+    for key in ("content", "text", "message_text"):
+        if chunk_dict.get(key):
+            return str(chunk_dict.get(key))
+    return ""
 
 
 def _framework_record_name(
@@ -4222,6 +4429,7 @@ def _framework_signals(
         "chain": "agent",
         "graph": "agent",
         "node": "agent",
+        "messages": "model",
         "llm": "model",
         "model": "model",
         "generation": "model",
