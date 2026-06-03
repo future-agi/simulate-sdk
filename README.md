@@ -285,8 +285,8 @@ Voice adapters can replay VAD/STT/TTS
 events, Pipecat frame logs, latency profiles, barge-in/overlap handling, call
 routing, noise metadata, LiveKit/Pipecat-style export JSON, waveform fixtures,
 decoded local WAV/PCM media, speaker diarization segments, perceptual audio
-metrics, WebRTC-style jitter and packet-loss counters, audio artifacts,
-timelines, and voice trace artifacts. `load_pipecat_frame_log` turns exported
+metrics, WebRTC RTP/track/codec/audio-level stats with jitter and packet-loss
+counters, audio artifacts, timelines, and voice trace artifacts. `load_pipecat_frame_log` turns exported
 Pipecat frames plus optional raw audio captures into the same local
 `VoiceEnvironment` contract used by voice evals and optimizer cookbooks.
 Framework trace adapters can replay native orchestration spans and event streams
@@ -549,6 +549,7 @@ See [`examples/local_browser_runtime_state_replay.py`](examples/local_browser_ru
 See [`examples/local_browser_mutation_pack.py`](examples/local_browser_mutation_pack.py) for a browser/CUA mutation-pack cookbook with stale selectors, storage drift, runtime faults, network latency, actionability evidence, and fallback selector scoring.
 See [`examples/local_voice_replay_routing.py`](examples/local_voice_replay_routing.py) for a voice replay cookbook with VAD/STT/TTS events, Pipecat-style frame replay, noise/overlap evidence, interruption handling, and call routing.
 See [`examples/local_voice_export_replay.py`](examples/local_voice_export_replay.py) for a voice export replay cookbook with LiveKit-style events, Pipecat-style frames, waveform fixtures, diarization, MOS/SNR/clipping/jitter/packet-loss checks, and `load_voice_export`.
+See [`examples/local_voice_webrtc_stats_replay.py`](examples/local_voice_webrtc_stats_replay.py) for a LiveKit/WebRTC `getStats()` replay cookbook with RTP, track, codec, audio-level, jitter, and packet-loss checks.
 `load_pipecat_frame_log` is the direct loader for exported Pipecat frame logs and optional raw PCM audio captures when you want local replay without first reshaping the payload into a generic voice export.
 See [`examples/local_voice_media_decode.py`](examples/local_voice_media_decode.py) for a self-contained WAV media replay cookbook with decoded sample rate, duration, RMS/peak, and clipping checks.
 See [`examples/local_voice_timing_distribution.py`](examples/local_voice_timing_distribution.py) for a voice timing-distribution cookbook with VAD, end-of-utterance, STT, LLM, TTS, and full-turn p95 stage evidence.
@@ -731,7 +732,7 @@ evaluation = evaluate_agent_report(
         "forbidden_browser_prompt_injection_targets": ["coupon_iframe"],
         "expected_browser_state": {"url": "https://shop.example.com/done"},
         "expected_browser_dom_contains": ["Done"],
-        "required_voice_trace": ["audio", "vad", "stt", "tts", "interruption", "route", "frame", "noise", "overlap", "timeline", "media", "sample_rate", "duration", "rms", "peak", "timing_distribution", "timing_stage", "eou", "llm", "turn"],
+        "required_voice_trace": ["audio", "vad", "stt", "tts", "interruption", "route", "frame", "noise", "overlap", "timeline", "media", "sample_rate", "duration", "rms", "peak", "webrtc", "rtp", "track", "codec", "audio_level", "timing_distribution", "timing_stage", "eou", "llm", "turn"],
         "expected_voice_route": "billing",
         "expected_voice_transcript_contains": ["order 123"],
         "required_voice_frame_types": ["InputAudioRawFrame", "TranscriptionFrame", "TTSStartedFrame", "TTSAudioRawFrame"],
@@ -918,7 +919,7 @@ Traces from simulations flow into `Monitor`, scores flow into `Evaluate`, and fa
 - [x] OpenAI / Anthropic / Gemini / LangChain wrappers
 - [x] Generic framework adapter presets
 - [x] Multimodal artifacts + event trajectories
-- [x] Local environment adapters for mocked tools/APIs, world contract state machines, structured adversarial attack packs, framework trace replay with TraceAI/OpenTelemetry export ingestion, LangChain/LangGraph event-stream replay with memory/skill trace normalization, streaming/session trace replay with chunk/tool-delta/interruption/finalization evidence, orchestration graph traces with route/retry/recovery/budget evidence, AutoGen/CrewAI/OpenAI Agents-style multi-agent transcript replay, structured artifact fixtures, retrieval/memory attribution, autonomy-loop traces, multi-agent handoff traces, browser/CUA trace replay with Playwright trace/video import, HAR/resource bodies, OpenAI Computer Use and Browser Use trace import, actionability timelines, coordinate regions, image-derived pixel screenshot diffs, semantic/masked visual-diff regions, storage-state/runtime/performance capture, layout-shift distributions, stale-screenshot/layout-shift perturbations, structured browser mutation packs for selector/storage/runtime/network/actionability drift, Pipecat frame-log replay, voice frame replay/routing/noise/overlap/export replay/waveform/diarization/perceptual metrics/local WAV and PCM media decoding, images, files, adversarial packs, and multi-agent rooms
+- [x] Local environment adapters for mocked tools/APIs, world contract state machines, structured adversarial attack packs, framework trace replay with TraceAI/OpenTelemetry export ingestion, LangChain/LangGraph event-stream replay with memory/skill trace normalization, streaming/session trace replay with chunk/tool-delta/interruption/finalization evidence, orchestration graph traces with route/retry/recovery/budget evidence, AutoGen/CrewAI/OpenAI Agents-style multi-agent transcript replay, structured artifact fixtures, retrieval/memory attribution, autonomy-loop traces, multi-agent handoff traces, browser/CUA trace replay with Playwright trace/video import, HAR/resource bodies, OpenAI Computer Use and Browser Use trace import, actionability timelines, coordinate regions, image-derived pixel screenshot diffs, semantic/masked visual-diff regions, storage-state/runtime/performance capture, layout-shift distributions, stale-screenshot/layout-shift perturbations, structured browser mutation packs for selector/storage/runtime/network/actionability drift, Pipecat frame-log replay, voice frame replay/routing/noise/overlap/export replay/waveform/diarization/perceptual metrics/local WAV and PCM media decoding/WebRTC stats replay, images, files, adversarial packs, and multi-agent rooms
 - [x] Deterministic synthetic data generator
 - [x] Self-contained synthetic tool-world generator with schemas, mocks, state expectations, and evaluator config
 - [x] Self-contained synthetic trajectory-template generator with ordered tool calls, policy, browser action safety, memory correctness, state, and multimodal faithfulness expectations
@@ -933,7 +934,7 @@ Traces from simulations flow into `Monitor`, scores flow into `Evaluate`, and fa
 <td>
 
 - [ ] Conversation-graph scenarios (branching flows)
-- [ ] Streaming WebRTC media decoding, streaming diarization, and external perceptual-model integrations
+- [ ] Streaming WebRTC media decoding beyond stats replay, streaming diarization, and external perceptual-model integrations
 - [ ] Streaming transcript API
 - [ ] First-class Pipecat/VAPI/Retell voice backends over the generic voice artifact/event contract
 

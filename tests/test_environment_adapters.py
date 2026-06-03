@@ -24,6 +24,7 @@ from fi.simulate import (
     ToolMockEnvironment,
     VoiceEnvironment,
     WorldContractEnvironment,
+    evaluate_agent_report,
     load_adversarial_attack_pack,
     load_browser_trace_export,
     load_voice_export,
@@ -3002,6 +3003,116 @@ async def test_voice_environment_loads_voice_exports_waveforms_diarization_and_q
     assert any(artifact.type == "audio" and artifact.metadata.get("id") == "caller_wave" for artifact in result.artifacts)
     assert voice_traces[-1]["export_framework"] == "livekit"
     assert voice_traces[-1]["perceptual_metrics"]["overall"]["packet_loss_pct"] == 0.4
+
+
+@pytest.mark.asyncio
+async def test_voice_environment_replays_webrtc_stats_and_quality_counters():
+    voice_export = {
+        "framework": "livekit",
+        "events": [
+            {
+                "id": "caller_1",
+                "event": "user_input_transcribed",
+                "transcript": "Billing issue for order 123.",
+                "speaker_id": "caller",
+            }
+        ],
+        "webrtc_stats": [
+            {
+                "id": "inbound_audio_1",
+                "type": "inbound-rtp",
+                "kind": "audio",
+                "trackIdentifier": "caller-track",
+                "codecId": "codec_opus",
+                "packetsReceived": 1000,
+                "packetsLost": 5,
+                "jitter": 0.012,
+                "audioLevel": 0.18,
+                "totalAudioEnergy": 4.2,
+            },
+            {
+                "id": "codec_opus",
+                "type": "codec",
+                "mimeType": "audio/opus",
+                "payloadType": 111,
+            },
+        ],
+        "speaker_segments": [
+            {"id": "seg_caller", "speaker": "caller", "start_ms": 0, "end_ms": 900},
+            {"id": "seg_agent", "speaker": "agent", "start_ms": 940, "end_ms": 1300},
+        ],
+    }
+
+    normalized = normalize_voice_export(voice_export, framework="livekit")
+    inbound = normalized["webrtc_stats"][0]
+    assert inbound["type"] == "inbound-rtp"
+    assert inbound["track_id"] == "caller-track"
+    assert inbound["jitter_ms"] == 12
+    assert inbound["packet_loss_pct"] == pytest.approx(0.4975)
+    assert normalized["perceptual_metrics"]["overall"]["jitter_ms"] == 12
+
+    async def agent(input):
+        return AgentResponse(
+            content="I inspected the WebRTC stats and routed the call.",
+            tool_calls=[
+                {"id": "route", "name": "route_call", "arguments": {"route": "billing"}},
+                {"id": "stt", "name": "transcribe_audio", "arguments": {"id": "caller_1"}},
+                {"id": "status", "name": "voice_status", "arguments": {}},
+            ],
+        )
+
+    report = await LocalTextEngine().run(
+        scenario=_scenario(),
+        agent_callback=agent,
+        environment=load_voice_export(
+            voice_export,
+            framework="livekit",
+            routes={"default": {"agent": "support"}, "billing": {"agent": "billing"}},
+        ),
+        max_turns=1,
+        min_turns=1,
+        modality="voice",
+    )
+    result = report.results[0]
+    voice_state = result.metadata["environment_state"]["voice"]
+    voice_trace = next(
+        artifact.data
+        for artifact in result.artifacts
+        if artifact.type == "trace" and artifact.metadata.get("kind") == "voice_trace"
+    )
+
+    assert voice_state["webrtc_stats"][0]["audio_level"] == 0.18
+    assert voice_trace["webrtc_stats"][1]["codec"] == "opus"
+    assert any(event.name == "voice_webrtc_stats_ready" for event in result.events)
+
+    evaluation = evaluate_agent_report(
+        report,
+        config={
+            "required_tools": ["route_call", "transcribe_audio", "voice_status"],
+            "available_tools": ["route_call", "transcribe_audio", "voice_status"],
+            "required_artifact_types": ["trace"],
+            "expected_voice_route": "billing",
+            "expected_voice_transcript_contains": ["order 123"],
+            "required_voice_speakers": ["caller", "agent"],
+            "max_voice_jitter_ms": 20,
+            "max_voice_packet_loss_pct": 1.0,
+            "required_voice_trace": [
+                "livekit_export",
+                "webrtc",
+                "rtp",
+                "track",
+                "codec",
+                "audio_level",
+                "jitter",
+                "packet_loss",
+                "diarization",
+            ],
+        },
+        threshold=0.9,
+    )
+    metrics = evaluation.summary["metric_averages"]
+    assert metrics["voice_trace_coverage"] == 1.0
+    assert metrics["voice_interaction_quality"] == 1.0
 
 
 @pytest.mark.asyncio

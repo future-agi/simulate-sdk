@@ -2134,6 +2134,7 @@ class VoiceEnvironment(EnvironmentAdapter):
             "frame_replay": [],
             "waveforms": [],
             "diarization": [],
+            "webrtc_stats": [],
             "perceptual_metrics": {},
             "timing_distribution": {},
             "metadata": {},
@@ -2191,8 +2192,10 @@ class VoiceEnvironment(EnvironmentAdapter):
                 *_as_iterable(diarization),
             ]
         )
+        self.webrtc_stats = _normalize_voice_webrtc_stats(export_payload.get("webrtc_stats"))
         self.perceptual_metrics = _merge_voice_perceptual_metrics(
             export_payload.get("perceptual_metrics"),
+            {"segments": self.webrtc_stats},
             perceptual_metrics,
             waveforms=self.waveforms,
         )
@@ -2257,6 +2260,7 @@ class VoiceEnvironment(EnvironmentAdapter):
                     "export_framework": self.voice_export_framework,
                     "waveform_count": len(self.waveforms),
                     "diarization_segments": len(self.diarization),
+                    "webrtc_stat_count": len(self.webrtc_stats),
                     "perceptual_metrics": copy.deepcopy(self.perceptual_metrics.get("overall", {})),
                     "timing_stage_count": len(self.timing_distribution.get("stages", {})),
                 },
@@ -2278,6 +2282,22 @@ class VoiceEnvironment(EnvironmentAdapter):
                     type="voice",
                     name="speaker_segment",
                     payload=copy.deepcopy(segment),
+                )
+            )
+        if self.webrtc_stats:
+            for stat in self.webrtc_stats:
+                self.timeline.append(
+                    _voice_timeline_entry(
+                        "webrtc_stats",
+                        stat,
+                        speaker=stat.get("speaker"),
+                    )
+                )
+            events.append(
+                SimulationEvent(
+                    type="voice_webrtc",
+                    name="voice_webrtc_stats_ready",
+                    payload={"stats": copy.deepcopy(self.webrtc_stats)},
                 )
             )
         if self.perceptual_metrics.get("overall") or self.perceptual_metrics.get("segments"):
@@ -2423,6 +2443,7 @@ class VoiceEnvironment(EnvironmentAdapter):
                     "export_framework": self.voice_export_framework,
                     "waveforms": len(self.waveforms),
                     "diarization_segments": len(self.diarization),
+                    "webrtc_stats": len(self.webrtc_stats),
                     "timing_stages": len(self.timing_distribution.get("stages", {})),
                 }
             },
@@ -2648,6 +2669,7 @@ class VoiceEnvironment(EnvironmentAdapter):
             "frame_replay": copy.deepcopy(self.frame_replay),
             "waveforms": copy.deepcopy(self.waveforms),
             "diarization": copy.deepcopy(self.diarization),
+            "webrtc_stats": copy.deepcopy(self.webrtc_stats),
             "perceptual_metrics": copy.deepcopy(self.perceptual_metrics),
             "timeline": copy.deepcopy(self.timeline),
             "overlap_events": copy.deepcopy(self.overlap_events),
@@ -2674,6 +2696,7 @@ class VoiceEnvironment(EnvironmentAdapter):
             "frame_replay": copy.deepcopy(self.frame_replay),
             "waveforms": copy.deepcopy(self.waveforms),
             "diarization": copy.deepcopy(self.diarization),
+            "webrtc_stats": copy.deepcopy(self.webrtc_stats),
             "perceptual_metrics": copy.deepcopy(self.perceptual_metrics),
             "timeline": copy.deepcopy(self.timeline),
             "overlap_events": copy.deepcopy(self.overlap_events),
@@ -13193,6 +13216,7 @@ def _normalize_voice_export(
         "frame_replay": [],
         "waveforms": [],
         "diarization": [],
+        "webrtc_stats": [],
         "perceptual_metrics": {},
         "timing_distribution": {},
         "metadata": {"framework": framework_name},
@@ -13212,6 +13236,7 @@ def _normalize_voice_export(
             payload["waveforms"].extend(_normalize_voice_waveforms(_as_iterable(export.get(key)), sample_rate_hz=16000))
         for key in ("diarization", "speaker_segments", "speakers"):
             payload["diarization"].extend(_normalize_voice_diarization(export.get(key)))
+        payload["webrtc_stats"].extend(_normalize_voice_webrtc_stats(export))
         payload["perceptual_metrics"] = _merge_voice_perceptual_metrics(
             export.get("perceptual_metrics"),
             export.get("audio_quality"),
@@ -13248,6 +13273,7 @@ def _normalize_voice_export(
         segment = _voice_diarization_segment_from_record(item, name)
         if segment:
             payload["diarization"].append(segment)
+        payload["webrtc_stats"].extend(_normalize_voice_webrtc_stats(item))
         payload["perceptual_metrics"] = _merge_voice_perceptual_metrics(
             payload["perceptual_metrics"],
             _voice_perceptual_metrics_from_record(item),
@@ -13262,8 +13288,10 @@ def _normalize_voice_export(
     payload["frame_replay"] = _dedupe_voice_dicts(payload["frame_replay"], "id", include_timestamp=True)
     payload["waveforms"] = _dedupe_voice_dicts(payload["waveforms"], "id")
     payload["diarization"] = _dedupe_voice_dicts(payload["diarization"], "id", include_timestamp=True)
+    payload["webrtc_stats"] = _dedupe_voice_dicts(payload["webrtc_stats"], "id", include_timestamp=True)
     payload["perceptual_metrics"] = _merge_voice_perceptual_metrics(
         payload["perceptual_metrics"],
+        {"segments": payload["webrtc_stats"]},
         waveforms=payload["waveforms"],
     )
     payload["timing_distribution"] = _normalize_voice_timing_distribution(payload["timing_distribution"])
@@ -13302,7 +13330,7 @@ def _pipecat_frame_log_export(
         for key in ("diarization", "speaker_segments", "speakers"):
             if key in item:
                 export[key] = copy.deepcopy(item[key])
-        for key in ("perceptual_metrics", "audio_quality", "quality_profile", "timing_distribution", "timing_profile", "timing", "latency_distribution", "latency_metrics", "metrics"):
+        for key in ("webrtc_stats", "rtc_stats", "get_stats", "stats_report", "perceptual_metrics", "audio_quality", "quality_profile", "timing_distribution", "timing_profile", "timing", "latency_distribution", "latency_metrics", "metrics"):
             if key in item:
                 export[key] = copy.deepcopy(item[key])
         if not export["frames"] and not export["events"] and _looks_like_voice_export_record(item):
@@ -13333,6 +13361,7 @@ def _merge_voice_export_payloads(*payloads: Mapping[str, Any]) -> Dict[str, Any]
         "frame_replay": [],
         "waveforms": [],
         "diarization": [],
+        "webrtc_stats": [],
         "perceptual_metrics": {},
         "timing_distribution": {},
         "metadata": {},
@@ -13342,7 +13371,7 @@ def _merge_voice_export_payloads(*payloads: Mapping[str, Any]) -> Dict[str, Any]
             continue
         merged["framework"] = str(payload.get("framework") or merged["framework"])
         merged["metadata"].update(copy.deepcopy(dict(payload.get("metadata", {}))))
-        for key in ("utterances", "event_replay", "frame_replay", "waveforms", "diarization"):
+        for key in ("utterances", "event_replay", "frame_replay", "waveforms", "diarization", "webrtc_stats"):
             merged[key].extend(copy.deepcopy(list(payload.get(key, []))))
         merged["perceptual_metrics"] = _merge_voice_perceptual_metrics(
             merged["perceptual_metrics"],
@@ -13436,6 +13465,11 @@ def _looks_like_voice_export_record(record: Mapping[str, Any]) -> bool:
             "latency",
             "timing",
             "metrics",
+            "webrtc",
+            "rtp",
+            "packetsreceived",
+            "packetslost",
+            "trackidentifier",
             "eou",
             "endpointing",
             "user_input_transcribed",
@@ -13590,6 +13624,23 @@ def _voice_utterance_from_export_record(record: Any, name: str, *, index: int) -
 def _voice_waveform_from_export_record(record: Mapping[str, Any], name: str, *, index: int) -> Optional[Dict[str, Any]]:
     payload = _as_mapping(record.get("payload") or record.get("data"))
     text = f"{name} {_stringify_dict(record)}".lower()
+    if _looks_like_voice_webrtc_stat_record(record) and not any(
+        key in record or key in payload
+        for key in (
+            "audio",
+            "audio_data",
+            "audio_uri",
+            "audio_path",
+            "recording_uri",
+            "uri",
+            "path",
+            "data",
+            "sample_count",
+            "num_frames",
+            "duration_ms",
+        )
+    ):
+        return None
     if not any(token in text for token in ("audio", "waveform", "recording", "webrtc", "rtp", "on_user_turn_audio_data", "on_bot_turn_audio_data")):
         return None
     waveform = {
@@ -14022,6 +14073,221 @@ def _voice_diarization_segment_from_record(record: Mapping[str, Any], name: str)
     return (_normalize_voice_diarization(record) or [None])[0]
 
 
+def _normalize_voice_webrtc_stats(value: Any) -> List[Dict[str, Any]]:
+    stats: List[Dict[str, Any]] = []
+    for index, record in enumerate(_voice_webrtc_stat_records(value)):
+        normalized = _normalize_voice_webrtc_stat(record, index=index)
+        if normalized:
+            stats.append(normalized)
+    return stats
+
+
+def _voice_webrtc_stat_records(value: Any) -> List[Mapping[str, Any]]:
+    if value in (None, ""):
+        return []
+    if hasattr(value, "model_dump"):
+        return _voice_webrtc_stat_records(value.model_dump())
+    if hasattr(value, "dict"):
+        return _voice_webrtc_stat_records(value.dict())
+    if isinstance(value, str):
+        text = value.strip()
+        if text.startswith(("{", "[")):
+            try:
+                return _voice_webrtc_stat_records(json.loads(text))
+            except json.JSONDecodeError:
+                return []
+        return []
+    if isinstance(value, Mapping):
+        item = copy.deepcopy(dict(value))
+        records: List[Mapping[str, Any]] = []
+        if _looks_like_voice_webrtc_stat_record(item):
+            records.append(item)
+        for key in (
+            "webrtc_stats",
+            "rtc_stats",
+            "get_stats",
+            "getStats",
+            "stats_report",
+            "statsReport",
+            "peer_connection_stats",
+            "peerConnectionStats",
+            "rtp_stats",
+            "rtpStats",
+            "track_stats",
+            "trackStats",
+            "tracks",
+            "codecs",
+        ):
+            if key in item:
+                records.extend(_voice_webrtc_stat_records(item[key]))
+        if not records and item:
+            nested_records: List[Mapping[str, Any]] = []
+            for key, nested in item.items():
+                if not isinstance(nested, Mapping):
+                    continue
+                nested_item = dict(nested)
+                nested_item.setdefault("id", key)
+                if _looks_like_voice_webrtc_stat_record(nested_item):
+                    nested_records.append(nested_item)
+            records.extend(nested_records)
+        return records
+    if isinstance(value, Iterable) and not isinstance(value, (str, bytes)):
+        records = []
+        for item in value:
+            records.extend(_voice_webrtc_stat_records(item))
+        return records
+    return []
+
+
+def _looks_like_voice_webrtc_stat_record(record: Mapping[str, Any]) -> bool:
+    if not record:
+        return False
+    stat_type = str(record.get("type") or record.get("stat_type") or "").lower()
+    if stat_type in {
+        "inbound-rtp",
+        "outbound-rtp",
+        "remote-inbound-rtp",
+        "remote-outbound-rtp",
+        "track",
+        "media-source",
+        "codec",
+    }:
+        return True
+    return any(
+        key in record
+        for key in (
+            "packetsReceived",
+            "packets_received",
+            "packetsSent",
+            "packets_sent",
+            "packetsLost",
+            "packets_lost",
+            "fractionLost",
+            "fraction_lost",
+            "jitter",
+            "jitterBufferDelay",
+            "trackIdentifier",
+            "track_identifier",
+            "audioLevel",
+            "audio_level",
+            "totalAudioEnergy",
+            "total_audio_energy",
+            "codecId",
+            "codec_id",
+            "mimeType",
+            "mime_type",
+            "ssrc",
+        )
+    )
+
+
+def _normalize_voice_webrtc_stat(
+    record: Mapping[str, Any],
+    *,
+    index: int,
+) -> Dict[str, Any]:
+    item = copy.deepcopy(dict(record))
+    payload = _as_mapping(item.get("payload") or item.get("data"))
+    if payload:
+        merged = copy.deepcopy(payload)
+        merged.update({key: value for key, value in item.items() if key not in {"payload", "data"}})
+        item = merged
+    stat_type = str(item.get("type") or item.get("stat_type") or "webrtc").lower()
+    result: Dict[str, Any] = {
+        "id": str(item.get("id") or item.get("stats_id") or f"webrtc_stat_{index + 1}"),
+        "type": stat_type,
+        "source": "webrtc_stats",
+    }
+    kind = item.get("kind") or item.get("mediaType") or item.get("media_type")
+    if kind is not None:
+        result["kind"] = str(kind).lower()
+    for source_key, target_key in (
+        ("timestamp", "timestamp"),
+        ("timestamp_ms", "timestamp_ms"),
+        ("trackIdentifier", "track_id"),
+        ("track_identifier", "track_id"),
+        ("trackId", "track_id"),
+        ("track_id", "track_id"),
+        ("mid", "mid"),
+        ("ssrc", "ssrc"),
+        ("codecId", "codec_id"),
+        ("codec_id", "codec_id"),
+        ("mimeType", "mime_type"),
+        ("mime_type", "mime_type"),
+        ("payloadType", "payload_type"),
+        ("payload_type", "payload_type"),
+        ("audioLevel", "audio_level"),
+        ("audio_level", "audio_level"),
+        ("totalAudioEnergy", "total_audio_energy"),
+        ("total_audio_energy", "total_audio_energy"),
+        ("totalSamplesDuration", "total_samples_duration"),
+        ("total_samples_duration", "total_samples_duration"),
+        ("bytesReceived", "bytes_received"),
+        ("bytes_received", "bytes_received"),
+        ("bytesSent", "bytes_sent"),
+        ("bytes_sent", "bytes_sent"),
+        ("packetsReceived", "packets_received"),
+        ("packets_received", "packets_received"),
+        ("packetsSent", "packets_sent"),
+        ("packets_sent", "packets_sent"),
+        ("packetsLost", "packets_lost"),
+        ("packets_lost", "packets_lost"),
+        ("roundTripTime", "round_trip_time_seconds"),
+        ("round_trip_time", "round_trip_time_seconds"),
+        ("round_trip_time_seconds", "round_trip_time_seconds"),
+        ("jitterBufferDelay", "jitter_buffer_delay_seconds"),
+        ("jitter_buffer_delay", "jitter_buffer_delay_seconds"),
+        ("concealedSamples", "concealed_samples"),
+        ("concealed_samples", "concealed_samples"),
+    ):
+        value = item.get(source_key)
+        if value is not None:
+            result[target_key] = value
+    jitter_ms = _voice_webrtc_jitter_ms(item)
+    if jitter_ms is not None:
+        result["jitter_ms"] = jitter_ms
+    quality = _voice_quality_from_mapping(item)
+    quality.update(_voice_quality_from_mapping(result))
+    result.update(quality)
+    packet_loss = _voice_webrtc_packet_loss_pct(item)
+    if packet_loss is not None:
+        result["packet_loss_pct"] = packet_loss
+    if result.get("mime_type"):
+        result["codec"] = str(result["mime_type"]).split("/")[-1].lower()
+    return result
+
+
+def _voice_webrtc_jitter_ms(record: Mapping[str, Any]) -> Optional[float]:
+    jitter_ms = _voice_float(record.get("jitter_ms"))
+    if jitter_ms is not None:
+        return jitter_ms
+    jitter = _voice_float(record.get("jitter"))
+    if jitter is None:
+        return None
+    return round(jitter * 1000, 4) if jitter <= 10 else jitter
+
+
+def _voice_webrtc_packet_loss_pct(record: Mapping[str, Any]) -> Optional[float]:
+    for key in ("packet_loss_pct", "packet_loss_percent"):
+        explicit = _voice_float(record.get(key))
+        if explicit is not None:
+            return explicit
+    fraction_lost = _voice_float(record.get("fraction_lost", record.get("fractionLost")))
+    if fraction_lost is not None:
+        return round(fraction_lost * 100, 4) if fraction_lost <= 1 else fraction_lost
+    packets_lost = _voice_float(record.get("packets_lost", record.get("packetsLost")))
+    packets_received = _voice_float(record.get("packets_received", record.get("packetsReceived")))
+    packets_sent = _voice_float(record.get("packets_sent", record.get("packetsSent")))
+    denominator = None
+    if packets_received is not None:
+        denominator = packets_received + (packets_lost or 0.0)
+    elif packets_sent is not None:
+        denominator = packets_sent + (packets_lost or 0.0)
+    if packets_lost is not None and denominator and denominator > 0:
+        return round((packets_lost / denominator) * 100, 4)
+    return None
+
+
 def _merge_voice_perceptual_metrics(*values: Any, waveforms: Optional[Iterable[Mapping[str, Any]]] = None) -> Dict[str, Any]:
     overall: Dict[str, Any] = {}
     segments: List[Dict[str, Any]] = []
@@ -14114,6 +14380,7 @@ def _voice_quality_from_mapping(value: Mapping[str, Any]) -> Dict[str, float]:
         "packet_loss_pct": "packet_loss_pct",
         "packet_loss_percent": "packet_loss_pct",
         "fraction_lost": "packet_loss_pct",
+        "fractionLost": "packet_loss_pct",
         "rms_db": "rms_db",
         "peak_db": "peak_db",
         "noise_db": "noise_db",
@@ -14128,7 +14395,7 @@ def _voice_quality_from_mapping(value: Mapping[str, Any]) -> Dict[str, float]:
             continue
         if raw_key == "jitter_seconds" or (raw_key == "jitter" and raw <= 10):
             raw *= 1000
-        if raw_key in {"fraction_lost", "clipping_pct", "clipping_percent"} and raw <= 1:
+        if raw_key in {"fraction_lost", "fractionLost", "clipping_pct", "clipping_percent"} and raw <= 1:
             raw *= 100
         if canonical == "clipping_ratio" and raw_key in {"clipping_pct", "clipping_percent"}:
             raw = raw / 100
