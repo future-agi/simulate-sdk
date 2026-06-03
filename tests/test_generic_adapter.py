@@ -3,6 +3,8 @@ import pytest
 from fi.simulate.agent.frameworks import supported_frameworks, wrap_framework
 from fi.simulate.agent.generic import GenericAgentWrapper, wrap_agent
 from fi.simulate.agent.wrapper import AgentInput, AgentResponse, SimulationArtifact
+from fi.simulate.simulation import Persona, Scenario
+from fi.simulate.simulation.engines.local_text import LocalTextEngine
 
 
 @pytest.fixture
@@ -100,6 +102,90 @@ async def test_generic_wrapper_collects_async_stream_chunks(agent_input):
     assert trace_artifact.metadata["framework"] == "langchain"
     assert trace_artifact.data["summary"]["completion_status"] == "completed"
     assert response.state["streaming_trace"]["summary"]["chunk_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_framework_wrapper_emits_runtime_contract_trace(agent_input):
+    class RuntimeAgent:
+        async def ainvoke(self, payload):
+            assert payload["metadata"]["framework"] == "langchain"
+            assert payload["input"] == "What is the next step?"
+            return {
+                "content": "Runtime contract repaired with tool and metadata evidence.",
+                "tool_calls": [{"id": "policy", "name": "lookup_policy", "arguments": {"topic": "refund"}}],
+                "artifacts": [
+                    {
+                        "type": "json",
+                        "role": "assistant",
+                        "data": {"adapter": "langchain", "contract": "ok"},
+                        "metadata": {"kind": "runtime_contract"},
+                    }
+                ],
+                "events": [
+                    {
+                        "type": "runtime_checkpoint",
+                        "name": "adapter_contract",
+                        "payload": {"input_mode": "dict", "method": "ainvoke"},
+                    }
+                ],
+                "metadata": {"runtime_contract": {"passed": True}},
+            }
+
+    response = await wrap_framework("langchain", RuntimeAgent(), trace_runtime=True).call(agent_input)
+
+    assert isinstance(response, AgentResponse)
+    trace_artifact = next(
+        artifact
+        for artifact in response.artifacts
+        if artifact.type == "trace" and artifact.metadata.get("kind") == "framework_runtime"
+    )
+    trace = trace_artifact.data
+    assert trace["kind"] == "framework_runtime"
+    assert trace["framework"] == "langchain"
+    assert trace["summary"]["invocation_count"] == 1
+    assert trace["invocations"][0]["method"] == "ainvoke"
+    assert trace["invocations"][0]["input_mode"] == "dict"
+    assert {"runtime", "method", "input", "output", "tool", "artifact", "event", "metadata"} <= set(trace["signals"])
+    assert response.state["framework_runtime"]["summary"]["tool_call_count"] == 1
+    assert response.metadata["framework_runtime"]["summary"]["metadata_key_count"] >= 1
+    assert response.events[-1].type == "framework_runtime"
+
+
+@pytest.mark.asyncio
+async def test_local_engine_carries_framework_runtime_trace_artifact():
+    class RuntimeAgent:
+        async def ainvoke(self, payload):
+            return {
+                "content": "Runtime contract repaired with tool and metadata evidence.",
+                "tool_calls": [{"id": "policy", "name": "lookup_policy", "arguments": {"topic": "refund"}}],
+                "metadata": {"runtime_contract": {"passed": True}},
+            }
+
+    scenario = Scenario(
+        name="runtime-contract",
+        dataset=[
+            Persona(
+                persona={"name": "Avery"},
+                situation="Avery needs a framework runtime adapter certified.",
+                outcome="Runtime contract repaired with tool and metadata evidence.",
+            )
+        ],
+    )
+    report = await LocalTextEngine().run(
+        scenario=scenario,
+        agent_callback=wrap_framework("langchain", RuntimeAgent(), trace_runtime=True),
+        max_turns=1,
+        min_turns=1,
+    )
+
+    result = report.results[0]
+    runtime_trace = result.metadata["environment_state"]["framework_runtime"]
+    assert runtime_trace["framework"] == "langchain"
+    assert runtime_trace["summary"]["tool_call_count"] == 1
+    assert any(
+        artifact.type == "trace" and artifact.metadata.get("kind") == "framework_runtime"
+        for artifact in result.artifacts
+    )
 
 
 @pytest.mark.asyncio

@@ -58,6 +58,8 @@ def wrap_framework(
     system_prompt: str | None = None,
     output_key: str | None = None,
     metadata: Optional[Dict[str, Any]] = None,
+    trace_runtime: bool = False,
+    runtime_metadata: Optional[Dict[str, Any]] = None,
 ) -> AgentWrapper:
     """
     Wrap a known framework by name without importing that framework.
@@ -82,4 +84,6 @@ def wrap_framework(
         output_key=output_key,
         system_prompt=system_prompt,
         metadata={"framework": spec.name, "modality": spec.modality, **(metadata or {})},
+        trace_runtime=trace_runtime,
+        runtime_metadata=runtime_metadata,
     )

@@ -1,5 +1,6 @@
 import inspect
 import json
+import time
 from typing import Any, Callable, Dict, Iterable, List, Literal, Optional, Union
 
 from fi.simulate.agent.wrapper import (
@@ -33,6 +34,8 @@ class GenericAgentWrapper(AgentWrapper):
         output_key: str | None = None,
         system_prompt: str | None = None,
         metadata: Optional[Dict[str, Any]] = None,
+        trace_runtime: bool = False,
+        runtime_metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
         self.agent = agent
         self.method = method
@@ -40,13 +43,22 @@ class GenericAgentWrapper(AgentWrapper):
         self.output_key = output_key
         self.system_prompt = system_prompt
         self.metadata = metadata or {}
+        self.trace_runtime = trace_runtime
+        self.runtime_metadata = runtime_metadata or {}
 
     async def call(self, input: AgentInput) -> Union[str, AgentResponse]:
         method = self._resolve_method()
         method_name = getattr(method, "__name__", None) or (
             self.method if isinstance(self.method, str) else None
         )
+        runtime_input_mode = (
+            self._infer_input_mode(method_name)
+            if self.input_mode == "auto"
+            else self.input_mode
+        )
         payload = self._build_payload(input, method_name=method_name)
+        started_at = time.time()
+        streamed = False
 
         if payload is _NO_PAYLOAD:
             raw = method()
@@ -57,11 +69,27 @@ class GenericAgentWrapper(AgentWrapper):
             raw = await raw
 
         if _is_async_stream(raw):
+            streamed = True
             raw = await self._coerce_async_stream(raw)
         elif _is_sync_stream(raw):
+            streamed = True
             raw = self._coerce_sync_stream(raw)
 
-        return self._coerce_response(raw)
+        response = self._coerce_response(raw)
+        if not self.trace_runtime:
+            return response
+        trace = _framework_runtime_trace(
+            framework=str(self.metadata.get("framework") or "generic"),
+            method_name=method_name,
+            input_mode=runtime_input_mode,
+            payload=payload,
+            response=response,
+            duration_ms=int((time.time() - started_at) * 1000),
+            streamed=streamed,
+            wrapper_metadata=self.metadata,
+            runtime_metadata=self.runtime_metadata,
+        )
+        return _attach_framework_runtime_trace(response, trace)
 
     def _resolve_method(self) -> Callable[..., Any]:
         if isinstance(self.agent, AgentWrapper):
@@ -324,6 +352,8 @@ def wrap_agent(
     output_key: str | None = None,
     system_prompt: str | None = None,
     metadata: Optional[Dict[str, Any]] = None,
+    trace_runtime: bool = False,
+    runtime_metadata: Optional[Dict[str, Any]] = None,
 ) -> AgentWrapper:
     """Return an AgentWrapper for an existing AgentWrapper, object, or callable."""
 
@@ -336,6 +366,8 @@ def wrap_agent(
         output_key=output_key,
         system_prompt=system_prompt,
         metadata=metadata,
+        trace_runtime=trace_runtime,
+        runtime_metadata=runtime_metadata,
     )
 
 
@@ -498,6 +530,192 @@ def _streaming_trace_from_chunks(chunks: List[Any], metadata: Dict[str, Any]) ->
         chunks,
         metadata=trace_metadata,
     )
+
+
+def _framework_runtime_trace(
+    *,
+    framework: str,
+    method_name: str | None,
+    input_mode: str,
+    payload: Any,
+    response: str | AgentResponse,
+    duration_ms: int,
+    streamed: bool,
+    wrapper_metadata: Dict[str, Any],
+    runtime_metadata: Dict[str, Any],
+) -> Dict[str, Any]:
+    response_dict = _response_summary(response)
+    signals = {"framework", "runtime", "method", "input", "output", "latency"}
+    if streamed or response_dict.get("streaming"):
+        signals.add("streaming")
+    if response_dict.get("tool_call_count", 0) > 0:
+        signals.add("tool")
+    if response_dict.get("artifact_count", 0) > 0:
+        signals.add("artifact")
+    if response_dict.get("event_count", 0) > 0:
+        signals.add("event")
+    if response_dict.get("state_keys"):
+        signals.add("state")
+    if response_dict.get("metadata_keys"):
+        signals.add("metadata")
+
+    invocation = {
+        "id": "framework_runtime_1",
+        "framework": framework or "generic",
+        "method": method_name or "callable",
+        "input_mode": "none" if payload is _NO_PAYLOAD else input_mode,
+        "input": _shape_summary(payload),
+        "output": response_dict,
+        "duration_ms": max(0, int(duration_ms)),
+        "signals": sorted(signals),
+    }
+    summary = {
+        "invocation_count": 1,
+        "framework": framework or "generic",
+        "methods": [invocation["method"]],
+        "input_modes": [invocation["input_mode"]],
+        "output_types": [response_dict["type"]],
+        "tool_call_count": response_dict.get("tool_call_count", 0),
+        "artifact_count": response_dict.get("artifact_count", 0),
+        "event_count": response_dict.get("event_count", 0),
+        "state_key_count": len(response_dict.get("state_keys", [])),
+        "metadata_key_count": len(response_dict.get("metadata_keys", [])),
+        "streamed": bool(streamed or response_dict.get("streaming")),
+        "error_count": 0,
+        "duration_ms": invocation["duration_ms"],
+    }
+    return {
+        "kind": "framework_runtime",
+        "framework": framework or "generic",
+        "modality": wrapper_metadata.get("modality"),
+        "invocations": [invocation],
+        "summary": summary,
+        "signals": sorted(signals),
+        "metadata": {
+            "source": "generic_agent_wrapper",
+            **dict(wrapper_metadata),
+            **dict(runtime_metadata),
+        },
+    }
+
+
+def _attach_framework_runtime_trace(
+    response: str | AgentResponse,
+    trace: Dict[str, Any],
+) -> AgentResponse:
+    artifact = SimulationArtifact(
+        type="trace",
+        role="assistant",
+        data=trace,
+        metadata={
+            "kind": "framework_runtime",
+            "framework": trace.get("framework", "generic"),
+            "source": "generic_agent_wrapper",
+        },
+    )
+    event = SimulationEvent(
+        type="framework_runtime",
+        name=str(trace["invocations"][0].get("method") or "callable"),
+        payload=trace["invocations"][0],
+        metadata={"kind": "framework_runtime", "framework": trace.get("framework", "generic")},
+    )
+    runtime_metadata = {
+        "framework_runtime": {
+            "framework": trace.get("framework", "generic"),
+            "signals": list(trace.get("signals", [])),
+            "summary": dict(trace.get("summary", {})),
+        }
+    }
+    if not isinstance(response, AgentResponse):
+        return AgentResponse(
+            content=str(response),
+            artifacts=[artifact],
+            events=[event],
+            state={"framework_runtime": trace},
+            metadata=runtime_metadata,
+        )
+
+    state = dict(response.state or {})
+    state["framework_runtime"] = trace
+    metadata = {**dict(response.metadata or {}), **runtime_metadata}
+    return AgentResponse(
+        content=response.content,
+        tool_calls=response.tool_calls,
+        tool_responses=response.tool_responses,
+        artifacts=[*response.artifacts, artifact],
+        events=[*response.events, event],
+        memory_updates=response.memory_updates,
+        state=state,
+        metadata=metadata,
+    )
+
+
+def _response_summary(response: str | AgentResponse) -> Dict[str, Any]:
+    if not isinstance(response, AgentResponse):
+        return {
+            "type": type(response).__name__,
+            "content_length": len(str(response)),
+            "tool_call_count": 0,
+            "artifact_count": 0,
+            "event_count": 0,
+            "state_keys": [],
+            "metadata_keys": [],
+            "streaming": False,
+        }
+    metadata = dict(response.metadata or {})
+    state = dict(response.state or {})
+    return {
+        "type": "AgentResponse",
+        "content_length": len(response.content or ""),
+        "tool_call_count": len(response.tool_calls or []),
+        "tool_names": sorted(
+            {
+                str(call.get("name") or call.get("tool") or call.get("function", {}).get("name") or "")
+                for call in response.tool_calls or []
+                if isinstance(call, dict)
+            }
+        ),
+        "tool_response_count": len(response.tool_responses or []),
+        "artifact_count": len(response.artifacts),
+        "artifact_types": sorted({artifact.type for artifact in response.artifacts}),
+        "event_count": len(response.events),
+        "event_types": sorted({event.type for event in response.events}),
+        "state_keys": sorted(str(key) for key in state.keys()),
+        "metadata_keys": sorted(str(key) for key in metadata.keys()),
+        "streaming": bool(metadata.get("streaming") or state.get("streaming_trace")),
+    }
+
+
+def _shape_summary(value: Any) -> Dict[str, Any]:
+    if value is _NO_PAYLOAD:
+        return {"type": "none"}
+    if isinstance(value, AgentInput):
+        return {
+            "type": "AgentInput",
+            "message_count": len(value.messages),
+            "tool_count": len(value.tools),
+            "artifact_count": len(value.artifacts),
+            "event_count": len(value.events),
+            "modality": value.modality,
+        }
+    if isinstance(value, dict):
+        return {
+            "type": "dict",
+            "keys": sorted(str(key) for key in value.keys()),
+            "message_count": len(value.get("messages") or []),
+            "tool_count": len(value.get("tools") or []),
+            "artifact_count": len(value.get("artifacts") or []),
+            "event_count": len(value.get("events") or []),
+            "has_metadata": isinstance(value.get("metadata"), dict),
+        }
+    if isinstance(value, list):
+        return {"type": "list", "length": len(value)}
+    if isinstance(value, tuple):
+        return {"type": "tuple", "length": len(value)}
+    if isinstance(value, (str, bytes)):
+        text = value.decode("utf-8", errors="replace") if isinstance(value, bytes) else value
+        return {"type": type(value).__name__, "length": len(text)}
+    return {"type": type(value).__name__}
 
 
 def _choices_content(choices: Any) -> str:
