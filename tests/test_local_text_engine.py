@@ -317,6 +317,89 @@ async def test_generated_tool_task_runs_and_scores_with_local_evaluator():
 
 
 @pytest.mark.asyncio
+async def test_local_text_engine_promotes_generic_stream_to_trace_state_and_scores():
+    scenario = Scenario(
+        name="generic-stream-trace",
+        dataset=[
+            Persona(
+                persona={"name": "Avery"},
+                situation="Avery needs the refund workflow streamed.",
+                outcome="Submit the refund form.",
+            )
+        ],
+    )
+
+    class LangGraphLikeStream:
+        async def ainvoke(self, payload):
+            assert payload["metadata"]["framework"] == "langgraph"
+            yield {
+                "event": "on_chat_model_stream",
+                "data": {"chunk": {"content": "Submit "}},
+                "timestamp_ms": 100,
+            }
+            yield {
+                "type": "response.output_text.delta",
+                "delta": "the refund form.",
+                "tool_call_chunks": [
+                    {
+                        "id": "call_1",
+                        "name": "lookup_policy",
+                        "args": {"topic": "refund"},
+                    }
+                ],
+                "timestamp_ms": 125,
+            }
+            yield {"event": "response.completed", "status": "completed", "timestamp_ms": 140}
+
+    report = await LocalTextEngine().run(
+        scenario=scenario,
+        agent_callback=LangGraphLikeStream(),
+        agent_wrapper_kwargs={
+            "method": "ainvoke",
+            "input_mode": "dict",
+            "metadata": {"framework": "langgraph"},
+        },
+        max_turns=1,
+        min_turns=1,
+    )
+    result = report.results[0]
+    trace_state = result.metadata["environment_state"]["streaming_trace"]
+    trace_artifact = next(
+        artifact
+        for artifact in result.artifacts
+        if artifact.type == "trace" and artifact.metadata.get("kind") == "streaming_trace"
+    )
+
+    assert trace_state["framework"] == "langgraph"
+    assert trace_state["summary"]["assembled_text"] == "Submit the refund form."
+    assert trace_state["summary"]["tool_delta_count"] == 1
+    assert trace_artifact.data["summary"]["completion_status"] == "completed"
+
+    evaluation = evaluate_agent_report(
+        report,
+        config={
+            "required_streaming_trace": ["trace", "event", "chunk", "tool_delta", "final"],
+            "streaming_trace_quality": {
+                "expected_output_contains": ["Submit the refund form."],
+                "required_chunks": ["Submit ", "the refund form."],
+                "expected_chunk_sequence": ["Submit ", "the refund form."],
+                "expected_tool_deltas": [
+                    {"name": "lookup_policy", "arguments": {"topic": "refund"}}
+                ],
+                "min_chunk_count": 2,
+                "min_tool_delta_count": 1,
+                "require_completion": True,
+            },
+        },
+        threshold=0.7,
+    )
+    scores = evaluation.summary["metric_averages"]
+
+    assert scores["streaming_trace_coverage"] == 1.0
+    assert scores["streaming_interaction_quality"] == 1.0
+
+
+@pytest.mark.asyncio
 async def test_generated_trajectory_template_task_runs_and_scores_locally():
     bundle = SyntheticDataGenerator().generate_trajectory_template_task(
         "refund trajectory",

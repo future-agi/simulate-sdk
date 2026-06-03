@@ -225,7 +225,7 @@ Scores and transcripts land in the platform dashboard. The local `TestReport` is
 
 ## Agent wrappers
 
-Built-in adapters for common SDKs plus a framework-neutral adapter layer. The generic adapter carries normalized messages, tools, memory, events, multimodal artifacts, and sync/async stream chunks, so the same report shape works for text, voice, image, browser/CUA, and framework-specific runtimes.
+Built-in adapters for common SDKs plus a framework-neutral adapter layer. The generic adapter carries normalized messages, tools, memory, events, multimodal artifacts, and sync/async stream chunks, so the same report shape works for text, voice, image, browser/CUA, and framework-specific runtimes. Stream outputs are also promoted into a `streaming_trace` trace artifact and report state, giving ai-evaluation and agent-opt the same chunk/tool-delta/finalization evidence that replay environments expose.
 
 | Wrapper | Wraps | Import |
 |---|---|---|

@@ -9360,16 +9360,16 @@ def _streaming_event_type(
     normalized = _normalize_streaming_trace_key(raw_type)
     text = " ".join([raw_type, _framework_sources_text(raw, data, payload, chunk, delta_payload)])
     lowered = text.lower()
-    if any(token in lowered for token in ("tool_call_delta", "tool_call_chunk", "function_call_arguments.delta")):
+    if any(token in lowered for token in ("tool_call_delta", "function_call_arguments.delta")):
         return "tool_delta"
+    if any(token in lowered for token in ("response.output_text.delta", "text_delta", "message_delta")):
+        return "chunk"
     if any(
         source.get(key) not in (None, "", [], {})
         for source in (raw, data, payload, chunk, delta_payload)
         for key in ("tool_call_chunks", "tool_calls")
     ):
         return "tool_delta"
-    if any(token in lowered for token in ("response.output_text.delta", "text_delta", "message_delta")):
-        return "chunk"
     if any(token in lowered for token in ("final", "completed", "complete", "message_end", "response.done", "fullresponseend")):
         return "final"
     if any(token in lowered for token in ("interrupt", "barge", "cancel")):

@@ -192,10 +192,29 @@ class GenericAgentWrapper(AgentWrapper):
             events.extend(self._extract_events(chunk))
             events.append(_stream_chunk_event(chunk, index=index, text=text))
 
+        trace = _streaming_trace_from_chunks(chunks, self.metadata)
+        state: Dict[str, Any] = {}
+        if trace.get("events"):
+            artifacts.append(
+                SimulationArtifact(
+                    type="trace",
+                    role="assistant",
+                    data=trace,
+                    metadata={
+                        "kind": "streaming_trace",
+                        "framework": trace.get("framework", "generic"),
+                        "source": "generic_agent_wrapper",
+                    },
+                )
+            )
+            state["streaming_trace"] = trace
+
         metadata = {
             "streaming": {
                 "chunk_count": len(chunks),
                 "content_part_count": len(content_parts),
+                "signals": list(trace.get("signals", [])),
+                "summary": dict(trace.get("summary", {})),
             },
             **self.metadata,
         }
@@ -205,6 +224,7 @@ class GenericAgentWrapper(AgentWrapper):
             tool_responses=tool_responses or None,
             artifacts=artifacts,
             events=events,
+            state=state or None,
             metadata=metadata,
         )
 
@@ -463,6 +483,21 @@ def _stream_chunk_field(chunk: Any, names: Iterable[str]) -> Any:
             if value is not None:
                 return value
     return None
+
+
+def _streaming_trace_from_chunks(chunks: List[Any], metadata: Dict[str, Any]) -> Dict[str, Any]:
+    from fi.simulate.environment import normalize_streaming_trace_events
+
+    framework = str(metadata.get("framework") or "generic")
+    trace_metadata = {
+        "source": "generic_agent_wrapper",
+        **dict(metadata),
+    }
+    return normalize_streaming_trace_events(
+        framework,
+        chunks,
+        metadata=trace_metadata,
+    )
 
 
 def _choices_content(choices: Any) -> str:

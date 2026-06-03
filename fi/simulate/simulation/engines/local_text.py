@@ -242,6 +242,7 @@ class LocalTextEngine(BaseEngine):
                 )
             if response.state:
                 memory.setdefault("state", {}).update(response.state)
+                _deep_merge(environment_state, response.state)
                 events.append(
                     SimulationEvent(
                         type="state_update",

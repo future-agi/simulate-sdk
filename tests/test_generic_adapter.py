@@ -89,7 +89,17 @@ async def test_generic_wrapper_collects_async_stream_chunks(agent_input):
     ]
     assert response.events[0].timestamp_ms == 100
     assert response.metadata["streaming"]["chunk_count"] == 3
+    assert response.metadata["streaming"]["summary"]["assembled_text"] == "Submit the refund form."
+    assert response.metadata["streaming"]["summary"]["tool_delta_count"] == 1
     assert response.metadata["framework"] == "langchain"
+    trace_artifact = next(
+        artifact
+        for artifact in response.artifacts
+        if artifact.type == "trace" and artifact.metadata.get("kind") == "streaming_trace"
+    )
+    assert trace_artifact.metadata["framework"] == "langchain"
+    assert trace_artifact.data["summary"]["completion_status"] == "completed"
+    assert response.state["streaming_trace"]["summary"]["chunk_count"] == 2
 
 
 @pytest.mark.asyncio
