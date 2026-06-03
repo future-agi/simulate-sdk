@@ -2152,6 +2152,15 @@ async def test_optimizer_trace_environment_emits_society_trace_and_scores_qualit
         rounds=[{"round": 1}, {"round": 2}, {"round": 3}],
         diagnostics=[{"component": "multi_agent", "failure_mode": "coordination_failure"}],
         search_paths=["multi_agent.handoff.contract", "security.adversarial_review"],
+        governance={
+            "checks": [
+                {"name": "role_diversity", "passed": True},
+                {"name": "mediator_review", "passed": True},
+                {"name": "contract_gate", "passed": True},
+                {"name": "rollback_check", "passed": True},
+                {"name": "search_locality", "passed": True},
+            ]
+        },
         best_candidate_id="candidate_sangha",
         final_score=1.0,
     )
@@ -2161,6 +2170,7 @@ async def test_optimizer_trace_environment_emits_society_trace_and_scores_qualit
             content="Optimizer society trace inspected with role credit and synthesis.",
             tool_calls=[
                 {"id": "status", "name": "optimizer_trace_status", "arguments": {}},
+                {"id": "governance", "name": "inspect_optimizer_governance", "arguments": {}},
                 {"id": "role", "name": "inspect_optimizer_role", "arguments": {"role": "sangha"}},
                 {
                     "id": "proposals",
@@ -2181,6 +2191,8 @@ async def test_optimizer_trace_environment_emits_society_trace_and_scores_qualit
     state = result.metadata["environment_state"]["optimizer_society_trace"]
     assert state["summary"]["proposal_count"] == 5
     assert state["summary"]["has_synthesis"] is True
+    assert state["summary"]["has_governance"] is True
+    assert state["summary"]["has_contract_gate"] is True
     assert any(
         artifact.metadata.get("kind") == "optimizer_society_trace"
         for artifact in result.artifacts
@@ -2202,6 +2214,12 @@ async def test_optimizer_trace_environment_emits_society_trace_and_scores_qualit
                 "critique",
                 "synthesis",
                 "steward",
+                "governance",
+                "role_diversity",
+                "mediator_review",
+                "contract_gate",
+                "rollback_check",
+                "search_locality",
                 "best_candidate",
             ],
             "optimizer_trace_quality": {
@@ -2212,6 +2230,9 @@ async def test_optimizer_trace_environment_emits_society_trace_and_scores_qualit
                 "min_credit_entries": 4,
                 "required_archetypes": ["collective_synthesis", "prudent_critic"],
                 "required_search_paths": ["multi_agent.handoff.contract"],
+                "required_governance_signals": ["role_diversity", "mediator_review", "contract_gate", "rollback_check", "search_locality"],
+                "min_governance_checks": 5,
+                "min_governance_pass_rate": 1.0,
                 "min_best_score": 0.99,
                 "required_best_role": "sangha",
                 "require_role_graph": True,
@@ -2219,6 +2240,12 @@ async def test_optimizer_trace_environment_emits_society_trace_and_scores_qualit
                 "require_critique": True,
                 "require_synthesis": True,
                 "require_steward": True,
+                "require_governance": True,
+                "require_role_diversity": True,
+                "require_mediator": True,
+                "require_contract_gate": True,
+                "require_rollback": True,
+                "require_locality": True,
                 "max_duplicate_candidate_count": 0,
             },
         },

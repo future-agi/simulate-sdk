@@ -6,7 +6,8 @@ Requires:
 
 This audits optimizer deliberation itself: roles, proposals, diagnostics,
 role-credit, critique, synthesis, steward simplification, and best-candidate
-selection are carried as a trace artifact and scored locally.
+selection are carried as a trace artifact and scored locally. Governance checks
+cover role diversity, mediator review, contract gates, rollback, and locality.
 """
 
 import asyncio
@@ -76,6 +77,15 @@ TRACE = normalize_optimizer_society_trace(
     rounds=[{"round": 1}, {"round": 2}, {"round": 3}],
     diagnostics=[{"component": "multi_agent", "failure_mode": "coordination_failure"}],
     search_paths=["multi_agent.handoff.contract", "security.adversarial_review"],
+    governance={
+        "checks": [
+            {"name": "role_diversity", "passed": True},
+            {"name": "mediator_review", "passed": True},
+            {"name": "contract_gate", "passed": True},
+            {"name": "rollback_check", "passed": True},
+            {"name": "search_locality", "passed": True},
+        ]
+    },
     best_candidate_id="synthesis_patch",
     final_score=1.0,
 )
@@ -86,6 +96,7 @@ async def trace_auditor(input):
         content="Optimizer society trace inspected with role credit, critique, synthesis, and steward evidence.",
         tool_calls=[
             {"id": "status", "name": "optimizer_trace_status", "arguments": {}},
+            {"id": "governance", "name": "inspect_optimizer_governance", "arguments": {}},
             {"id": "role", "name": "inspect_optimizer_role", "arguments": {"role": "sangha"}},
             {
                 "id": "proposal",
@@ -130,6 +141,12 @@ async def main():
                 "critique",
                 "synthesis",
                 "steward",
+                "governance",
+                "role_diversity",
+                "mediator_review",
+                "contract_gate",
+                "rollback_check",
+                "search_locality",
                 "best_candidate",
             ],
             "optimizer_trace_quality": {
@@ -140,6 +157,9 @@ async def main():
                 "min_credit_entries": 4,
                 "required_archetypes": ["collective_synthesis", "prudent_critic"],
                 "required_search_paths": ["multi_agent.handoff.contract"],
+                "required_governance_signals": ["role_diversity", "mediator_review", "contract_gate", "rollback_check", "search_locality"],
+                "min_governance_checks": 5,
+                "min_governance_pass_rate": 1.0,
                 "min_best_score": 0.99,
                 "required_best_role": "sangha",
                 "require_role_graph": True,
@@ -147,6 +167,12 @@ async def main():
                 "require_critique": True,
                 "require_synthesis": True,
                 "require_steward": True,
+                "require_governance": True,
+                "require_role_diversity": True,
+                "require_mediator": True,
+                "require_contract_gate": True,
+                "require_rollback": True,
+                "require_locality": True,
                 "max_duplicate_candidate_count": 0,
             },
         },

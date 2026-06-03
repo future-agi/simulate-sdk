@@ -5627,6 +5627,7 @@ class OptimizerTraceEnvironment(EnvironmentAdapter):
         rounds: Optional[Iterable[Mapping[str, Any]]] = None,
         diagnostics: Optional[Iterable[Mapping[str, Any]]] = None,
         search_paths: Optional[Iterable[str]] = None,
+        governance: Optional[Mapping[str, Any]] = None,
         best_candidate_id: Optional[str] = None,
         final_score: Optional[float] = None,
         metadata: Optional[Mapping[str, Any]] = None,
@@ -5640,6 +5641,7 @@ class OptimizerTraceEnvironment(EnvironmentAdapter):
             rounds=rounds,
             diagnostics=diagnostics,
             search_paths=search_paths,
+            governance=governance,
             best_candidate_id=best_candidate_id,
             final_score=final_score,
             metadata=metadata,
@@ -5669,6 +5671,15 @@ class OptimizerTraceEnvironment(EnvironmentAdapter):
                     metadata={"kind": "optimizer_society_trace", "role": proposal.get("role")},
                 )
             )
+        if self.trace.get("governance"):
+            events.append(
+                SimulationEvent(
+                    type="optimizer_governance",
+                    name="optimizer_governance_ready",
+                    payload=copy.deepcopy(dict(self.trace.get("governance") or {})),
+                    metadata={"kind": "optimizer_society_trace"},
+                )
+            )
         return EnvironmentSnapshot(
             tools=self._tool_specs(),
             artifacts=[self._trace_artifact()],
@@ -5695,6 +5706,7 @@ class OptimizerTraceEnvironment(EnvironmentAdapter):
             "list_optimizer_proposals",
             "inspect_optimizer_role",
             "inspect_optimizer_candidate",
+            "inspect_optimizer_governance",
         }:
             return None
         arguments = _tool_arguments(tool_call)
@@ -5769,6 +5781,28 @@ class OptimizerTraceEnvironment(EnvironmentAdapter):
             event_name = "optimizer_role_inspected" if success else "optimizer_role_missing"
             content = f"Inspected optimizer role {role_name}." if success else f"Optimizer role not found: {role_name}"
             error = None if success else "role_not_found"
+        elif name == "inspect_optimizer_governance":
+            signal = _normalize_optimizer_trace_key(arguments.get("signal") or arguments.get("name") or "")
+            governance = copy.deepcopy(dict(self.trace.get("governance") or {}))
+            checks = [copy.deepcopy(dict(item)) for item in _as_iterable(governance.get("checks")) if isinstance(item, Mapping)]
+            if signal:
+                checks = [
+                    check
+                    for check in checks
+                    if _normalize_optimizer_trace_key(check.get("name") or check.get("check")) == signal
+                ]
+            result = {
+                "name": self.trace.get("name"),
+                "governance": {
+                    **governance,
+                    "checks": checks,
+                },
+                "query": {"signal": signal},
+            }
+            event_name = "optimizer_governance_inspected"
+            content = f"Inspected {len(checks)} optimizer governance check(s)."
+            success = True
+            error = None
         else:
             candidate_id = str(arguments.get("id") or arguments.get("candidate_id") or "")
             proposal = next(
@@ -5838,6 +5872,11 @@ class OptimizerTraceEnvironment(EnvironmentAdapter):
                 "description": "Inspect one optimizer proposal by candidate id.",
                 "parameters": {"type": "object", "properties": {"candidate_id": {"type": "string"}}},
             },
+            {
+                "name": "inspect_optimizer_governance",
+                "description": "Inspect optimizer governance checks such as diversity, contract gates, rollback, locality, and dependency audit.",
+                "parameters": {"type": "object", "properties": {"signal": {"type": "string"}}},
+            },
         ]
 
     def _trace_artifact(self) -> SimulationArtifact:
@@ -5862,6 +5901,7 @@ def normalize_optimizer_society_trace(
     rounds: Optional[Iterable[Mapping[str, Any]]] = None,
     diagnostics: Optional[Iterable[Mapping[str, Any]]] = None,
     search_paths: Optional[Iterable[str]] = None,
+    governance: Optional[Mapping[str, Any]] = None,
     best_candidate_id: Optional[str] = None,
     final_score: Optional[float] = None,
     metadata: Optional[Mapping[str, Any]] = None,
@@ -5891,6 +5931,9 @@ def normalize_optimizer_society_trace(
             for path in _as_iterable(search_paths if search_paths is not None else source.get("search_paths") or [])
             if str(path)
         }
+    )
+    normalized_governance = _normalize_optimizer_governance(
+        governance if governance is not None else source.get("governance") or {}
     )
     normalized_metadata = {
         **copy.deepcopy(dict(source.get("metadata") or {})),
@@ -5931,6 +5974,7 @@ def normalize_optimizer_society_trace(
         diagnostics=normalized_diagnostics,
         search_paths=normalized_search_paths,
         role_credit=role_credit,
+        governance=normalized_governance,
         best_candidate_id=normalized_best_candidate_id,
     )
     summary = _optimizer_trace_summary(
@@ -5940,6 +5984,7 @@ def normalize_optimizer_society_trace(
         diagnostics=normalized_diagnostics,
         search_paths=normalized_search_paths,
         role_credit=role_credit,
+        governance=normalized_governance,
         best_candidate_id=normalized_best_candidate_id,
         final_score=normalized_final_score,
     )
@@ -5953,6 +5998,7 @@ def normalize_optimizer_society_trace(
         "diagnostics": normalized_diagnostics,
         "search_paths": normalized_search_paths,
         "role_credit": role_credit,
+        "governance": normalized_governance,
         "best_candidate_id": normalized_best_candidate_id or None,
         "final_score": normalized_final_score,
         "signals": sorted(signals),
@@ -6056,6 +6102,74 @@ def _optimizer_role_credit(proposals: Sequence[Mapping[str, Any]]) -> List[Dict[
     ]
 
 
+def _normalize_optimizer_governance(value: Any) -> Dict[str, Any]:
+    source = copy.deepcopy(dict(value or {})) if isinstance(value, Mapping) else {}
+    raw_checks = source.get("checks") if source else value
+    checks: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in _as_iterable(raw_checks or []):
+        if isinstance(item, Mapping):
+            check = copy.deepcopy(dict(item))
+            name = _normalize_optimizer_trace_key(check.get("name") or check.get("check") or check.get("signal"))
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            checks.append(
+                {
+                    "name": name,
+                    "passed": bool(check.get("passed", check.get("match", True))),
+                    "reason": str(check.get("reason") or ""),
+                    "evidence": copy.deepcopy(dict(check.get("evidence") or {})),
+                    "metadata": copy.deepcopy(dict(check.get("metadata") or {})),
+                }
+            )
+        else:
+            name = _normalize_optimizer_trace_key(item)
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            checks.append({"name": name, "passed": True, "reason": "", "evidence": {}, "metadata": {}})
+    explicit_signals = {
+        _normalize_optimizer_trace_key(signal)
+        for signal in _as_iterable(source.get("signals") if source else [])
+        if _normalize_optimizer_trace_key(signal)
+    }
+    passed_signals = {
+        _normalize_optimizer_trace_key(check.get("name"))
+        for check in checks
+        if check.get("passed")
+    }
+    signals = {"governance", *explicit_signals, *passed_signals} if checks or explicit_signals else set()
+    passed_count = sum(1 for check in checks if check.get("passed"))
+    summary = {
+        **copy.deepcopy(dict(source.get("summary") or {})),
+        "governance_check_count": len(checks),
+        "governance_passed_count": passed_count,
+        "governance_pass_rate": round(passed_count / len(checks), 4) if checks else 0.0,
+        "has_governance": bool(checks or explicit_signals),
+        "has_role_diversity": _optimizer_governance_passed(checks, "role_diversity"),
+        "has_mediator": _optimizer_governance_passed(checks, "mediator_review"),
+        "has_contract_gate": _optimizer_governance_passed(checks, "contract_gate"),
+        "has_rollback": _optimizer_governance_passed(checks, "rollback_check"),
+        "has_locality": _optimizer_governance_passed(checks, "search_locality"),
+        "has_dependency_audit": _optimizer_governance_passed(checks, "dependency_audit"),
+    }
+    return {
+        "checks": checks,
+        "signals": sorted(signal for signal in signals if signal),
+        "summary": summary,
+    }
+
+
+def _optimizer_governance_passed(checks: Sequence[Mapping[str, Any]], name: str) -> bool:
+    normalized = _normalize_optimizer_trace_key(name)
+    return any(
+        _normalize_optimizer_trace_key(check.get("name")) == normalized
+        and bool(check.get("passed"))
+        for check in checks
+    )
+
+
 def _optimizer_trace_signals(
     *,
     roles: Sequence[Mapping[str, Any]],
@@ -6064,6 +6178,7 @@ def _optimizer_trace_signals(
     diagnostics: Sequence[Mapping[str, Any]],
     search_paths: Sequence[str],
     role_credit: Sequence[Mapping[str, Any]],
+    governance: Mapping[str, Any],
     best_candidate_id: str,
 ) -> set[str]:
     signals = {"optimizer", "society_trace"}
@@ -6085,6 +6200,13 @@ def _optimizer_trace_signals(
         signals.add("search_path")
     if role_credit:
         signals.add("credit")
+    governance_signals = {
+        _normalize_optimizer_trace_key(signal)
+        for signal in _as_iterable(governance.get("signals"))
+        if _normalize_optimizer_trace_key(signal)
+    }
+    if governance_signals or _as_iterable(governance.get("checks")):
+        signals.update({"governance", *governance_signals})
     if best_candidate_id:
         signals.add("best_candidate")
     role_tokens = {
@@ -6113,6 +6235,7 @@ def _optimizer_trace_summary(
     diagnostics: Sequence[Mapping[str, Any]],
     search_paths: Sequence[str],
     role_credit: Sequence[Mapping[str, Any]],
+    governance: Mapping[str, Any],
     best_candidate_id: str,
     final_score: Optional[float],
 ) -> Dict[str, Any]:
@@ -6124,7 +6247,8 @@ def _optimizer_trace_summary(
         _normalize_optimizer_trace_key(proposal.get("role_kind"))
         for proposal in proposals
     }
-    return {
+    governance_summary = copy.deepcopy(dict(governance.get("summary") or {}))
+    summary = {
         "role_count": len(roles),
         "proposal_count": len(proposals),
         "evaluation_count": sum(1 for proposal in proposals if _optional_float(proposal.get("score")) is not None),
@@ -6141,6 +6265,21 @@ def _optimizer_trace_summary(
         "has_steward": bool(role_tokens & {"steward", "dharma_steward"}),
         "terminal_status": "completed" if best_candidate_id or final_score is not None else "running",
     }
+    for key in (
+        "governance_check_count",
+        "governance_passed_count",
+        "governance_pass_rate",
+        "has_governance",
+        "has_role_diversity",
+        "has_mediator",
+        "has_contract_gate",
+        "has_rollback",
+        "has_locality",
+        "has_dependency_audit",
+    ):
+        if key in governance_summary:
+            summary[key] = governance_summary[key]
+    return summary
 
 
 def _normalize_optimizer_trace_key(value: Any) -> str:
