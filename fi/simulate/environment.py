@@ -1911,6 +1911,21 @@ def normalize_voice_export(
     )
 
 
+def normalize_pipecat_frame_log(
+    frame_log: Any,
+    *,
+    audio_captures: Optional[Iterable[str | Mapping[str, Any]]] = None,
+    source_label: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Normalize Pipecat frame/event logs plus raw audio captures."""
+
+    return normalize_voice_export(
+        _pipecat_frame_log_export(frame_log, audio_captures=audio_captures),
+        framework="pipecat",
+        source_label=source_label,
+    )
+
+
 def normalize_voice_timing_distribution(
     timing_distribution: Any,
     *,
@@ -1929,6 +1944,79 @@ def normalize_voice_timing_distribution(
         )
         if latency_profile
         else None,
+    )
+
+
+def load_pipecat_frame_log(
+    source: str | os.PathLike[str] | Mapping[str, Any] | Iterable[Any],
+    *,
+    audio_captures: Optional[Iterable[str | Mapping[str, Any]]] = None,
+    headers: Optional[Mapping[str, str]] = None,
+    auth: Optional[Mapping[str, Any]] = None,
+    pagination: Optional[Mapping[str, Any]] = None,
+    max_pages: int = 20,
+    timeout: float = 30.0,
+    sample_rate_hz: int = 16000,
+    stt_latency_ms: int = 180,
+    tts_latency_ms: int = 320,
+    state: Optional[Dict[str, Any]] = None,
+    latency_profile: Optional[Mapping[str, Any]] = None,
+    timing_distribution: Optional[Mapping[str, Any]] = None,
+    noise_profile: Optional[Mapping[str, Any]] = None,
+    allow_interruptions: bool = True,
+    interruption_policy: Optional[Mapping[str, Any]] = None,
+    routes: Optional[Mapping[str, Any] | Iterable[str]] = None,
+    initial_route: Optional[str] = None,
+) -> "VoiceEnvironment":
+    """Load a Pipecat frame log and return a voice replay environment."""
+
+    if audio_captures is None:
+        return load_voice_export(
+            source,
+            framework="pipecat",
+            headers=headers,
+            auth=auth,
+            pagination=pagination,
+            max_pages=max_pages,
+            timeout=timeout,
+            sample_rate_hz=sample_rate_hz,
+            stt_latency_ms=stt_latency_ms,
+            tts_latency_ms=tts_latency_ms,
+            state=state,
+            latency_profile=latency_profile,
+            timing_distribution=timing_distribution,
+            noise_profile=noise_profile,
+            allow_interruptions=allow_interruptions,
+            interruption_policy=interruption_policy,
+            routes=routes,
+            initial_route=initial_route,
+        )
+
+    if isinstance(source, (str, os.PathLike)) or _is_export_source_spec(source):
+        loaded = _load_framework_trace_export_source(
+            source,
+            headers=headers,
+            auth=auth,
+            pagination=pagination,
+            max_pages=max_pages,
+            timeout=timeout,
+        )
+    else:
+        loaded = source
+    return load_voice_export(
+        _pipecat_frame_log_export(loaded, audio_captures=audio_captures),
+        framework="pipecat",
+        sample_rate_hz=sample_rate_hz,
+        stt_latency_ms=stt_latency_ms,
+        tts_latency_ms=tts_latency_ms,
+        state=state,
+        latency_profile=latency_profile,
+        timing_distribution=timing_distribution,
+        noise_profile=noise_profile,
+        allow_interruptions=allow_interruptions,
+        interruption_policy=interruption_policy,
+        routes=routes,
+        initial_route=initial_route,
     )
 
 
@@ -13180,6 +13268,61 @@ def _normalize_voice_export(
     )
     payload["timing_distribution"] = _normalize_voice_timing_distribution(payload["timing_distribution"])
     return payload
+
+
+def _pipecat_frame_log_export(
+    frame_log: Any,
+    *,
+    audio_captures: Optional[Iterable[str | Mapping[str, Any]]],
+) -> Dict[str, Any]:
+    export: Dict[str, Any] = {"framework": "pipecat", "frames": [], "events": []}
+    if isinstance(frame_log, Mapping):
+        item = copy.deepcopy(dict(frame_log))
+        metadata = copy.deepcopy(dict(item.get("metadata", {})))
+        metadata.setdefault("source_type", "pipecat_frame_log")
+        export["metadata"] = metadata
+        for key in (
+            "frames",
+            "frame_replay",
+            "events",
+            "records",
+            "items",
+            "messages",
+            "history",
+            "conversation",
+            "transcripts",
+            "transcriptions",
+        ):
+            if key in item:
+                target_key = "frames" if key in {"frames", "frame_replay"} else "events"
+                export[target_key].extend(copy.deepcopy(_as_iterable(item.get(key))))
+        for key in ("audio_captures", "audio", "audio_artifacts", "recordings", "waveforms"):
+            if key in item:
+                export.setdefault("recordings", []).extend(copy.deepcopy(_as_iterable(item.get(key))))
+        for key in ("diarization", "speaker_segments", "speakers"):
+            if key in item:
+                export[key] = copy.deepcopy(item[key])
+        for key in ("perceptual_metrics", "audio_quality", "quality_profile", "timing_distribution", "timing_profile", "timing", "latency_distribution", "latency_metrics", "metrics"):
+            if key in item:
+                export[key] = copy.deepcopy(item[key])
+        if not export["frames"] and not export["events"] and _looks_like_voice_export_record(item):
+            if _voice_export_record_is_frame(item, _voice_export_record_name(item)):
+                export["frames"].append(item)
+            else:
+                export["events"].append(item)
+    else:
+        for record in _as_iterable(frame_log):
+            item = copy.deepcopy(_as_mapping(record))
+            if not item:
+                continue
+            if _voice_export_record_is_frame(item, _voice_export_record_name(item)):
+                export["frames"].append(item)
+            else:
+                export["events"].append(item)
+
+    if audio_captures is not None:
+        export.setdefault("recordings", []).extend(copy.deepcopy(list(audio_captures)))
+    return {key: value for key, value in export.items() if value not in (None, "", [], {})}
 
 
 def _merge_voice_export_payloads(*payloads: Mapping[str, Any]) -> Dict[str, Any]:

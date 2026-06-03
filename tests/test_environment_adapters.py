@@ -27,6 +27,7 @@ from fi.simulate import (
     load_adversarial_attack_pack,
     load_browser_trace_export,
     load_voice_export,
+    load_pipecat_frame_log,
     load_world_contract,
     load_playwright_trace_export,
     load_framework_trace_export,
@@ -46,6 +47,7 @@ from fi.simulate import (
     normalize_browser_mutation_pack,
     normalize_browser_trace_export,
     normalize_voice_export,
+    normalize_pipecat_frame_log,
     normalize_voice_timing_distribution,
     normalize_world_contract,
     normalize_playwright_trace_export,
@@ -3000,6 +3002,116 @@ async def test_voice_environment_loads_voice_exports_waveforms_diarization_and_q
     assert any(artifact.type == "audio" and artifact.metadata.get("id") == "caller_wave" for artifact in result.artifacts)
     assert voice_traces[-1]["export_framework"] == "livekit"
     assert voice_traces[-1]["perceptual_metrics"]["overall"]["packet_loss_pct"] == 0.4
+
+
+@pytest.mark.asyncio
+async def test_pipecat_frame_log_loader_replays_frames_and_decodes_raw_pcm():
+    sample_rate_hz = 16000
+    duration_ms = 500
+    sample_count = int(sample_rate_hz * duration_ms / 1000)
+    pcm = b"".join(
+        struct.pack("<h", int(math.sin(2 * math.pi * 330 * index / sample_rate_hz) * 9000))
+        for index in range(sample_count)
+    )
+    frame_log = {
+        "metadata": {"session_id": "pc_123"},
+        "frames": [
+            {
+                "id": "input_audio",
+                "frame_type": "InputAudioRawFrame",
+                "sample_rate": sample_rate_hz,
+                "num_channels": 1,
+                "num_frames": sample_count,
+            },
+            {"id": "user_start", "frame_type": "UserStartedSpeakingFrame", "timestamp_ms": 20},
+            {
+                "id": "pc_transcript",
+                "frame_type": "TranscriptionFrame",
+                "timestamp_ms": 420,
+                "text": "Billing issue for order 123.",
+                "speaker": "caller",
+                "confidence": 0.97,
+            },
+            {"id": "tts_start", "frame_type": "TTSStartedFrame", "timestamp_ms": 900},
+            {
+                "id": "output_audio",
+                "frame_type": "OutputAudioRawFrame",
+                "timestamp_ms": 1040,
+                "sample_rate": sample_rate_hz,
+                "num_channels": 1,
+                "num_frames": 2400,
+            },
+            {
+                "id": "interruption",
+                "frame_type": "InterruptionFrame",
+                "timestamp_ms": 1320,
+            },
+        ],
+        "events": [
+            {"event": "eou_metrics", "eou_delay_ms": 95, "timestamp_ms": 510},
+            {"event": "llm_metrics", "llm_latency_ms": 210, "timestamp_ms": 860},
+        ],
+        "timing_distribution": {
+            "stages": {
+                "vad": {"samples_ms": [22, 25, 24]},
+                "stt": {"samples_ms": [180, 190, 195]},
+            }
+        },
+    }
+    audio_capture = {
+        "id": "caller_raw_pcm",
+        "speaker": "caller",
+        "data": pcm,
+        "encoding": "linear16",
+        "sample_rate_hz": sample_rate_hz,
+        "channels": 1,
+        "sample_width_bytes": 2,
+    }
+
+    normalized = normalize_pipecat_frame_log(frame_log, audio_captures=[audio_capture])
+    assert normalized["framework"] == "pipecat"
+    assert normalized["frame_replay"][-1]["frame_type"] == "InterruptionFrame"
+    assert normalized["waveforms"][0]["decoded_audio"] is True
+    assert normalized["waveforms"][0]["sample_count"] == sample_count
+
+    async def agent(input):
+        return AgentResponse(
+            content="I inspected the Pipecat frame pipeline and routed the caller.",
+            tool_calls=[
+                {"id": "route", "name": "route_call", "arguments": {"route": "billing"}},
+                {"id": "stt", "name": "transcribe_audio", "arguments": {"id": "pc_transcript"}},
+                {"id": "timing", "name": "voice_timing", "arguments": {}},
+            ],
+        )
+
+    report = await LocalTextEngine().run(
+        scenario=_scenario(),
+        agent_callback=agent,
+        environment=load_pipecat_frame_log(
+            frame_log,
+            audio_captures=[audio_capture],
+            routes={"default": {"agent": "support"}, "billing": {"agent": "billing"}},
+        ),
+        max_turns=1,
+        min_turns=1,
+        modality="voice",
+    )
+
+    result = report.results[0]
+    voice_state = result.metadata["environment_state"]["voice"]
+    voice_trace = next(
+        artifact.data
+        for artifact in result.artifacts
+        if artifact.type == "trace" and artifact.metadata.get("kind") == "voice_trace"
+    )
+
+    assert voice_state["current_route"] == "billing"
+    assert voice_state["transcript_history"][-1]["transcript"] == "Billing issue for order 123."
+    assert voice_state["waveforms"][0]["media_format"] == "linear16"
+    assert voice_state["waveforms"][0]["decoded_audio"] is True
+    assert voice_trace["export_framework"] == "pipecat"
+    assert any(event.type == "voice_frame" and event.name == "TranscriptionFrame" for event in result.events)
+    assert any(artifact.type == "audio" and artifact.metadata["id"] == "caller_raw_pcm" for artifact in result.artifacts)
 
 
 def test_voice_environment_replays_paginated_authenticated_export():
