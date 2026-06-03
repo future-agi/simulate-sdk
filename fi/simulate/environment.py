@@ -4923,6 +4923,9 @@ class FrameworkTraceEnvironment(EnvironmentAdapter):
         export_pagination: Optional[Mapping[str, Any]] = None,
         export_max_pages: int = 20,
         export_timeout: float = 30.0,
+        adapter_spec: Optional[Mapping[str, Any]] = None,
+        adapter_required_signals: Optional[Iterable[str]] = None,
+        adapter_required_mappings: Optional[Mapping[str, Any]] = None,
         state: Optional[Mapping[str, Any]] = None,
         metadata: Optional[Mapping[str, Any]] = None,
     ) -> None:
@@ -4956,6 +4959,16 @@ class FrameworkTraceEnvironment(EnvironmentAdapter):
         self.metadata = copy.deepcopy(dict(metadata or {}))
         if export_metadata:
             self.metadata.setdefault("trace_export", {}).update(export_metadata)
+        metadata_adapter_spec = _coerce_plain_dict(
+            self.metadata.get("adapter_conformance")
+            or self.metadata.get("adapter_spec")
+            or self.metadata.get("framework_adapter")
+        )
+        self.adapter_spec = {**metadata_adapter_spec, **copy.deepcopy(dict(adapter_spec or {}))}
+        if adapter_required_signals is not None:
+            self.adapter_spec["required_signals"] = list(adapter_required_signals)
+        if adapter_required_mappings is not None:
+            self.adapter_spec["required_mappings"] = copy.deepcopy(dict(adapter_required_mappings))
         self.spans: List[Dict[str, Any]] = []
         self.events: List[Dict[str, Any]] = []
         self.state = copy.deepcopy(self.initial_state)
@@ -5019,6 +5032,7 @@ class FrameworkTraceEnvironment(EnvironmentAdapter):
                     "span_count": len(self.spans),
                     "event_count": len(self.events),
                     "signals": sorted(self._observed_signals()),
+                    "adapter_conformance": self._adapter_conformance_payload(),
                 }
             },
         )
@@ -5115,7 +5129,7 @@ class FrameworkTraceEnvironment(EnvironmentAdapter):
         )
 
     def _trace_payload(self) -> Dict[str, Any]:
-        return {
+        payload = {
             "kind": "framework_trace",
             "framework": self.framework,
             "spans": copy.deepcopy(self.spans),
@@ -5126,6 +5140,10 @@ class FrameworkTraceEnvironment(EnvironmentAdapter):
             "state": copy.deepcopy(self.state),
             "metadata": copy.deepcopy(self.metadata),
         }
+        conformance = self._adapter_conformance_payload()
+        if conformance:
+            payload["adapter_conformance"] = conformance
+        return payload
 
     def _state_payload(self) -> Dict[str, Any]:
         return self._trace_payload()
@@ -5134,7 +5152,24 @@ class FrameworkTraceEnvironment(EnvironmentAdapter):
         signals: set[str] = set()
         for span in [*self.spans, *self.events]:
             signals.update(span.get("signals", []))
+        if self.adapter_spec:
+            signals.add("adapter_conformance")
         return signals
+
+    def _adapter_conformance_payload(self) -> Dict[str, Any]:
+        if not self.adapter_spec:
+            return {}
+        return normalize_framework_adapter_conformance(
+            self.framework,
+            [*self.spans, *self.events],
+            required_signals=self.adapter_spec.get("required_signals") or self.adapter_spec.get("signals"),
+            required_mappings=(
+                self.adapter_spec.get("required_mappings")
+                or self.adapter_spec.get("mappings")
+                or self.adapter_spec.get("field_mappings")
+            ),
+            metadata=self.adapter_spec,
+        )
 
     def _checkpoint_payloads(self) -> List[Dict[str, Any]]:
         checkpoints: List[Dict[str, Any]] = []
@@ -5178,6 +5213,149 @@ def normalize_framework_trace_events(
         _normalize_framework_span(record, framework=str(framework), category=category)
         for record in records
     ]
+
+
+def normalize_framework_adapter_conformance(
+    framework: str,
+    records: Iterable[Mapping[str, Any]],
+    *,
+    required_signals: Optional[Iterable[str]] = None,
+    required_mappings: Optional[Mapping[str, Any]] = None,
+    metadata: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Score whether a custom framework adapter captures required semantic channels.
+
+    `required_signals` checks that normalized spans contain channels such as
+    model, tool, memory, state, latency, or cost. `required_mappings` checks
+    that at least one record for each signal carries the requested normalized
+    fields or dotted paths, such as `input`, `output`, `tool_name`,
+    `memory.operation`, or `attributes.gen_ai.usage`.
+    """
+
+    spec = copy.deepcopy(dict(metadata or {}))
+    if required_signals is None:
+        required_signals = spec.get("required_signals") or spec.get("signals") or []
+    if required_mappings is None:
+        required_mappings = (
+            spec.get("required_mappings")
+            or spec.get("mappings")
+            or spec.get("field_mappings")
+            or {}
+        )
+    records_list = [copy.deepcopy(dict(record)) for record in records if isinstance(record, Mapping)]
+    observed_signals = {
+        _normalize_framework_trace_key(signal)
+        for record in records_list
+        for signal in _as_iterable(record.get("signals"))
+        if _normalize_framework_trace_key(signal)
+    }
+    checks: List[Dict[str, Any]] = []
+    for signal in required_signals or []:
+        normalized = _normalize_framework_trace_key(signal)
+        if not normalized:
+            continue
+        checks.append(
+            {
+                "check": "signal",
+                "signal": normalized,
+                "expected": normalized,
+                "matched": normalized in observed_signals,
+            }
+        )
+    for signal, paths in _framework_adapter_required_mappings(required_mappings).items():
+        signal_records = [
+            record
+            for record in records_list
+            if signal in {
+                _normalize_framework_trace_key(item)
+                for item in _as_iterable(record.get("signals"))
+            }
+        ]
+        for path in paths:
+            matching_ids = [
+                str(record.get("id") or record.get("span_id") or record.get("name") or "")
+                for record in signal_records
+                if _framework_adapter_record_has_path(record, path)
+            ]
+            checks.append(
+                {
+                    "check": "mapping",
+                    "signal": signal,
+                    "path": path,
+                    "expected": {"signal": signal, "path": path},
+                    "matched": bool(matching_ids),
+                    "matched_records": [item for item in matching_ids if item],
+                }
+            )
+    matched = sum(1 for check in checks if check.get("matched"))
+    score = matched / len(checks) if checks else 1.0
+    findings = [
+        {
+            "type": (
+                "framework_adapter_signal_missing"
+                if check.get("check") == "signal"
+                else "framework_adapter_mapping_missing"
+            ),
+            "signal": check.get("signal"),
+            "path": check.get("path"),
+        }
+        for check in checks
+        if not check.get("matched")
+    ]
+    return {
+        "kind": "framework_adapter_conformance",
+        "framework": str(framework),
+        "required_signals": sorted(
+            {
+                _normalize_framework_trace_key(signal)
+                for signal in (required_signals or [])
+                if _normalize_framework_trace_key(signal)
+            }
+        ),
+        "observed_signals": sorted(observed_signals),
+        "required_mappings": _framework_adapter_required_mappings(required_mappings),
+        "checks": checks,
+        "findings": findings,
+        "score": round(score, 4),
+        "passed": not findings,
+    }
+
+
+def _framework_adapter_required_mappings(value: Any) -> Dict[str, List[str]]:
+    mappings: Dict[str, List[str]] = {}
+    for signal, raw_paths in _coerce_plain_dict(value).items():
+        normalized_signal = _normalize_framework_trace_key(signal)
+        if not normalized_signal:
+            continue
+        if isinstance(raw_paths, Mapping):
+            paths = (
+                raw_paths.get("required_fields")
+                or raw_paths.get("fields")
+                or raw_paths.get("paths")
+                or raw_paths.get("path")
+                or []
+            )
+        else:
+            paths = raw_paths
+        normalized_paths = [str(path) for path in _as_iterable(paths) if str(path).strip()]
+        if normalized_paths:
+            mappings[normalized_signal] = normalized_paths
+    return mappings
+
+
+def _framework_adapter_record_has_path(record: Mapping[str, Any], path: str) -> bool:
+    sources = [
+        record,
+        _coerce_plain_dict(record.get("attributes")),
+        _coerce_plain_dict(record.get("framework_event")),
+        _coerce_plain_dict(record.get("metadata")),
+    ]
+    for source in sources:
+        value = _framework_value_from_source(source, path)
+        if value not in (None, "", [], {}):
+            return True
+    return False
 
 
 def normalize_framework_trace_export(

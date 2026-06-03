@@ -49,6 +49,7 @@ from fi.simulate import (
     normalize_streaming_trace_export,
     normalize_adversarial_attack_pack,
     normalize_framework_trace_events,
+    normalize_framework_adapter_conformance,
     normalize_framework_trace_export,
     normalize_mcp_tool_session_export,
     normalize_openai_responses_trace,
@@ -1764,6 +1765,103 @@ def test_normalize_framework_trace_events_accepts_traceai_and_native_records():
     assert normalized[0]["input"] == "order 123"
     assert normalized[0]["output"] == "planned tool call"
     assert normalized[2]["id"] == "lc_tool"
+
+
+@pytest.mark.asyncio
+async def test_framework_trace_environment_scores_adapter_conformance():
+    async def agent(input):
+        return AgentResponse(
+            content="Custom framework adapter conformance inspected.",
+            tool_calls=[
+                {"id": "status", "name": "framework_trace_status", "arguments": {}},
+                {"id": "model", "name": "list_framework_spans", "arguments": {"signal": "model"}},
+            ],
+        )
+
+    records = [
+        {
+            "id": "model_1",
+            "name": "custom llm generation",
+            "type": "llm",
+            "input": "order 123",
+            "output": "Call search_order and store the result.",
+            "usage": {"total_tokens": 48},
+        },
+        {
+            "id": "tool_1",
+            "name": "custom tool call",
+            "type": "tool",
+            "tool_name": "search_order",
+            "input": {"order_id": "123"},
+        },
+        {
+            "id": "memory_1",
+            "name": "memory_update case_summary",
+            "type": "memory_update",
+            "memory_operation": "write",
+            "memory_key": "case_summary",
+            "memory_value": "order 123 resolved",
+        },
+        {
+            "id": "state_1",
+            "method": "updates",
+            "params": {"data": {"case": {"status": "resolved"}}},
+        },
+    ]
+    adapter_spec = {
+        "required_signals": ["model", "tool", "memory", "state", "cost"],
+        "required_mappings": {
+            "model": ["input", "output", "cost"],
+            "tool": ["tool_name", "input"],
+            "memory": ["memory.operation", "memory.key"],
+            "state": ["state"],
+        },
+    }
+
+    normalized = normalize_framework_trace_events("custom_runtime", records)
+    conformance = normalize_framework_adapter_conformance(
+        "custom_runtime",
+        normalized,
+        required_signals=adapter_spec["required_signals"],
+        required_mappings=adapter_spec["required_mappings"],
+    )
+    assert conformance["score"] == 1.0
+
+    report = await LocalTextEngine().run(
+        scenario=_scenario(),
+        agent_callback=agent,
+        environment=FrameworkTraceEnvironment(
+            framework="custom_runtime",
+            events=records,
+            adapter_spec=adapter_spec,
+        ),
+        max_turns=1,
+        min_turns=1,
+    )
+
+    result = report.results[0]
+    trace_state = result.metadata["environment_state"]["framework_trace"]
+    assert "adapter_conformance" in trace_state["signals"]
+    assert trace_state["adapter_conformance"]["score"] == 1.0
+    assert trace_state["adapter_conformance"]["passed"] is True
+
+    evaluation = evaluate_agent_report(
+        report,
+        config={
+            "required_framework_trace": [
+                "adapter_conformance",
+                "model",
+                "tool",
+                "memory",
+                "state",
+                "cost",
+            ],
+            "framework_adapter_conformance": adapter_spec,
+        },
+    )
+    metrics = evaluation.summary["metric_averages"]
+    assert metrics["framework_trace_coverage"] == 1.0
+    assert metrics["framework_adapter_conformance"] == 1.0
 
 
 @pytest.mark.asyncio
