@@ -5386,6 +5386,203 @@ class FrameworkLifecycleEnvironment(EnvironmentAdapter):
         )
 
 
+class FrameworkCapabilityEnvironment(EnvironmentAdapter):
+    """
+    Replay a framework capability matrix as certification evidence.
+
+    Use this for framework/runtime selection before optimization: tools,
+    memory, streaming, lifecycle, orchestration, security, observability,
+    exports, and task-surface support become inspectable trace evidence.
+    """
+
+    name = "framework_capability"
+
+    def __init__(
+        self,
+        matrix: Any = None,
+        *,
+        name: str = "framework-capability-matrix",
+        framework: str = "custom",
+        version: Optional[str] = None,
+        capabilities: Optional[Iterable[Any]] = None,
+        task_surfaces: Optional[Iterable[Any]] = None,
+        constraints: Optional[Iterable[Any]] = None,
+        integrations: Optional[Iterable[Any]] = None,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        self.matrix = normalize_framework_capability_matrix(
+            matrix,
+            name=name,
+            framework=framework,
+            version=version,
+            capabilities=capabilities,
+            task_surfaces=task_surfaces,
+            constraints=constraints,
+            integrations=integrations,
+            metadata=metadata,
+        )
+
+    def reset(self, **context: Any) -> EnvironmentSnapshot:
+        return EnvironmentSnapshot(
+            tools=self._tool_specs(),
+            artifacts=[self._matrix_artifact()],
+            events=[
+                SimulationEvent(
+                    type="framework_capability",
+                    name="framework_capability_ready",
+                    payload={
+                        "framework": self.matrix["framework"],
+                        "capability_count": self.matrix["summary"]["capability_count"],
+                        "support_rate": self.matrix["summary"]["support_rate"],
+                        "signals": copy.deepcopy(self.matrix["signals"]),
+                    },
+                ),
+                *[
+                    SimulationEvent(
+                        type="framework_capability",
+                        name="framework_capability_record",
+                        payload=copy.deepcopy(capability),
+                    )
+                    for capability in self.matrix["capabilities"]
+                ],
+            ],
+            state={"framework_capability_matrix": copy.deepcopy(self.matrix)},
+            metadata={"framework_capability_matrix": copy.deepcopy(self.matrix)},
+        )
+
+    def observe(self, **context: Any) -> EnvironmentSnapshot:
+        return EnvironmentSnapshot(
+            artifacts=[self._matrix_artifact()],
+            state={"framework_capability_matrix": copy.deepcopy(self.matrix)},
+            metadata={"framework_capability_matrix": copy.deepcopy(self.matrix)},
+        )
+
+    def handle_tool_call(
+        self,
+        tool_call: Mapping[str, Any],
+        **context: Any,
+    ) -> Optional[ToolExecutionResult]:
+        name = _tool_name(tool_call)
+        if name not in {
+            "framework_capability_status",
+            "list_framework_capabilities",
+            "inspect_framework_capability",
+            "list_framework_task_surfaces",
+        }:
+            return None
+        arguments = _tool_arguments(tool_call)
+        call_id = _tool_call_id(tool_call)
+
+        if name == "framework_capability_status":
+            result = copy.deepcopy(self.matrix)
+            event_name = "framework_capability_status"
+            content = f"{self.matrix['framework']} capability matrix status recorded."
+            success = True
+            error = None
+        elif name == "list_framework_task_surfaces":
+            result = {
+                "framework": self.matrix["framework"],
+                "task_surfaces": copy.deepcopy(self.matrix["task_surfaces"]),
+            }
+            event_name = "framework_task_surfaces_listed"
+            content = f"Listed {len(self.matrix['task_surfaces'])} framework task surface(s)."
+            success = True
+            error = None
+        elif name == "list_framework_capabilities":
+            category = _normalize_framework_capability_key(arguments.get("category") or "")
+            status = _normalize_framework_capability_status(arguments.get("status") or "")
+            surface = _normalize_framework_capability_key(arguments.get("surface") or arguments.get("task_surface") or "")
+            capabilities = copy.deepcopy(self.matrix["capabilities"])
+            if category:
+                capabilities = [item for item in capabilities if item.get("category") == category]
+            if status:
+                capabilities = [item for item in capabilities if item.get("status") == status]
+            if surface:
+                capabilities = [
+                    item
+                    for item in capabilities
+                    if surface in {_normalize_framework_capability_key(value) for value in _as_iterable(item.get("task_surfaces"))}
+                ]
+            result = {
+                "framework": self.matrix["framework"],
+                "capabilities": capabilities,
+                "filters": {"category": category, "status": status, "task_surface": surface},
+            }
+            event_name = "framework_capabilities_listed"
+            content = f"Listed {len(capabilities)} framework capability record(s)."
+            success = True
+            error = None
+        else:
+            capability_id = str(arguments.get("name") or arguments.get("id") or arguments.get("capability") or "")
+            capability = _find_framework_capability(self.matrix["capabilities"], capability_id)
+            success = capability is not None
+            result = {
+                "framework": self.matrix["framework"],
+                "capability": copy.deepcopy(capability),
+                "query": capability_id,
+            }
+            event_name = "framework_capability_inspected" if success else "framework_capability_missing"
+            content = f"Inspected framework capability {capability_id}." if success else f"Framework capability not found: {capability_id}"
+            error = None if success else "capability_not_found"
+
+        return ToolExecutionResult(
+            tool_call_id=call_id,
+            tool_name=name,
+            content=content,
+            result=result,
+            success=success,
+            error=error,
+            state_updates={"framework_capability_matrix": copy.deepcopy(self.matrix)},
+            artifacts=[self._matrix_artifact()],
+            events=[
+                SimulationEvent(
+                    type="framework_capability",
+                    name=event_name,
+                    payload=result,
+                )
+            ],
+        )
+
+    def _tool_specs(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                "name": "framework_capability_status",
+                "description": "Return normalized framework capability matrix state and summary.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            {
+                "name": "list_framework_capabilities",
+                "description": "List framework capabilities filtered by category, status, or task surface.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "category": {"type": "string"},
+                        "status": {"type": "string"},
+                        "task_surface": {"type": "string"},
+                    },
+                },
+            },
+            {
+                "name": "inspect_framework_capability",
+                "description": "Inspect one framework capability by name or id.",
+                "parameters": {"type": "object", "properties": {"name": {"type": "string"}}},
+            },
+            {
+                "name": "list_framework_task_surfaces",
+                "description": "List task surfaces covered by the framework capability matrix.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        ]
+
+    def _matrix_artifact(self) -> SimulationArtifact:
+        return SimulationArtifact(
+            type="trace",
+            role="environment",
+            data=copy.deepcopy(self.matrix),
+            metadata={"kind": "framework_capability_matrix", "framework": self.matrix["framework"]},
+        )
+
+
 class ObservabilityReplayEnvironment(EnvironmentAdapter):
     """
     Replay production observability/regression cases as local simulation evidence.
@@ -6779,6 +6976,415 @@ def normalize_framework_adapter_conformance(
         "score": round(score, 4),
         "passed": not findings,
     }
+
+
+def normalize_framework_capability_matrix(
+    matrix: Any = None,
+    *,
+    name: str = "framework-capability-matrix",
+    framework: str = "custom",
+    version: Optional[str] = None,
+    capabilities: Optional[Iterable[Any]] = None,
+    task_surfaces: Optional[Iterable[Any]] = None,
+    constraints: Optional[Iterable[Any]] = None,
+    integrations: Optional[Iterable[Any]] = None,
+    metadata: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Normalize framework feature/capability declarations into certificate evidence.
+
+    The matrix is framework-neutral: any LangGraph/LangChain/OpenAI Agents,
+    MCP, voice, browser, or custom runtime export can declare capabilities,
+    task surfaces, constraints, and integration evidence without adopting a
+    vendor-specific benchmark schema.
+    """
+
+    source = _coerce_plain_dict(matrix)
+    matrix_name = str(source.get("name") or source.get("id") or name)
+    matrix_framework = str(source.get("framework") or framework)
+    matrix_version = source.get("version") or source.get("framework_version") or version
+    raw_capabilities = (
+        capabilities
+        if capabilities is not None
+        else source.get("capabilities")
+        or source.get("features")
+        or source.get("capability_matrix")
+        or []
+    )
+    normalized_capabilities = [
+        _normalize_framework_capability(capability)
+        for capability in _as_iterable(raw_capabilities)
+    ]
+    normalized_capabilities = [
+        capability for capability in normalized_capabilities if capability.get("name")
+    ]
+    raw_task_surfaces = (
+        task_surfaces
+        if task_surfaces is not None
+        else source.get("task_surfaces")
+        or source.get("surfaces")
+        or source.get("tasks")
+        or []
+    )
+    raw_constraints = constraints if constraints is not None else source.get("constraints") or []
+    raw_integrations = integrations if integrations is not None else source.get("integrations") or source.get("connectors") or []
+    normalized_task_surfaces = _normalize_framework_named_records(raw_task_surfaces)
+    capability_surfaces = _normalize_framework_named_records(
+        [
+            surface
+            for capability in normalized_capabilities
+            for surface in _as_iterable(capability.get("task_surfaces"))
+        ]
+    )
+    normalized_task_surfaces = _dedupe_framework_named_records(
+        [*normalized_task_surfaces, *capability_surfaces]
+    )
+    normalized_constraints = _normalize_framework_named_records(raw_constraints)
+    normalized_integrations = _normalize_framework_named_records(raw_integrations)
+    matrix_metadata = {**_coerce_plain_dict(source.get("metadata")), **copy.deepcopy(dict(metadata or {}))}
+    summary = _framework_capability_summary(
+        normalized_capabilities,
+        normalized_task_surfaces,
+        normalized_constraints,
+        normalized_integrations,
+    )
+    signals = _framework_capability_signals(
+        normalized_capabilities,
+        normalized_task_surfaces,
+        normalized_constraints,
+        normalized_integrations,
+        source.get("signals"),
+    )
+    return {
+        "kind": "framework_capability_matrix",
+        "name": matrix_name,
+        "framework": matrix_framework,
+        "version": str(matrix_version or ""),
+        "capabilities": normalized_capabilities,
+        "task_surfaces": normalized_task_surfaces,
+        "constraints": normalized_constraints,
+        "integrations": normalized_integrations,
+        "summary": summary,
+        "signals": signals,
+        "metadata": matrix_metadata,
+    }
+
+
+def _normalize_framework_capability(value: Any) -> Dict[str, Any]:
+    if isinstance(value, str):
+        raw = {"name": value, "status": "supported"}
+    else:
+        raw = _coerce_plain_dict(value)
+    name = str(raw.get("name") or raw.get("id") or raw.get("capability") or raw.get("feature") or "").strip()
+    normalized_name = _normalize_framework_capability_key(name)
+    category = _framework_capability_category(raw, normalized_name)
+    status = _framework_capability_status_from_record(raw)
+    evidence = [
+        _normalize_framework_evidence(item)
+        for item in _as_iterable(raw.get("evidence") or raw.get("proof") or raw.get("examples"))
+    ]
+    task_surfaces = [
+        _normalize_framework_capability_key(item.get("name") if isinstance(item, Mapping) else item)
+        for item in _as_iterable(raw.get("task_surfaces") or raw.get("surfaces") or raw.get("tasks"))
+        if _normalize_framework_capability_key(item.get("name") if isinstance(item, Mapping) else item)
+    ]
+    signals = {
+        "framework_capability",
+        "capability",
+        normalized_name,
+        category,
+        status,
+        *[
+            _normalize_framework_capability_key(signal)
+            for signal in _as_iterable(raw.get("signals"))
+            if _normalize_framework_capability_key(signal)
+        ],
+    }
+    return {
+        "id": str(raw.get("id") or normalized_name),
+        "name": normalized_name,
+        "label": str(raw.get("label") or name or normalized_name),
+        "category": category,
+        "status": status,
+        "evidence": evidence,
+        "signals": sorted(signal for signal in signals if signal),
+        "task_surfaces": sorted(set(task_surfaces)),
+        "metadata": _coerce_plain_dict(raw.get("metadata")),
+    }
+
+
+def _normalize_framework_evidence(value: Any) -> Dict[str, Any]:
+    if isinstance(value, Mapping):
+        evidence = copy.deepcopy(dict(value))
+        evidence.setdefault("type", str(evidence.get("kind") or "record"))
+        return evidence
+    return {"type": "note", "value": str(value)}
+
+
+def _normalize_framework_named_records(values: Iterable[Any]) -> List[Dict[str, Any]]:
+    records: List[Dict[str, Any]] = []
+    for value in _as_iterable(values):
+        if isinstance(value, Mapping):
+            raw = copy.deepcopy(dict(value))
+            name = _normalize_framework_capability_key(raw.get("name") or raw.get("id") or raw.get("surface") or raw.get("integration"))
+            if not name:
+                continue
+            raw["name"] = name
+            raw.setdefault("id", name)
+            records.append(raw)
+            continue
+        name = _normalize_framework_capability_key(value)
+        if name:
+            records.append({"id": name, "name": name})
+    return _dedupe_framework_named_records(records)
+
+
+def _dedupe_framework_named_records(records: Iterable[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+    deduped: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for record in records:
+        record_dict = copy.deepcopy(dict(record))
+        key = _normalize_framework_capability_key(record_dict.get("id") or record_dict.get("name"))
+        if not key or key in seen:
+            continue
+        record_dict["id"] = key
+        record_dict["name"] = _normalize_framework_capability_key(record_dict.get("name") or key)
+        seen.add(key)
+        deduped.append(record_dict)
+    return deduped
+
+
+def _framework_capability_summary(
+    capabilities: Sequence[Mapping[str, Any]],
+    task_surfaces: Sequence[Mapping[str, Any]],
+    constraints: Sequence[Mapping[str, Any]],
+    integrations: Sequence[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    capability_count = len(capabilities)
+    supported = [item for item in capabilities if item.get("status") == "supported"]
+    partial = [item for item in capabilities if item.get("status") == "partial"]
+    missing = [item for item in capabilities if item.get("status") == "missing"]
+    blocked = [item for item in capabilities if item.get("status") == "blocked"]
+    categories = sorted({_normalize_framework_capability_key(item.get("category")) for item in capabilities if item.get("category")})
+    supported_categories = sorted(
+        {
+            _normalize_framework_capability_key(item.get("category"))
+            for item in [*supported, *partial]
+            if item.get("category")
+        }
+    )
+    evidence_count = sum(len(_as_iterable(item.get("evidence"))) for item in capabilities)
+    task_surface_names = sorted(
+        {
+            _normalize_framework_capability_key(surface.get("name"))
+            for surface in task_surfaces
+            if _normalize_framework_capability_key(surface.get("name"))
+        }
+    )
+    integration_names = sorted(
+        {
+            _normalize_framework_capability_key(integration.get("name"))
+            for integration in integrations
+            if _normalize_framework_capability_key(integration.get("name"))
+        }
+    )
+    supported_category_set = set(supported_categories)
+    return {
+        "capability_count": capability_count,
+        "supported_count": len(supported),
+        "partial_count": len(partial),
+        "missing_count": len(missing),
+        "blocked_count": len(blocked),
+        "support_rate": round(len(supported) / capability_count, 4) if capability_count else 1.0,
+        "effective_support_rate": round((len(supported) + 0.5 * len(partial)) / capability_count, 4) if capability_count else 1.0,
+        "evidence_count": evidence_count,
+        "task_surface_count": len(task_surface_names),
+        "constraint_count": len(constraints),
+        "integration_count": len(integration_names),
+        "categories": categories,
+        "supported_categories": supported_categories,
+        "supported_capabilities": sorted(item.get("name") for item in supported if item.get("name")),
+        "partial_capabilities": sorted(item.get("name") for item in partial if item.get("name")),
+        "missing_capabilities": sorted(item.get("name") for item in missing if item.get("name")),
+        "blocked_capabilities": sorted(item.get("name") for item in blocked if item.get("name")),
+        "task_surfaces": task_surface_names,
+        "integrations": integration_names,
+        "has_tools": "tools" in supported_category_set,
+        "has_memory": "memory" in supported_category_set,
+        "has_streaming": "streaming" in supported_category_set,
+        "has_lifecycle": "lifecycle" in supported_category_set,
+        "has_orchestration": "orchestration" in supported_category_set,
+        "has_security": "security" in supported_category_set,
+        "has_observability": "observability" in supported_category_set,
+        "has_exports": "exports" in supported_category_set,
+    }
+
+
+def _framework_capability_signals(
+    capabilities: Sequence[Mapping[str, Any]],
+    task_surfaces: Sequence[Mapping[str, Any]],
+    constraints: Sequence[Mapping[str, Any]],
+    integrations: Sequence[Mapping[str, Any]],
+    raw_signals: Any = None,
+) -> List[str]:
+    signals = {"framework_capability", "capability_matrix", "capability"}
+    for signal in _as_iterable(raw_signals):
+        normalized = _normalize_framework_capability_key(signal)
+        if normalized:
+            signals.add(normalized)
+    for capability in capabilities:
+        for signal in _as_iterable(capability.get("signals")):
+            normalized = _normalize_framework_capability_key(signal)
+            if normalized:
+                signals.add(normalized)
+        for key in ("name", "category", "status"):
+            normalized = _normalize_framework_capability_key(capability.get(key))
+            if normalized:
+                signals.add(normalized)
+    for collection, marker in (
+        (task_surfaces, "task_surface"),
+        (constraints, "constraint"),
+        (integrations, "integration"),
+    ):
+        if collection:
+            signals.add(marker)
+        for item in collection:
+            normalized = _normalize_framework_capability_key(item.get("name"))
+            if normalized:
+                signals.add(normalized)
+    return sorted(signals)
+
+
+def _framework_capability_category(raw: Mapping[str, Any], normalized_name: str) -> str:
+    category = _normalize_framework_capability_key(
+        raw.get("category")
+        or raw.get("domain")
+        or raw.get("surface")
+        or raw.get("group")
+        or ""
+    )
+    aliases = {
+        "tool": "tools",
+        "function": "tools",
+        "function_calling": "tools",
+        "mcp": "tools",
+        "state": "memory",
+        "checkpoint": "lifecycle",
+        "session": "lifecycle",
+        "trace": "observability",
+        "telemetry": "observability",
+        "log": "observability",
+        "export": "exports",
+        "artifact": "exports",
+        "workflow": "orchestration",
+        "graph": "orchestration",
+        "browser": "browser",
+        "voice": "voice",
+    }
+    if category:
+        return aliases.get(category, category)
+    inference = (
+        ("tools", ("tool", "function", "mcp", "schema")),
+        ("memory", ("memory", "retrieval", "vector")),
+        ("streaming", ("stream", "chunk", "delta")),
+        ("lifecycle", ("lifecycle", "session", "checkpoint", "retry", "resume", "cleanup")),
+        ("orchestration", ("orchestration", "workflow", "graph", "handoff", "multi_agent")),
+        ("security", ("security", "guardrail", "policy", "attack", "adversarial", "permission")),
+        ("observability", ("trace", "telemetry", "span", "log", "metric")),
+        ("exports", ("export", "artifact", "dataset")),
+        ("browser", ("browser", "cua", "computer_use", "gui")),
+        ("voice", ("voice", "audio", "webrtc", "tts", "stt")),
+    )
+    for inferred, tokens in inference:
+        if any(token in normalized_name for token in tokens):
+            return inferred
+    return "general"
+
+
+def _framework_capability_status_from_record(raw: Mapping[str, Any]) -> str:
+    raw_status = raw.get("status")
+    if raw_status in (None, ""):
+        if raw.get("blocked") is True:
+            raw_status = "blocked"
+        elif raw.get("supported") is False:
+            raw_status = "missing"
+        elif raw.get("partial") is True:
+            raw_status = "partial"
+        elif raw.get("supported") is True or raw.get("available") is True:
+            raw_status = "supported"
+        else:
+            raw_status = "supported"
+    return _normalize_framework_capability_status(raw_status) or "supported"
+
+
+def _normalize_framework_capability_status(value: Any) -> str:
+    normalized = _normalize_framework_capability_key(value)
+    aliases = {
+        "yes": "supported",
+        "true": "supported",
+        "available": "supported",
+        "enabled": "supported",
+        "pass": "supported",
+        "passed": "supported",
+        "limited": "partial",
+        "degraded": "partial",
+        "beta": "partial",
+        "no": "missing",
+        "false": "missing",
+        "unsupported": "missing",
+        "not_supported": "missing",
+        "fail": "missing",
+        "failed": "missing",
+        "denied": "blocked",
+        "forbidden": "blocked",
+    }
+    normalized = aliases.get(normalized, normalized)
+    return normalized if normalized in {"supported", "partial", "missing", "blocked"} else ""
+
+
+def _find_framework_capability(
+    capabilities: Iterable[Mapping[str, Any]],
+    capability_id: str,
+) -> Optional[Dict[str, Any]]:
+    query = _normalize_framework_capability_key(capability_id)
+    if not query:
+        return None
+    for capability in capabilities:
+        capability_dict = copy.deepcopy(dict(capability))
+        aliases = {
+            _normalize_framework_capability_key(capability_dict.get("id")),
+            _normalize_framework_capability_key(capability_dict.get("name")),
+            _normalize_framework_capability_key(capability_dict.get("label")),
+        }
+        if query in aliases:
+            return capability_dict
+    return None
+
+
+def _normalize_framework_capability_key(value: Any) -> str:
+    normalized = str(value or "").strip().lower().replace("-", "_").replace(" ", "_").replace(".", "_").replace("/", "_")
+    aliases = {
+        "tool": "tools",
+        "tools_list": "tools",
+        "function_call": "tool_calling",
+        "function_calls": "tool_calling",
+        "function_calling": "tool_calling",
+        "tool_calls": "tool_calling",
+        "tool_use": "tool_calling",
+        "state": "memory",
+        "checkpointing": "checkpoint",
+        "checkpoints": "checkpoint",
+        "stream": "streaming",
+        "trace": "observability",
+        "telemetry": "observability",
+        "export": "exports",
+        "artifact": "exports",
+        "workflow": "orchestration",
+        "graph": "orchestration",
+        "policy": "security",
+        "guardrails": "security",
+    }
+    return aliases.get(normalized, normalized)
 
 
 def _framework_adapter_required_mappings(value: Any) -> Dict[str, List[str]]:

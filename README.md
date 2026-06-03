@@ -331,6 +331,7 @@ from fi.simulate import (
     BrowserEnvironment,
     DomainPackageEnvironment,
     FileEnvironment,
+    FrameworkCapabilityEnvironment,
     FrameworkLifecycleEnvironment,
     FrameworkTraceEnvironment,
     ImageEnvironment,
@@ -572,6 +573,9 @@ environment = OptimizerTraceEnvironment(trace=optimizer_society_trace)
 # Framework lifecycle/session trace replay:
 environment = FrameworkLifecycleEnvironment(trace=framework_lifecycle_trace)
 
+# Framework capability matrix replay:
+environment = FrameworkCapabilityEnvironment(matrix=framework_capability_matrix)
+
 # Framework-neutral world contract/state-machine replay:
 environment = load_world_contract(
     {
@@ -606,6 +610,7 @@ See [`examples/local_framework_trace_replay.py`](examples/local_framework_trace_
 See [`examples/local_framework_adapter_conformance.py`](examples/local_framework_adapter_conformance.py) for a custom framework adapter certification cookbook with required semantic signals and field-mapping checks before optimization.
 See [`examples/local_framework_runtime_contract.py`](examples/local_framework_runtime_contract.py) for a live custom framework runtime contract cookbook with method/input/output evidence and runtime-contract scoring.
 See [`examples/local_framework_lifecycle_trace.py`](examples/local_framework_lifecycle_trace.py) for a framework lifecycle/session trace cookbook with setup, tool registration, checkpoint, retry, cancellation/resume, cleanup, terminal status, and state-persistence evidence.
+See [`examples/local_framework_capability_matrix.py`](examples/local_framework_capability_matrix.py) for a framework capability certification cookbook with tools, memory, streaming, lifecycle, orchestration, security, observability, exports, task surfaces, integrations, and evidence checks.
 See [`examples/local_observability_replay_pack.py`](examples/local_observability_replay_pack.py) for a Future AGI-style observability replay cookbook with failed regression rows, metrics, trace signals, raw evidence, and replay-pack scoring.
 See [`examples/local_optimizer_society_trace.py`](examples/local_optimizer_society_trace.py) for an optimizer society trace replay cookbook with roles, proposals, diagnostics, search paths, role credit, synthesis, steward, and governance evidence.
 See [`examples/local_langgraph_event_stream_replay.py`](examples/local_langgraph_event_stream_replay.py) for a LangGraph/LangChain event-stream replay cookbook with message/tool/state projections and transcript-quality scoring.

@@ -14,6 +14,7 @@ from fi.simulate import (
     BrowserEnvironment,
     DomainPackageEnvironment,
     FileEnvironment,
+    FrameworkCapabilityEnvironment,
     FrameworkLifecycleEnvironment,
     FrameworkTraceEnvironment,
     ImageEnvironment,
@@ -52,6 +53,7 @@ from fi.simulate import (
     normalize_orchestration_trace_export,
     normalize_streaming_trace_export,
     normalize_adversarial_attack_pack,
+    normalize_framework_capability_matrix,
     normalize_framework_lifecycle_trace,
     normalize_framework_trace_events,
     normalize_framework_adapter_conformance,
@@ -1971,6 +1973,117 @@ async def test_framework_lifecycle_environment_scores_session_quality():
     metrics = evaluation.summary["metric_averages"]
     assert metrics["framework_lifecycle_coverage"] == 1.0
     assert metrics["framework_lifecycle_quality"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_framework_capability_environment_replays_capability_matrix():
+    matrix = normalize_framework_capability_matrix(
+        name="langgraph-capabilities",
+        framework="langgraph",
+        version="1.0",
+        task_surfaces=["support_chat", "refund_workflow", "browser_research"],
+        capabilities=[
+            {"name": "tool_calling", "category": "tools", "status": "supported", "evidence": ["tools/list", "tools/call"]},
+            {"name": "mcp_tool_session", "category": "tools", "status": "supported", "evidence": ["mcp session replay"]},
+            {"name": "long_term_memory", "category": "memory", "status": "supported", "evidence": ["store adapter"]},
+            {"name": "streaming_deltas", "category": "streaming", "status": "supported", "evidence": ["stream_events"]},
+            {"name": "checkpoint_resume", "category": "lifecycle", "status": "supported", "evidence": ["checkpointer"]},
+            {"name": "workflow_graph", "category": "orchestration", "status": "supported", "evidence": ["graph nodes"]},
+            {"name": "policy_guardrails", "category": "security", "status": "supported", "evidence": ["guardrail gate"]},
+            {"name": "otel_trace_export", "category": "observability", "status": "supported", "evidence": ["span export"]},
+            {"name": "futureagi_export", "category": "exports", "status": "supported", "evidence": ["dataset export"]},
+            {"name": "voice_webrtc", "category": "voice", "status": "partial", "evidence": ["frame replay"]},
+        ],
+        integrations=["futureagi", "mcp", "otel"],
+    )
+    assert matrix["summary"]["capability_count"] == 10
+    assert matrix["summary"]["supported_count"] == 9
+    assert matrix["summary"]["has_tools"] is True
+    assert matrix["summary"]["has_observability"] is True
+
+    async def agent(input):
+        return AgentResponse(
+            content="Framework capability matrix certified tools, memory, streaming, lifecycle, orchestration, security, observability, and exports.",
+            tool_calls=[
+                {"id": "status", "name": "framework_capability_status", "arguments": {}},
+                {
+                    "id": "tools",
+                    "name": "list_framework_capabilities",
+                    "arguments": {"category": "tools", "status": "supported"},
+                },
+                {
+                    "id": "capability",
+                    "name": "inspect_framework_capability",
+                    "arguments": {"name": "checkpoint_resume"},
+                },
+                {"id": "surfaces", "name": "list_framework_task_surfaces", "arguments": {}},
+            ],
+        )
+
+    report = await LocalTextEngine().run(
+        scenario=_scenario(),
+        agent_callback=agent,
+        environment=FrameworkCapabilityEnvironment(matrix),
+        max_turns=1,
+        min_turns=1,
+    )
+
+    result = report.results[0]
+    state = result.metadata["environment_state"]["framework_capability_matrix"]
+    assert state["summary"]["support_rate"] == 0.9
+    assert "refund_workflow" in state["summary"]["task_surfaces"]
+    assert any(
+        artifact.metadata.get("kind") == "framework_capability_matrix"
+        for artifact in result.artifacts
+    )
+
+    evaluation = evaluate_agent_report(
+        report,
+        config={
+            "required_framework_capabilities": [
+                "framework_capability",
+                "tool_calling",
+                "long_term_memory",
+                "streaming_deltas",
+                "checkpoint_resume",
+                "workflow_graph",
+                "policy_guardrails",
+                "otel_trace_export",
+                "futureagi_export",
+            ],
+            "framework_capability_quality": {
+                "framework": "langgraph",
+                "required_capabilities": [
+                    "tool_calling",
+                    "long_term_memory",
+                    "streaming_deltas",
+                    "checkpoint_resume",
+                    "workflow_graph",
+                    "policy_guardrails",
+                    "otel_trace_export",
+                    "futureagi_export",
+                ],
+                "required_categories": ["tools", "memory", "streaming", "lifecycle", "orchestration", "security", "observability", "exports"],
+                "required_task_surfaces": ["support_chat", "refund_workflow", "browser_research"],
+                "min_supported_capabilities": 8,
+                "min_support_rate": 0.85,
+                "require_evidence": True,
+                "max_missing_capabilities": 0,
+                "require_tools": True,
+                "require_memory": True,
+                "require_streaming": True,
+                "require_lifecycle": True,
+                "require_orchestration": True,
+                "require_security": True,
+                "require_observability": True,
+                "require_exports": True,
+            },
+        },
+        threshold=0.9,
+    )
+    metrics = evaluation.summary["metric_averages"]
+    assert metrics["framework_capability_coverage"] == 1.0
+    assert metrics["framework_capability_quality"] == 1.0
 
 
 @pytest.mark.asyncio
