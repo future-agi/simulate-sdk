@@ -13,7 +13,7 @@ import zipfile
 import zlib
 from abc import ABC
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence
-from urllib.parse import unquote, urlparse
+from urllib.parse import urlencode, unquote, urljoin, urlparse
 
 from pydantic import BaseModel, Field
 
@@ -1937,6 +1937,9 @@ def load_voice_export(
     *,
     framework: str = "voice",
     headers: Optional[Mapping[str, str]] = None,
+    auth: Optional[Mapping[str, Any]] = None,
+    pagination: Optional[Mapping[str, Any]] = None,
+    max_pages: int = 20,
     timeout: float = 30.0,
     sample_rate_hz: int = 16000,
     stt_latency_ms: int = 180,
@@ -1968,6 +1971,9 @@ def load_voice_export(
             voice_export_source=source,
             export_framework=framework,
             export_headers=headers,
+            export_auth=auth,
+            export_pagination=pagination,
+            export_max_pages=max_pages,
             export_timeout=timeout,
         )
     return VoiceEnvironment(
@@ -1982,8 +1988,14 @@ def load_voice_export(
         interruption_policy=interruption_policy,
         routes=routes,
         initial_route=initial_route,
-        voice_export=source,
+        voice_export_source=source if _is_export_source_spec(source) else None,
+        voice_export=None if _is_export_source_spec(source) else source,
         export_framework=framework,
+        export_headers=headers,
+        export_auth=auth,
+        export_pagination=pagination,
+        export_max_pages=max_pages,
+        export_timeout=timeout,
     )
 
 
@@ -2011,9 +2023,12 @@ class VoiceEnvironment(EnvironmentAdapter):
         routes: Optional[Mapping[str, Any] | Iterable[str]] = None,
         initial_route: Optional[str] = None,
         voice_export: Optional[Any] = None,
-        voice_export_source: Optional[str | os.PathLike[str]] = None,
+        voice_export_source: Optional[Any] = None,
         export_framework: str = "voice",
         export_headers: Optional[Mapping[str, str]] = None,
+        export_auth: Optional[Mapping[str, Any]] = None,
+        export_pagination: Optional[Mapping[str, Any]] = None,
+        export_max_pages: int = 20,
         export_timeout: float = 30.0,
         waveforms: Optional[Iterable[str | Mapping[str, Any]]] = None,
         diarization: Optional[Iterable[Mapping[str, Any]] | Mapping[str, Any]] = None,
@@ -2036,19 +2051,21 @@ class VoiceEnvironment(EnvironmentAdapter):
             "metadata": {},
         }
         if voice_export_source is not None:
-            loaded_export = _load_framework_trace_export_source(
+            loaded_export, source_metadata = _load_framework_trace_export_source_with_metadata(
                 voice_export_source,
                 headers=export_headers,
+                auth=export_auth,
+                pagination=export_pagination,
+                max_pages=export_max_pages,
                 timeout=export_timeout,
             )
-            export_payload = _merge_voice_export_payloads(
-                export_payload,
-                normalize_voice_export(
-                    loaded_export,
-                    framework=export_framework,
-                    source_label=_framework_trace_source_label(voice_export_source),
-                ),
+            normalized_export = normalize_voice_export(
+                loaded_export,
+                framework=export_framework,
+                source_label=_framework_trace_source_label(voice_export_source),
             )
+            normalized_export.setdefault("metadata", {}).setdefault("trace_export", {}).update(source_metadata)
+            export_payload = _merge_voice_export_payloads(export_payload, normalized_export)
         if voice_export is not None:
             export_payload = _merge_voice_export_payloads(
                 export_payload,
@@ -4084,8 +4101,11 @@ class FrameworkTraceEnvironment(EnvironmentAdapter):
         spans: Optional[Iterable[str | Mapping[str, Any]]] = None,
         events: Optional[Iterable[str | Mapping[str, Any]]] = None,
         trace_export: Optional[Any] = None,
-        export_source: Optional[str | os.PathLike[str]] = None,
+        export_source: Optional[Any] = None,
         export_headers: Optional[Mapping[str, str]] = None,
+        export_auth: Optional[Mapping[str, Any]] = None,
+        export_pagination: Optional[Mapping[str, Any]] = None,
+        export_max_pages: int = 20,
         export_timeout: float = 30.0,
         state: Optional[Mapping[str, Any]] = None,
         metadata: Optional[Mapping[str, Any]] = None,
@@ -4094,13 +4114,16 @@ class FrameworkTraceEnvironment(EnvironmentAdapter):
         export_spans: List[Dict[str, Any]] = []
         export_metadata: Dict[str, Any] = {}
         if export_source is not None:
-            loaded_export = _load_framework_trace_export_source(
+            loaded_export, source_metadata = _load_framework_trace_export_source_with_metadata(
                 export_source,
                 headers=export_headers,
+                auth=export_auth,
+                pagination=export_pagination,
+                max_pages=export_max_pages,
                 timeout=export_timeout,
             )
             export_spans.extend(normalize_framework_trace_export(loaded_export, framework=self.framework))
-            export_metadata["export_source"] = _framework_trace_source_label(export_source)
+            export_metadata.update(source_metadata)
         if trace_export is not None:
             export_spans.extend(normalize_framework_trace_export(trace_export, framework=self.framework))
         self.initial_spans = normalize_framework_trace_events(
@@ -4127,8 +4150,11 @@ class FrameworkTraceEnvironment(EnvironmentAdapter):
         *,
         framework: str = "traceai",
         export: Optional[Any] = None,
-        source: Optional[str | os.PathLike[str]] = None,
+        source: Optional[Any] = None,
         headers: Optional[Mapping[str, str]] = None,
+        auth: Optional[Mapping[str, Any]] = None,
+        pagination: Optional[Mapping[str, Any]] = None,
+        max_pages: int = 20,
         timeout: float = 30.0,
         state: Optional[Mapping[str, Any]] = None,
         metadata: Optional[Mapping[str, Any]] = None,
@@ -4138,6 +4164,9 @@ class FrameworkTraceEnvironment(EnvironmentAdapter):
             trace_export=export,
             export_source=source,
             export_headers=headers,
+            export_auth=auth,
+            export_pagination=pagination,
+            export_max_pages=max_pages,
             export_timeout=timeout,
             state=state,
             metadata=metadata,
@@ -4333,17 +4362,23 @@ def load_framework_trace_export(
     *,
     framework: str = "traceai",
     headers: Optional[Mapping[str, str]] = None,
+    auth: Optional[Mapping[str, Any]] = None,
+    pagination: Optional[Mapping[str, Any]] = None,
+    max_pages: int = 20,
     timeout: float = 30.0,
     state: Optional[Mapping[str, Any]] = None,
     metadata: Optional[Mapping[str, Any]] = None,
 ) -> FrameworkTraceEnvironment:
     """Load a local/HTTP trace export and return a replay environment."""
 
-    if isinstance(source, (str, os.PathLike)):
+    if isinstance(source, (str, os.PathLike)) or _is_export_source_spec(source):
         return FrameworkTraceEnvironment.from_export(
             framework=framework,
             source=source,
             headers=headers,
+            auth=auth,
+            pagination=pagination,
+            max_pages=max_pages,
             timeout=timeout,
             state=state,
             metadata=metadata,
@@ -5890,23 +5925,326 @@ def _as_iterable(value: Any) -> List[Any]:
 
 
 def _load_framework_trace_export_source(
-    source: str | os.PathLike[str],
+    source: Any,
     *,
     headers: Optional[Mapping[str, str]] = None,
+    auth: Optional[Mapping[str, Any]] = None,
+    pagination: Optional[Mapping[str, Any]] = None,
+    max_pages: int = 20,
     timeout: float = 30.0,
 ) -> Any:
+    payload, _ = _load_framework_trace_export_source_with_metadata(
+        source,
+        headers=headers,
+        auth=auth,
+        pagination=pagination,
+        max_pages=max_pages,
+        timeout=timeout,
+    )
+    return payload
+
+
+def _load_framework_trace_export_source_with_metadata(
+    source: Any,
+    *,
+    headers: Optional[Mapping[str, str]] = None,
+    auth: Optional[Mapping[str, Any]] = None,
+    pagination: Optional[Mapping[str, Any]] = None,
+    max_pages: int = 20,
+    timeout: float = 30.0,
+) -> tuple[Any, Dict[str, Any]]:
+    if _is_export_source_spec(source):
+        spec = copy.deepcopy(dict(source))
+        spec_headers = {**dict(headers or {}), **dict(spec.get("headers", {}))}
+        spec_auth = _as_mapping(spec.get("auth")) or auth
+        spec_pagination = _as_mapping(spec.get("pagination")) or pagination
+        spec_max_pages = _voice_int(spec.get("max_pages")) or max_pages
+        if "pages" in spec:
+            pages = [
+                _load_export_page_payload(
+                    page,
+                    headers=spec_headers,
+                    auth=spec_auth,
+                    timeout=timeout,
+                )
+                for page in _as_iterable(spec.get("pages"))
+            ]
+            metadata = _export_source_metadata(
+                source,
+                headers=spec_headers,
+                auth=spec_auth,
+                page_count=len(pages),
+                pagination_enabled=True,
+                pagination=spec_pagination,
+            )
+            return pages, metadata
+        nested_source = spec.get("url") or spec.get("source") or spec.get("path")
+        if nested_source is None:
+            return spec, _export_source_metadata(
+                source,
+                headers=spec_headers,
+                auth=spec_auth,
+                page_count=1,
+                pagination_enabled=bool(spec_pagination),
+                pagination=spec_pagination,
+            )
+        return _load_framework_trace_export_source_with_metadata(
+            nested_source,
+            headers=spec_headers,
+            auth=spec_auth,
+            pagination=spec_pagination,
+            max_pages=spec_max_pages,
+            timeout=timeout,
+        )
+
+    effective_headers = _export_request_headers(headers, auth)
+    source_text = os.fspath(source)
+    parsed = urlparse(source_text)
+    if parsed.scheme in {"http", "https"} and _pagination_enabled(pagination):
+        pages: List[Any] = []
+        next_url: Optional[str] = source_text
+        cursor: Optional[str] = None
+        for _ in range(max(1, max_pages)):
+            if not next_url:
+                break
+            page_payload, response_headers = _load_http_export_page(
+                next_url,
+                headers=effective_headers,
+                timeout=timeout,
+            )
+            pages.append(page_payload)
+            next_url = _next_export_page_url(
+                page_payload,
+                response_headers=response_headers,
+                current_url=next_url,
+                pagination=pagination,
+            )
+            if not next_url:
+                cursor = _next_export_cursor(page_payload, pagination=pagination)
+                if cursor:
+                    next_url = _url_with_cursor(
+                        source_text,
+                        cursor=cursor,
+                        pagination=pagination,
+                    )
+        metadata = _export_source_metadata(
+            source,
+            headers=effective_headers,
+            auth=auth,
+            page_count=len(pages),
+            pagination_enabled=True,
+            pagination=pagination,
+        )
+        metadata["truncated"] = bool(next_url)
+        return pages, metadata
+
     source_text = os.fspath(source)
     parsed = urlparse(source_text)
     if parsed.scheme in {"http", "https"}:
-        request = urllib.request.Request(source_text, headers=dict(headers or {}))
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            encoding = response.headers.get_content_charset() or "utf-8"
-            body = response.read().decode(encoding)
-        return _parse_framework_trace_export_text(body)
+        payload, _ = _load_http_export_page(
+            source_text,
+            headers=effective_headers,
+            timeout=timeout,
+        )
+        return payload, _export_source_metadata(
+            source,
+            headers=effective_headers,
+            auth=auth,
+            page_count=1,
+            pagination_enabled=False,
+            pagination=pagination,
+        )
     if os.path.exists(source_text):
         with open(source_text, "r", encoding="utf-8") as file:
-            return _parse_framework_trace_export_text(file.read())
-    return _parse_framework_trace_export_text(source_text)
+            payload = _parse_framework_trace_export_text(file.read())
+        return payload, _export_source_metadata(
+            source,
+            headers=effective_headers,
+            auth=auth,
+            page_count=1,
+            pagination_enabled=False,
+            pagination=pagination,
+        )
+    return _parse_framework_trace_export_text(source_text), _export_source_metadata(
+        source,
+        headers=effective_headers,
+        auth=auth,
+        page_count=1,
+        pagination_enabled=False,
+        pagination=pagination,
+    )
+
+
+def _is_export_source_spec(value: Any) -> bool:
+    return isinstance(value, Mapping) and any(key in value for key in ("url", "source", "path", "pages", "auth", "pagination"))
+
+
+def _load_export_page_payload(
+    page: Any,
+    *,
+    headers: Mapping[str, str],
+    auth: Optional[Mapping[str, Any]],
+    timeout: float,
+) -> Any:
+    if _is_export_source_spec(page):
+        payload, _ = _load_framework_trace_export_source_with_metadata(
+            page,
+            headers=headers,
+            auth=auth,
+            timeout=timeout,
+        )
+        return payload
+    if isinstance(page, (str, os.PathLike)):
+        return _load_framework_trace_export_source(
+            page,
+            headers=headers,
+            auth=auth,
+            timeout=timeout,
+        )
+    return copy.deepcopy(page)
+
+
+def _load_http_export_page(
+    url: str,
+    *,
+    headers: Mapping[str, str],
+    timeout: float,
+) -> tuple[Any, Mapping[str, str]]:
+    request = urllib.request.Request(url, headers=dict(headers))
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        encoding = response.headers.get_content_charset() or "utf-8"
+        body = response.read().decode(encoding)
+        response_headers = {key.lower(): value for key, value in response.headers.items()}
+    return _parse_framework_trace_export_text(body), response_headers
+
+
+def _export_request_headers(
+    headers: Optional[Mapping[str, str]],
+    auth: Optional[Mapping[str, Any]],
+) -> Dict[str, str]:
+    result = dict(headers or {})
+    auth_map = _as_mapping(auth)
+    if not auth_map:
+        return result
+    auth_type = str(auth_map.get("type") or auth_map.get("scheme") or "").lower()
+    token = auth_map.get("token") or auth_map.get("bearer_token") or auth_map.get("api_key")
+    if auth_type in {"bearer", "token"} and token:
+        result.setdefault("Authorization", f"Bearer {token}")
+    elif auth_type in {"api_key", "apikey"} and token:
+        header_name = str(auth_map.get("header") or auth_map.get("header_name") or "X-API-Key")
+        result.setdefault(header_name, str(token))
+    elif auth_map.get("authorization"):
+        result.setdefault("Authorization", str(auth_map["authorization"]))
+    return result
+
+
+def _export_source_metadata(
+    source: Any,
+    *,
+    headers: Optional[Mapping[str, str]],
+    auth: Optional[Mapping[str, Any]],
+    page_count: int,
+    pagination_enabled: bool,
+    pagination: Optional[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    header_names = sorted(str(key) for key in (headers or {}).keys())
+    auth_map = _as_mapping(auth)
+    auth_header_names = [
+        name
+        for name in header_names
+        if name.lower() in {"authorization", "x-api-key", str(auth_map.get("header", "")).lower()}
+    ]
+    metadata = {
+        "export_source": _framework_trace_source_label(source),
+        "page_count": int(page_count),
+        "pagination_enabled": bool(pagination_enabled),
+        "auth_enabled": bool(auth_map or auth_header_names),
+        "header_names": header_names,
+        "auth_header_names": sorted(set(auth_header_names)),
+    }
+    if pagination:
+        metadata["pagination"] = {
+            key: value
+            for key, value in dict(pagination).items()
+            if key not in {"token", "api_key", "authorization"}
+        }
+    return metadata
+
+
+def _pagination_enabled(pagination: Optional[Mapping[str, Any]]) -> bool:
+    if pagination is None:
+        return False
+    if not pagination:
+        return True
+    return bool(pagination.get("enabled", True))
+
+
+def _next_export_page_url(
+    payload: Any,
+    *,
+    response_headers: Mapping[str, str],
+    current_url: str,
+    pagination: Optional[Mapping[str, Any]],
+) -> Optional[str]:
+    link_header = response_headers.get("link")
+    if link_header:
+        for part in link_header.split(","):
+            if 'rel="next"' in part or "rel=next" in part:
+                start = part.find("<")
+                end = part.find(">")
+                if start >= 0 and end > start:
+                    return urljoin(current_url, part[start + 1 : end])
+    item = _as_mapping(payload)
+    paths = _as_iterable(_as_mapping(pagination).get("next_url_path")) or [
+        "next",
+        "next_url",
+        "nextPageUrl",
+        "pagination.next",
+        "pagination.next_url",
+        "links.next",
+        "meta.next",
+    ]
+    for path in paths:
+        value = _mapping_path(item, str(path))
+        if value:
+            return urljoin(current_url, str(value))
+    return None
+
+
+def _next_export_cursor(payload: Any, *, pagination: Optional[Mapping[str, Any]]) -> Optional[str]:
+    item = _as_mapping(payload)
+    paths = _as_iterable(_as_mapping(pagination).get("cursor_path")) or [
+        "next_cursor",
+        "nextCursor",
+        "pagination.next_cursor",
+        "pagination.cursor",
+        "meta.next_cursor",
+    ]
+    for path in paths:
+        value = _mapping_path(item, str(path))
+        if value:
+            return str(value)
+    return None
+
+
+def _url_with_cursor(
+    url: str,
+    *,
+    cursor: str,
+    pagination: Optional[Mapping[str, Any]],
+) -> str:
+    cursor_param = str(_as_mapping(pagination).get("cursor_param") or "cursor")
+    separator = "&" if "?" in url else "?"
+    return f"{url}{separator}{urlencode({cursor_param: cursor})}"
+
+
+def _mapping_path(value: Mapping[str, Any], path: str) -> Any:
+    current: Any = value
+    for part in path.split("."):
+        if not isinstance(current, Mapping):
+            return None
+        current = current.get(part)
+    return current
 
 
 def _parse_framework_trace_export_text(text: str) -> Any:
@@ -5930,7 +6268,13 @@ def _parse_framework_trace_export_text(text: str) -> Any:
         raise ValueError("Invalid trace export JSON/JSONL") from exc
 
 
-def _framework_trace_source_label(source: str | os.PathLike[str]) -> str:
+def _framework_trace_source_label(source: Any) -> str:
+    if isinstance(source, Mapping):
+        if source.get("url") or source.get("source") or source.get("path"):
+            return _framework_trace_source_label(source.get("url") or source.get("source") or source.get("path"))
+        if source.get("pages") is not None:
+            return "inline_paginated_export"
+        return "inline_export_spec"
     source_text = os.fspath(source)
     parsed = urlparse(source_text)
     if parsed.scheme in {"http", "https"}:

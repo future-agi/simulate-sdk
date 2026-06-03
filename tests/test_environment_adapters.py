@@ -2382,6 +2382,56 @@ def test_framework_trace_environment_replays_traceai_export_file(tmp_path):
     assert any(event.type == "framework_span" and event.payload["id"] == "tool_span" for event in snapshot.events)
 
 
+def test_framework_trace_environment_replays_paginated_authenticated_export():
+    paginated_source = {
+        "auth": {"type": "bearer", "token": "secret-token"},
+        "pagination": {"enabled": True, "cursor_path": "pagination.next_cursor"},
+        "pages": [
+            {
+                "records": [
+                    {
+                        "name": "Future AGI support agent",
+                        "span_id": "agent_span",
+                        "attributes": {"fi.span.kind": "AGENT"},
+                    }
+                ],
+                "pagination": {"next_cursor": "page_2"},
+            },
+            {
+                "records": [
+                    {
+                        "name": "OpenAI chat completion",
+                        "span_id": "model_span",
+                        "attributes": {
+                            "gen_ai.operation.name": "chat",
+                            "gen_ai.usage.input_tokens": 48,
+                        },
+                    },
+                    {
+                        "name": "MCP tool search_order",
+                        "span_id": "tool_span",
+                        "attributes": {
+                            "gen_ai.operation.name": "execute_tool",
+                            "mcp.tool.name": "search_order",
+                        },
+                    },
+                ],
+            },
+        ],
+    }
+
+    environment = load_framework_trace_export(paginated_source, framework="future_agi")
+    snapshot = environment.reset()
+    trace_state = snapshot.state["framework_trace"]
+    export_metadata = trace_state["metadata"]["trace_export"]
+
+    assert export_metadata["page_count"] == 2
+    assert export_metadata["pagination_enabled"] is True
+    assert export_metadata["auth_enabled"] is True
+    assert export_metadata["export_source"] == "inline_paginated_export"
+    assert {"agent", "model", "tool", "cost"} <= set(trace_state["signals"])
+
+
 @pytest.mark.asyncio
 async def test_framework_trace_environment_ingests_raw_traceai_records():
     async def agent(input):
@@ -2868,6 +2918,60 @@ async def test_voice_environment_loads_voice_exports_waveforms_diarization_and_q
     assert any(artifact.type == "audio" and artifact.metadata.get("id") == "caller_wave" for artifact in result.artifacts)
     assert voice_traces[-1]["export_framework"] == "livekit"
     assert voice_traces[-1]["perceptual_metrics"]["overall"]["packet_loss_pct"] == 0.4
+
+
+def test_voice_environment_replays_paginated_authenticated_export():
+    paginated_source = {
+        "framework": "livekit",
+        "auth": {"type": "api_key", "header": "X-FI-Key", "token": "secret-key"},
+        "pagination": {"enabled": True, "next_url_path": "links.next"},
+        "pages": [
+            {
+                "events": [
+                    {
+                        "event": "user_input_transcribed",
+                        "id": "caller_1",
+                        "transcript": "Billing issue for order 123.",
+                        "speaker_id": "caller",
+                    }
+                ],
+                "links": {"next": "page_2"},
+            },
+            {
+                "frames": [
+                    {"id": "input", "frame_type": "InputAudioRawFrame", "sample_rate": 24000},
+                    {
+                        "id": "transcript",
+                        "frame_type": "TranscriptionFrame",
+                        "text": "Billing issue for order 123.",
+                    },
+                ],
+                "recordings": [
+                    {
+                        "id": "caller_wave",
+                        "speaker": "caller",
+                        "duration_ms": 1000,
+                        "sample_rate_hz": 24000,
+                    }
+                ],
+            },
+        ],
+    }
+
+    snapshot = load_voice_export(paginated_source, framework="livekit").reset()
+    voice_trace = next(
+        artifact.data
+        for artifact in snapshot.artifacts
+        if artifact.type == "trace" and artifact.metadata.get("kind") == "voice_trace"
+    )
+    export_metadata = voice_trace["export_metadata"]["trace_export"]
+
+    assert export_metadata["page_count"] == 2
+    assert export_metadata["pagination_enabled"] is True
+    assert export_metadata["auth_enabled"] is True
+    assert voice_trace["utterances"][0]["transcript"] == "Billing issue for order 123."
+    assert voice_trace["frame_replay"][-1]["frame_type"] == "TranscriptionFrame"
+    assert any(event.name == "voice_session_ready" for event in snapshot.events)
 
 
 @pytest.mark.asyncio
