@@ -7657,6 +7657,195 @@ class AgentIntegrationEnvironment(EnvironmentAdapter):
         return copy.deepcopy(self.manifest)
 
 
+class FrameworkImportManifestEnvironment(EnvironmentAdapter):
+    """
+    Replay framework-import evidence as one portable simulation surface.
+
+    This sits above one-off LangGraph/LangChain/AutoGen/CrewAI/OpenAI/OTel
+    loaders: users declare which exports they have, the manifest records source
+    status and signals, and downstream evals/optimizers score the gaps.
+    """
+
+    name = "framework_import_manifest"
+
+    def __init__(
+        self,
+        manifest: Any = None,
+        *,
+        name: str = "framework-import-manifest",
+        framework: Optional[str] = None,
+        adapter: Optional[Mapping[str, Any]] = None,
+        target: Optional[Mapping[str, Any]] = None,
+        sources: Optional[Iterable[Any]] = None,
+        traces: Optional[Iterable[Any]] = None,
+        event_streams: Optional[Iterable[Any]] = None,
+        lifecycle: Optional[Iterable[Any]] = None,
+        capabilities: Optional[Iterable[Any]] = None,
+        probes: Optional[Iterable[Any]] = None,
+        portability: Optional[Iterable[Any]] = None,
+        observability: Optional[Mapping[str, Any]] = None,
+        artifacts: Optional[Iterable[Any]] = None,
+        required_sources: Optional[Iterable[str]] = None,
+        required_frameworks: Optional[Iterable[str]] = None,
+        required_export_types: Optional[Iterable[str]] = None,
+        required_signals: Optional[Iterable[str]] = None,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        self.initial_manifest = normalize_framework_import_manifest(
+            manifest,
+            name=name,
+            framework=framework,
+            adapter=adapter,
+            target=target,
+            sources=sources,
+            traces=traces,
+            event_streams=event_streams,
+            lifecycle=lifecycle,
+            capabilities=capabilities,
+            probes=probes,
+            portability=portability,
+            observability=observability,
+            artifacts=artifacts,
+            required_sources=required_sources,
+            required_frameworks=required_frameworks,
+            required_export_types=required_export_types,
+            required_signals=required_signals,
+            metadata=metadata,
+        )
+        self.manifest: Dict[str, Any] = {}
+
+    def reset(self, **context: Any) -> EnvironmentSnapshot:
+        self.manifest = copy.deepcopy(self.initial_manifest)
+        return EnvironmentSnapshot(
+            tools=self._tool_specs(),
+            artifacts=[self._trace_artifact()],
+            events=[
+                SimulationEvent(
+                    type="framework_import",
+                    name="framework_import_manifest_ready",
+                    payload={
+                        "name": self.manifest.get("name"),
+                        "framework": self.manifest.get("framework"),
+                        "summary": copy.deepcopy(self.manifest.get("summary", {})),
+                        "signals": copy.deepcopy(self.manifest.get("signals", [])),
+                    },
+                )
+            ],
+            state={"framework_import_manifest": self._trace_payload()},
+            metadata={"framework_import_manifest": copy.deepcopy(self.manifest.get("summary", {}))},
+        )
+
+    def handle_tool_call(
+        self,
+        tool_call: Mapping[str, Any],
+        **context: Any,
+    ) -> Optional[ToolExecutionResult]:
+        name = _tool_name(tool_call)
+        if name not in {
+            "framework_import_status",
+            "list_framework_import_sources",
+            "list_framework_import_exports",
+            "list_framework_import_gaps",
+        }:
+            return None
+        arguments = _tool_arguments(tool_call)
+        call_id = _tool_call_id(tool_call)
+
+        if name == "framework_import_status":
+            result = self._trace_payload()
+            event_name = "framework_import_status"
+            content = f"Framework import manifest {self.manifest.get('name')} status recorded."
+        elif name == "list_framework_import_sources":
+            sources = copy.deepcopy(self.manifest.get("sources", []))
+            framework = _normalize_framework_import_framework(arguments.get("framework") or "")
+            export_type = _normalize_framework_import_export_type(arguments.get("export_type") or arguments.get("type") or "")
+            status = _normalize_framework_import_status(arguments.get("status") or "")
+            if framework:
+                sources = [item for item in sources if item.get("framework") == framework]
+            if export_type:
+                sources = [item for item in sources if item.get("export_type") == export_type]
+            if status:
+                sources = [item for item in sources if item.get("status") == status]
+            result = {"sources": sources, "count": len(sources)}
+            event_name = "framework_import_sources_listed"
+            content = f"Listed {len(sources)} framework import source(s)."
+        elif name == "list_framework_import_exports":
+            summary = copy.deepcopy(self.manifest.get("summary", {}))
+            result = {
+                "frameworks": summary.get("observed_frameworks", []),
+                "export_types": summary.get("observed_export_types", []),
+                "signals": summary.get("observed_signals", []),
+                "source_count": summary.get("source_count", 0),
+                "passed_source_count": summary.get("passed_source_count", 0),
+            }
+            event_name = "framework_import_exports_listed"
+            content = "Listed framework import export coverage."
+        else:
+            summary = copy.deepcopy(self.manifest.get("summary", {}))
+            result = {
+                "missing_required_sources": summary.get("missing_required_sources", []),
+                "missing_required_frameworks": summary.get("missing_required_frameworks", []),
+                "missing_required_export_types": summary.get("missing_required_export_types", []),
+                "missing_required_signals": summary.get("missing_required_signals", []),
+                "failed_sources": summary.get("failed_sources", []),
+            }
+            event_name = "framework_import_gaps_listed"
+            content = "Listed framework import gaps."
+
+        return ToolExecutionResult(
+            tool_call_id=call_id,
+            tool_name=name,
+            content=content,
+            result=result,
+            success=True,
+            state_updates={"framework_import_manifest": self._trace_payload()},
+            artifacts=[self._trace_artifact()],
+            events=[SimulationEvent(type="framework_import", name=event_name, payload=result)],
+        )
+
+    def _tool_specs(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                "name": "framework_import_status",
+                "description": "Return the normalized framework import manifest and summary.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            {
+                "name": "list_framework_import_sources",
+                "description": "List framework import sources, optionally filtered by framework, export type, or status.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "framework": {"type": "string"},
+                        "export_type": {"type": "string"},
+                        "status": {"type": "string"},
+                    },
+                },
+            },
+            {
+                "name": "list_framework_import_exports",
+                "description": "List observed frameworks, export types, and signals in this import.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            {
+                "name": "list_framework_import_gaps",
+                "description": "List missing framework import sources, frameworks, export types, signals, and failed sources.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        ]
+
+    def _trace_artifact(self) -> SimulationArtifact:
+        return SimulationArtifact(
+            type="trace",
+            role="environment",
+            data=self._trace_payload(),
+            metadata={"kind": "framework_import_manifest", "framework": self.manifest.get("framework")},
+        )
+
+    def _trace_payload(self) -> Dict[str, Any]:
+        return copy.deepcopy(self.manifest)
+
+
 class WorkspaceRunEnvironment(EnvironmentAdapter):
     """
     Replay autonomous repository checkout/run evidence as a simulation surface.
@@ -11843,6 +12032,171 @@ def load_agent_integration_manifest(
     )
 
 
+def normalize_framework_import_manifest(
+    payload: Any = None,
+    *,
+    name: str = "framework-import-manifest",
+    framework: Optional[str] = None,
+    adapter: Optional[Mapping[str, Any]] = None,
+    target: Optional[Mapping[str, Any]] = None,
+    sources: Optional[Iterable[Any]] = None,
+    traces: Optional[Iterable[Any]] = None,
+    event_streams: Optional[Iterable[Any]] = None,
+    lifecycle: Optional[Iterable[Any]] = None,
+    capabilities: Optional[Iterable[Any]] = None,
+    probes: Optional[Iterable[Any]] = None,
+    portability: Optional[Iterable[Any]] = None,
+    observability: Optional[Mapping[str, Any]] = None,
+    artifacts: Optional[Iterable[Any]] = None,
+    required_sources: Optional[Iterable[str]] = None,
+    required_frameworks: Optional[Iterable[str]] = None,
+    required_export_types: Optional[Iterable[str]] = None,
+    required_signals: Optional[Iterable[str]] = None,
+    metadata: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Normalize framework import evidence into one replayable manifest."""
+
+    payload_dict = dict(payload) if isinstance(payload, Mapping) else {}
+    manifest_name = str(payload_dict.get("name") or name)
+    manifest_framework = _normalize_framework_import_framework(payload_dict.get("framework") or framework)
+    adapter_record = _framework_import_mapping(adapter if adapter is not None else payload_dict.get("adapter"))
+    target_record = _framework_import_mapping(target if target is not None else payload_dict.get("target"))
+    observability_record = _framework_import_mapping(
+        observability if observability is not None else payload_dict.get("observability")
+    )
+    artifact_records = _normalize_framework_import_artifacts(
+        artifacts if artifacts is not None else payload_dict.get("artifacts")
+    )
+
+    source_records = _normalize_framework_import_sources(
+        sources if sources is not None else payload_dict.get("sources"),
+        default_framework=manifest_framework,
+    )
+    typed_sources = [
+        ("trace_export", traces if traces is not None else payload_dict.get("traces", payload_dict.get("trace_exports"))),
+        ("event_stream", event_streams if event_streams is not None else payload_dict.get("event_streams")),
+        ("lifecycle", lifecycle if lifecycle is not None else payload_dict.get("lifecycle")),
+        ("capability_matrix", capabilities if capabilities is not None else payload_dict.get("capabilities")),
+        ("probe_suite", probes if probes is not None else payload_dict.get("probes")),
+        ("portability_matrix", portability if portability is not None else payload_dict.get("portability")),
+    ]
+    for export_type, value in typed_sources:
+        source_records.extend(
+            _normalize_framework_import_sources(
+                value,
+                default_framework=manifest_framework,
+                default_export_type=export_type,
+            )
+        )
+
+    source_records = _dedupe_framework_import_sources(source_records)
+    required_source_keys = _framework_import_key_list(
+        required_sources if required_sources is not None else payload_dict.get("required_sources")
+    )
+    required_framework_keys = [
+        _normalize_framework_import_framework(item)
+        for item in _as_iterable(
+            required_frameworks if required_frameworks is not None else payload_dict.get("required_frameworks")
+        )
+    ]
+    required_framework_keys = sorted({item for item in required_framework_keys if item})
+    required_export_type_keys = [
+        _normalize_framework_import_export_type(item)
+        for item in _as_iterable(
+            required_export_types if required_export_types is not None else payload_dict.get("required_export_types")
+        )
+    ]
+    required_export_type_keys = sorted({item for item in required_export_type_keys if item})
+    required_signal_keys = _framework_import_key_list(
+        required_signals if required_signals is not None else payload_dict.get("required_signals")
+    )
+
+    summary = _framework_import_summary(
+        framework=manifest_framework,
+        adapter=adapter_record,
+        target=target_record,
+        sources=source_records,
+        observability=observability_record,
+        artifacts=artifact_records,
+        required_sources=required_source_keys,
+        required_frameworks=required_framework_keys,
+        required_export_types=required_export_type_keys,
+        required_signals=required_signal_keys,
+    )
+    signals = _framework_import_signals(
+        framework=manifest_framework,
+        adapter=adapter_record,
+        target=target_record,
+        sources=source_records,
+        observability=observability_record,
+        artifacts=artifact_records,
+        summary=summary,
+    )
+    merged_metadata = {
+        **dict(payload_dict.get("metadata") or {}),
+        **dict(metadata or {}),
+    }
+    return {
+        "kind": "framework_import_manifest",
+        "name": manifest_name,
+        "framework": manifest_framework,
+        "adapter": adapter_record,
+        "target": target_record,
+        "sources": source_records,
+        "observability": observability_record,
+        "artifacts": artifact_records,
+        "required_sources": required_source_keys,
+        "required_frameworks": required_framework_keys,
+        "required_export_types": required_export_type_keys,
+        "required_signals": required_signal_keys,
+        "summary": summary,
+        "signals": signals,
+        "metadata": copy.deepcopy(merged_metadata),
+    }
+
+
+def load_framework_import_manifest(
+    source: str | os.PathLike[str] | Mapping[str, Any] | Iterable[Any],
+    *,
+    name: str = "framework-import-manifest",
+    framework: Optional[str] = None,
+    required_sources: Optional[Iterable[str]] = None,
+    required_frameworks: Optional[Iterable[str]] = None,
+    required_export_types: Optional[Iterable[str]] = None,
+    required_signals: Optional[Iterable[str]] = None,
+    headers: Optional[Mapping[str, str]] = None,
+    auth: Optional[Mapping[str, Any]] = None,
+    pagination: Optional[Mapping[str, Any]] = None,
+    max_pages: int = 20,
+    timeout: float = 30.0,
+    metadata: Optional[Mapping[str, Any]] = None,
+) -> FrameworkImportManifestEnvironment:
+    """Load a local/HTTP framework import manifest and return an environment."""
+
+    source_metadata: Dict[str, Any] = {}
+    if isinstance(source, (str, os.PathLike)) or _is_export_source_spec(source):
+        loaded, source_metadata = _load_framework_trace_export_source_with_metadata(
+            source,
+            headers=headers,
+            auth=auth,
+            pagination=pagination,
+            max_pages=max_pages,
+            timeout=timeout,
+        )
+    else:
+        loaded = source
+    return FrameworkImportManifestEnvironment(
+        loaded,
+        name=name,
+        framework=framework,
+        required_sources=required_sources,
+        required_frameworks=required_frameworks,
+        required_export_types=required_export_types,
+        required_signals=required_signals,
+        metadata={**source_metadata, **dict(metadata or {})},
+    )
+
+
 def normalize_workspace_run_manifest(
     payload: Any = None,
     *,
@@ -12922,6 +13276,393 @@ def _normalize_agent_integration_key(value: Any) -> str:
 
 def _agent_integration_dict(value: Any) -> Dict[str, Any]:
     return copy.deepcopy(dict(value)) if isinstance(value, Mapping) else {}
+
+
+def _normalize_framework_import_sources(
+    value: Any,
+    *,
+    default_framework: str = "",
+    default_export_type: str = "",
+) -> List[Dict[str, Any]]:
+    records: List[Dict[str, Any]] = []
+    for index, raw in enumerate(_as_iterable(value), start=1):
+        if raw in (None, "", [], {}):
+            continue
+        if isinstance(raw, str):
+            item = {"name": raw, "path": raw}
+        elif isinstance(raw, Mapping):
+            item = copy.deepcopy(dict(raw))
+        else:
+            item = {"name": str(raw)}
+        framework = _normalize_framework_import_framework(
+            item.get("framework")
+            or item.get("runtime")
+            or item.get("source_framework")
+            or default_framework
+        )
+        export_type = _normalize_framework_import_export_type(
+            item.get("export_type")
+            or item.get("type")
+            or item.get("kind")
+            or item.get("category")
+            or default_export_type
+        )
+        source_id = _normalize_framework_import_key(
+            item.get("id")
+            or item.get("name")
+            or item.get("source")
+            or item.get("path")
+            or item.get("url")
+            or f"{framework or 'framework'}_{export_type or 'source'}_{index}"
+        )
+        status = _normalize_framework_import_status(item.get("status") or item.get("conclusion"))
+        if not status:
+            status = "failed" if item.get("error") else "passed" if _framework_import_source_has_evidence(item) else "unknown"
+        signals = {
+            framework,
+            export_type,
+            *_framework_import_key_list(item.get("signals")),
+            *_framework_import_text_signals(
+                " ".join(
+                    str(part)
+                    for part in [
+                        source_id,
+                        item.get("name"),
+                        item.get("path"),
+                        item.get("url"),
+                        item.get("description"),
+                        framework,
+                        export_type,
+                    ]
+                    if part
+                )
+            ),
+        }
+        if item.get("spans") or item.get("resourceSpans") or item.get("resource_spans"):
+            signals.add("trace_export")
+            signals.add("span")
+        if item.get("events") or item.get("stream_events") or item.get("messages"):
+            signals.add("event_stream")
+        if item.get("observability") or item.get("trace_id") or item.get("span_id"):
+            signals.add("observability")
+        if item.get("artifact") or item.get("artifact_ref") or item.get("path") or item.get("url"):
+            signals.add("artifact")
+        item.update(
+            {
+                "id": source_id,
+                "name": str(item.get("name") or source_id),
+                "framework": framework,
+                "export_type": export_type,
+                "status": status,
+                "passed": status in {"passed", "success", "completed", "available", "verified", "live_verified"},
+                "record_count": _framework_import_int(
+                    item.get("record_count")
+                    or item.get("event_count")
+                    or item.get("span_count")
+                    or len(_as_iterable(item.get("records") or item.get("events") or item.get("spans")))
+                ),
+                "signals": sorted(signal for signal in (_normalize_framework_import_key(s) for s in signals) if signal),
+            }
+        )
+        records.append(item)
+    return records
+
+
+def _dedupe_framework_import_sources(sources: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+    deduped: List[Dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for source in sources:
+        item = copy.deepcopy(dict(source))
+        key = (
+            str(item.get("id") or ""),
+            str(item.get("framework") or ""),
+            str(item.get("export_type") or ""),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+    return deduped
+
+
+def _normalize_framework_import_artifacts(value: Any) -> List[Dict[str, Any]]:
+    records: List[Dict[str, Any]] = []
+    for index, raw in enumerate(_as_iterable(value), start=1):
+        if raw in (None, "", [], {}):
+            continue
+        item = copy.deepcopy(dict(raw)) if isinstance(raw, Mapping) else {"path": str(raw)}
+        artifact_type = _normalize_framework_import_export_type(item.get("type") or item.get("kind") or "artifact")
+        item.update(
+            {
+                "id": str(item.get("id") or item.get("name") or f"artifact_{index}"),
+                "type": artifact_type,
+                "signals": sorted(
+                    {
+                        "artifact",
+                        artifact_type,
+                        *_framework_import_key_list(item.get("signals")),
+                        *_framework_import_text_signals(str(item.get("path") or item.get("url") or item.get("name") or "")),
+                    }
+                ),
+            }
+        )
+        records.append(item)
+    return records
+
+
+def _framework_import_summary(
+    *,
+    framework: str,
+    adapter: Mapping[str, Any],
+    target: Mapping[str, Any],
+    sources: Sequence[Mapping[str, Any]],
+    observability: Mapping[str, Any],
+    artifacts: Sequence[Mapping[str, Any]],
+    required_sources: Sequence[str],
+    required_frameworks: Sequence[str],
+    required_export_types: Sequence[str],
+    required_signals: Sequence[str],
+) -> Dict[str, Any]:
+    observed_frameworks = {_normalize_framework_import_framework(framework)}
+    observed_frameworks.update(
+        _normalize_framework_import_framework(source.get("framework"))
+        for source in sources
+        if source.get("framework")
+    )
+    observed_export_types = {
+        _normalize_framework_import_export_type(source.get("export_type"))
+        for source in sources
+        if source.get("export_type")
+    }
+    observed_signals = {
+        _normalize_framework_import_key(signal)
+        for source in sources
+        for signal in _as_iterable(source.get("signals"))
+        if _normalize_framework_import_key(signal)
+    }
+    observed_signals.update(
+        _normalize_framework_import_key(signal)
+        for artifact in artifacts
+        for signal in _as_iterable(artifact.get("signals"))
+        if _normalize_framework_import_key(signal)
+    )
+    if target:
+        observed_signals.add("target")
+    if adapter:
+        observed_signals.add("adapter")
+    observability_hook_count = sum(
+        len(_as_iterable(observability.get(key)))
+        for key in ("traces", "logs", "metrics", "dashboards", "webhooks", "events", "runs")
+    )
+    if observability and not observability_hook_count:
+        observability_hook_count = 1
+    if observability_hook_count:
+        observed_signals.add("observability")
+    if artifacts:
+        observed_signals.add("artifact")
+
+    source_keys = {
+        _normalize_framework_import_key(value)
+        for source in sources
+        for value in [
+            source.get("id"),
+            source.get("name"),
+            source.get("framework"),
+            source.get("export_type"),
+            *_as_iterable(source.get("signals")),
+        ]
+        if _normalize_framework_import_key(value)
+    }
+    failed_sources = [
+        str(source.get("id"))
+        for source in sources
+        if source.get("status") in {"failed", "error", "timeout", "cancelled", "canceled"}
+    ]
+    has_export = lambda *names: bool(observed_export_types.intersection(names))
+    return {
+        "has_target": bool(target),
+        "has_adapter": bool(adapter),
+        "source_count": len(sources),
+        "passed_source_count": sum(1 for source in sources if source.get("passed")),
+        "failed_source_count": len([item for item in failed_sources if item]),
+        "failed_sources": [item for item in failed_sources if item],
+        "artifact_count": len(artifacts),
+        "observability_hook_count": observability_hook_count,
+        "has_trace_export": has_export("trace_export", "otlp_trace", "framework_trace"),
+        "has_event_stream": has_export("event_stream", "stream_events"),
+        "has_lifecycle": has_export("lifecycle", "lifecycle_trace"),
+        "has_capability_matrix": has_export("capability_matrix"),
+        "has_probe_suite": has_export("probe_suite"),
+        "has_portability_matrix": has_export("portability_matrix"),
+        "has_observability": observability_hook_count > 0,
+        "has_artifacts": bool(artifacts),
+        "observed_frameworks": sorted(item for item in observed_frameworks if item),
+        "observed_export_types": sorted(item for item in observed_export_types if item),
+        "observed_signals": sorted(item for item in observed_signals if item),
+        "source_keys": sorted(item for item in source_keys if item),
+        "missing_required_sources": sorted(set(required_sources) - source_keys),
+        "missing_required_frameworks": sorted(set(required_frameworks) - {item for item in observed_frameworks if item}),
+        "missing_required_export_types": sorted(set(required_export_types) - {item for item in observed_export_types if item}),
+        "missing_required_signals": sorted(set(required_signals) - {item for item in observed_signals if item}),
+    }
+
+
+def _framework_import_signals(
+    *,
+    framework: str,
+    adapter: Mapping[str, Any],
+    target: Mapping[str, Any],
+    sources: Sequence[Mapping[str, Any]],
+    observability: Mapping[str, Any],
+    artifacts: Sequence[Mapping[str, Any]],
+    summary: Mapping[str, Any],
+) -> List[str]:
+    signals = {"framework_import", "framework_import_manifest"}
+    if framework:
+        signals.update({"framework", framework})
+    if adapter:
+        signals.add("adapter")
+    if target:
+        signals.add("target")
+    for source in sources:
+        signals.add("source")
+        signals.add(_normalize_framework_import_framework(source.get("framework")))
+        signals.add(_normalize_framework_import_export_type(source.get("export_type")))
+        signals.update(_normalize_framework_import_key(signal) for signal in _as_iterable(source.get("signals")) if _normalize_framework_import_key(signal))
+    if observability:
+        signals.add("observability")
+    if artifacts:
+        signals.add("artifact")
+    for key in ("observed_frameworks", "observed_export_types", "observed_signals"):
+        signals.update(str(item) for item in _as_iterable(summary.get(key)) if str(item))
+    return sorted(_normalize_framework_import_key(signal) for signal in signals if _normalize_framework_import_key(signal))
+
+
+def _framework_import_mapping(value: Any) -> Dict[str, Any]:
+    if value in (None, "", [], {}):
+        return {}
+    if isinstance(value, Mapping):
+        return copy.deepcopy(dict(value))
+    return {"name": str(value)}
+
+
+def _framework_import_source_has_evidence(item: Mapping[str, Any]) -> bool:
+    return any(
+        item.get(key) not in (None, "", [], {})
+        for key in ("path", "url", "records", "events", "spans", "data", "artifact", "artifact_ref")
+    )
+
+
+def _normalize_framework_import_status(value: Any) -> str:
+    normalized = _normalize_framework_import_key(value)
+    if normalized in {"ok", "complete", "completed", "success", "succeeded", "passed", "available", "verified", "live_verified"}:
+        return "passed"
+    if normalized in {"fail", "failed", "error", "errored", "timeout", "timed_out", "cancelled", "canceled"}:
+        return "failed"
+    return normalized
+
+
+def _normalize_framework_import_framework(value: Any) -> str:
+    normalized = _normalize_framework_import_key(value)
+    aliases = {
+        "llama_index": "llamaindex",
+        "openai_ag": "openai_agents",
+        "openai_agent": "openai_agents",
+        "openai_agents_sdk": "openai_agents",
+        "openai_responses": "openai_agents",
+        "openai": "openai_agents",
+        "pydantic_ai": "pydantic_ai",
+        "pydanticai": "pydantic_ai",
+        "auto_gen": "autogen",
+        "trace_ai": "traceai",
+        "opentelemetry": "otel",
+    }
+    return aliases.get(normalized, normalized)
+
+
+def _normalize_framework_import_export_type(value: Any) -> str:
+    normalized = _normalize_framework_import_key(value)
+    aliases = {
+        "trace": "trace_export",
+        "traces": "trace_export",
+        "framework_trace": "trace_export",
+        "span_export": "trace_export",
+        "spans": "trace_export",
+        "otlp": "trace_export",
+        "otel": "trace_export",
+        "event": "event_stream",
+        "events": "event_stream",
+        "stream": "event_stream",
+        "stream_event": "event_stream",
+        "stream_events": "event_stream",
+        "capability": "capability_matrix",
+        "capabilities": "capability_matrix",
+        "capability_map": "capability_matrix",
+        "probe": "probe_suite",
+        "probes": "probe_suite",
+        "probe_matrix": "probe_suite",
+        "portability": "portability_matrix",
+        "portability_map": "portability_matrix",
+        "transcripts": "transcript",
+    }
+    return aliases.get(normalized, normalized)
+
+
+def _framework_import_key_list(value: Any) -> List[str]:
+    return sorted({_normalize_framework_import_key(item) for item in _as_iterable(value) if _normalize_framework_import_key(item)})
+
+
+def _framework_import_text_signals(text: str) -> set[str]:
+    normalized = _normalize_framework_import_key(text)
+    keyword_map = {
+        "langgraph": "langgraph",
+        "langchain": "langchain",
+        "autogen": "autogen",
+        "crewai": "crewai",
+        "openai": "openai_agents",
+        "traceai": "traceai",
+        "otel": "otel",
+        "opentelemetry": "otel",
+        "span": "trace_export",
+        "trace": "trace_export",
+        "event": "event_stream",
+        "stream": "event_stream",
+        "lifecycle": "lifecycle",
+        "capability": "capability_matrix",
+        "probe": "probe_suite",
+        "portability": "portability_matrix",
+        "transcript": "transcript",
+        "model": "model",
+        "tool": "tool",
+        "state": "state",
+        "checkpoint": "checkpoint",
+        "handoff": "handoff",
+        "memory": "memory",
+        "security": "security",
+        "observability": "observability",
+        "latency": "latency",
+        "cost": "cost",
+    }
+    return {signal for keyword, signal in keyword_map.items() if keyword in normalized}
+
+
+def _normalize_framework_import_key(value: Any) -> str:
+    return str(value or "").strip().lower().replace("-", "_").replace(" ", "_").replace(".", "_")
+
+
+def _framework_import_int(value: Any) -> Optional[int]:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(value.strip())
+        except ValueError:
+            return None
+    return None
 
 
 def _observability_replay_records(payload: Any) -> List[Any]:

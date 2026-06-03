@@ -18,6 +18,7 @@ from fi.simulate import (
     DomainPackageEnvironment,
     FileEnvironment,
     FrameworkCapabilityEnvironment,
+    FrameworkImportManifestEnvironment,
     FrameworkLifecycleEnvironment,
     FrameworkPortabilityEnvironment,
     FrameworkProbeEnvironment,
@@ -51,6 +52,7 @@ from fi.simulate import (
     load_playwright_trace_export,
     load_red_team_campaign_manifest,
     load_framework_trace_export,
+    load_framework_import_manifest,
     load_streaming_trace_export,
     load_autogen_groupchat_transcript,
     load_crewai_event_log,
@@ -68,6 +70,7 @@ from fi.simulate import (
     normalize_workspace_run_manifest,
     normalize_agent_trust_boundary_model,
     normalize_framework_capability_matrix,
+    normalize_framework_import_manifest,
     normalize_framework_lifecycle_trace,
     normalize_framework_portability_matrix,
     normalize_framework_probe_suite,
@@ -3075,6 +3078,202 @@ async def test_agent_integration_environment_covers_voice_chat_providers_and_tra
         required_channels=["webrtc"],
     )
     assert isinstance(loaded, AgentIntegrationEnvironment)
+
+
+@pytest.mark.asyncio
+async def test_framework_import_manifest_environment_scores_framework_evidence():
+    manifest = {
+        "name": "support-agent-framework-import",
+        "framework": "langgraph",
+        "target": {"name": "support-agent", "runtime": "customer-repo"},
+        "adapter": {"name": "futureagi-import", "version": "2026.06"},
+        "sources": [
+            {
+                "id": "langgraph_events",
+                "framework": "langgraph",
+                "export_type": "event_stream",
+                "status": "passed",
+                "signals": ["model", "tool", "state", "checkpoint", "session"],
+                "events": [{"type": "on_chain_stream"}],
+            },
+            {
+                "id": "openai_responses",
+                "framework": "openai_agents",
+                "export_type": "trace_export",
+                "status": "passed",
+                "signals": ["model", "tool", "cost"],
+                "spans": [{"name": "response.output_text.delta"}],
+            },
+            {
+                "id": "autogen_transcript",
+                "framework": "autogen",
+                "export_type": "transcript",
+                "status": "passed",
+                "signals": ["agent", "tool", "handoff"],
+                "messages": [{"role": "assistant", "content": "handoff"}],
+            },
+            {
+                "id": "capabilities",
+                "framework": "langgraph",
+                "export_type": "capability_matrix",
+                "status": "passed",
+                "signals": ["memory", "streaming", "tools", "security", "observability"],
+            },
+            {
+                "id": "probes",
+                "framework": "langgraph",
+                "export_type": "probe_suite",
+                "status": "passed",
+                "signals": ["invoke", "tools", "memory", "observability"],
+            },
+            {
+                "id": "portability",
+                "framework": "langgraph",
+                "export_type": "portability_matrix",
+                "status": "passed",
+                "signals": ["tools", "memory", "streaming", "runtime"],
+            },
+        ],
+        "lifecycle": [
+            {
+                "id": "langgraph_lifecycle",
+                "framework": "langgraph",
+                "status": "passed",
+                "signals": ["setup", "tool_registration", "checkpoint", "cleanup"],
+            }
+        ],
+        "observability": {
+            "traces": ["trace_framework_import"],
+            "logs": ["artifacts/import.log"],
+            "webhooks": ["framework_import.completed"],
+        },
+        "artifacts": [
+            {"id": "manifest_json", "type": "json", "path": "artifacts/framework-import.json"},
+            {"id": "trace_jsonl", "type": "trace", "path": "artifacts/trace.jsonl"},
+        ],
+    }
+    normalized = normalize_framework_import_manifest(
+        manifest,
+        required_frameworks=["langgraph", "openai_agents", "autogen"],
+        required_export_types=[
+            "event_stream",
+            "trace_export",
+            "transcript",
+            "capability_matrix",
+            "probe_suite",
+            "portability_matrix",
+            "lifecycle",
+        ],
+        required_signals=["model", "tool", "state", "handoff", "observability"],
+    )
+    assert normalized["summary"]["missing_required_frameworks"] == []
+    assert normalized["summary"]["missing_required_export_types"] == []
+    assert {"framework_import_manifest", "langgraph", "openai_agents", "trace_export"} <= set(normalized["signals"])
+
+    async def agent(input):
+        return AgentResponse(
+            content="Framework import manifest inspected for trace exports, event streams, lifecycle, capabilities, probes, portability, artifacts, and observability.",
+            tool_calls=[
+                {"id": "status", "name": "framework_import_status", "arguments": {}},
+                {"id": "sources", "name": "list_framework_import_sources", "arguments": {"framework": "langgraph"}},
+                {"id": "exports", "name": "list_framework_import_exports", "arguments": {}},
+                {"id": "gaps", "name": "list_framework_import_gaps", "arguments": {}},
+            ],
+        )
+
+    report = await LocalTextEngine().run(
+        scenario=_scenario(),
+        agent_callback=agent,
+        environment=FrameworkImportManifestEnvironment(
+            manifest,
+            required_frameworks=["langgraph", "openai_agents", "autogen"],
+            required_export_types=[
+                "event_stream",
+                "trace_export",
+                "transcript",
+                "capability_matrix",
+                "probe_suite",
+                "portability_matrix",
+                "lifecycle",
+            ],
+            required_signals=["model", "tool", "state", "handoff", "observability"],
+        ),
+        max_turns=1,
+        min_turns=1,
+    )
+    result = report.results[0]
+    state = result.metadata["environment_state"]["framework_import_manifest"]
+    assert state["summary"]["source_count"] == 7
+    assert state["summary"]["passed_source_count"] == 7
+    assert {"framework_import_status", "list_framework_import_sources", "list_framework_import_gaps"} <= {
+        tool["name"] for tool in result.tool_calls
+    }
+
+    evaluation = evaluate_agent_report(
+        report,
+        config={
+            "required_framework_import": [
+                "framework_import",
+                "target",
+                "adapter",
+                "source",
+                "trace_export",
+                "event_stream",
+                "lifecycle",
+                "capability_matrix",
+                "probe_suite",
+                "portability_matrix",
+                "artifact",
+                "observability",
+                "langgraph",
+                "openai_agents",
+                "autogen",
+                "model",
+                "tool",
+                "state",
+                "handoff",
+            ],
+            "framework_import_quality": {
+                "required_frameworks": ["langgraph", "openai_agents", "autogen"],
+                "required_export_types": [
+                    "event_stream",
+                    "trace_export",
+                    "transcript",
+                    "capability_matrix",
+                    "probe_suite",
+                    "portability_matrix",
+                    "lifecycle",
+                ],
+                "required_signals": ["model", "tool", "state", "handoff", "observability"],
+                "require_target": True,
+                "require_adapter": True,
+                "require_trace_export": True,
+                "require_event_stream": True,
+                "require_lifecycle": True,
+                "require_capability_matrix": True,
+                "require_probe_suite": True,
+                "require_portability_matrix": True,
+                "require_observability": True,
+                "require_artifacts": True,
+                "min_source_count": 7,
+                "min_passed_sources": 7,
+                "min_artifact_count": 2,
+                "min_observability_hooks": 3,
+                "max_failed_sources": 0,
+            },
+        },
+        threshold=0.9,
+    )
+    metrics = evaluation.summary["metric_averages"]
+    assert metrics["framework_import_coverage"] == 1.0
+    assert metrics["framework_import_quality"] == 1.0
+
+    loaded = load_framework_import_manifest(
+        manifest,
+        required_frameworks=["langgraph"],
+        required_export_types=["event_stream"],
+    )
+    assert isinstance(loaded, FrameworkImportManifestEnvironment)
 
 
 @pytest.mark.asyncio
