@@ -5194,6 +5194,198 @@ class FrameworkTraceEnvironment(EnvironmentAdapter):
         return sessions
 
 
+class FrameworkLifecycleEnvironment(EnvironmentAdapter):
+    """
+    Replay framework/session lifecycle evidence for arbitrary agent runtimes.
+
+    Use this when a framework works for one call but may fail around setup,
+    tool registration, session state, retries, cancellation/resume, checkpoints,
+    or teardown. The environment emits one `framework_lifecycle_trace` artifact.
+    """
+
+    name = "framework_lifecycle"
+
+    def __init__(
+        self,
+        trace: Any = None,
+        *,
+        name: str = "framework-lifecycle-trace",
+        framework: str = "custom",
+        session_id: Optional[str] = None,
+        phases: Optional[Iterable[Any]] = None,
+        state: Optional[Mapping[str, Any]] = None,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        self.trace = normalize_framework_lifecycle_trace(
+            trace,
+            name=name,
+            framework=framework,
+            session_id=session_id,
+            phases=phases,
+            state=state,
+            metadata=metadata,
+        )
+
+    def reset(self, **context: Any) -> EnvironmentSnapshot:
+        return EnvironmentSnapshot(
+            tools=self._tool_specs(),
+            artifacts=[self._trace_artifact()],
+            events=[
+                SimulationEvent(
+                    type="framework_lifecycle",
+                    name="framework_lifecycle_ready",
+                    payload={
+                        "framework": self.trace["framework"],
+                        "session_count": self.trace["summary"]["session_count"],
+                        "phase_count": self.trace["summary"]["phase_count"],
+                        "signals": copy.deepcopy(self.trace["signals"]),
+                    },
+                ),
+                *[
+                    SimulationEvent(
+                        type="framework_lifecycle",
+                        name="framework_lifecycle_phase",
+                        payload=copy.deepcopy(phase),
+                    )
+                    for phase in self.trace["phases"]
+                ],
+            ],
+            state={"framework_lifecycle_trace": copy.deepcopy(self.trace)},
+            metadata={"framework_lifecycle_trace": copy.deepcopy(self.trace)},
+        )
+
+    def observe(self, **context: Any) -> EnvironmentSnapshot:
+        return EnvironmentSnapshot(
+            artifacts=[self._trace_artifact()],
+            state={"framework_lifecycle_trace": copy.deepcopy(self.trace)},
+            metadata={"framework_lifecycle_trace": copy.deepcopy(self.trace)},
+        )
+
+    def handle_tool_call(
+        self,
+        tool_call: Mapping[str, Any],
+        **context: Any,
+    ) -> Optional[ToolExecutionResult]:
+        name = _tool_name(tool_call)
+        if name not in {
+            "framework_lifecycle_status",
+            "list_framework_lifecycle_phases",
+            "inspect_framework_lifecycle_phase",
+            "inspect_framework_session",
+        }:
+            return None
+        arguments = _tool_arguments(tool_call)
+        call_id = _tool_call_id(tool_call)
+
+        if name == "framework_lifecycle_status":
+            result = copy.deepcopy(self.trace)
+            event_name = "framework_lifecycle_status"
+            content = f"{self.trace['framework']} lifecycle trace status recorded."
+            success = True
+            error = None
+        elif name == "list_framework_lifecycle_phases":
+            phases = copy.deepcopy(self.trace["phases"])
+            stage = _normalize_framework_lifecycle_key(arguments.get("stage") or arguments.get("phase") or "")
+            signal = _normalize_framework_lifecycle_key(arguments.get("signal") or "")
+            session_id = str(arguments.get("session_id") or arguments.get("session") or "")
+            status = _normalize_framework_lifecycle_key(arguments.get("status") or "")
+            if stage:
+                phases = [phase for phase in phases if phase.get("stage") == stage]
+            if signal:
+                phases = [phase for phase in phases if signal in set(phase.get("signals", []))]
+            if session_id:
+                phases = [phase for phase in phases if str(phase.get("session_id") or "") == session_id]
+            if status:
+                phases = [phase for phase in phases if phase.get("status") == status]
+            result = {
+                "framework": self.trace["framework"],
+                "phases": phases,
+                "filters": {"stage": stage, "signal": signal, "session_id": session_id, "status": status},
+            }
+            event_name = "framework_lifecycle_phases_listed"
+            content = f"Listed {len(phases)} lifecycle phase(s)."
+            success = True
+            error = None
+        elif name == "inspect_framework_session":
+            session_id = str(arguments.get("session_id") or arguments.get("id") or arguments.get("session") or "")
+            phases = [
+                copy.deepcopy(phase)
+                for phase in self.trace["phases"]
+                if str(phase.get("session_id") or "") == session_id
+            ]
+            success = bool(phases)
+            result = {"framework": self.trace["framework"], "session_id": session_id, "phases": phases}
+            event_name = "framework_session_inspected" if success else "framework_session_missing"
+            content = f"Inspected framework session {session_id}." if success else f"Framework session not found: {session_id}"
+            error = None if success else "session_not_found"
+        else:
+            phase_id = str(arguments.get("id") or arguments.get("phase_id") or arguments.get("name") or "")
+            phase = _find_framework_lifecycle_phase(self.trace["phases"], phase_id)
+            success = phase is not None
+            result = {"framework": self.trace["framework"], "phase": copy.deepcopy(phase), "query": phase_id}
+            event_name = "framework_lifecycle_phase_inspected" if success else "framework_lifecycle_phase_missing"
+            content = f"Inspected lifecycle phase {phase_id}." if success else f"Lifecycle phase not found: {phase_id}"
+            error = None if success else "phase_not_found"
+
+        return ToolExecutionResult(
+            tool_call_id=call_id,
+            tool_name=name,
+            content=content,
+            result=result,
+            success=success,
+            error=error,
+            state_updates={"framework_lifecycle_trace": copy.deepcopy(self.trace)},
+            artifacts=[self._trace_artifact()],
+            events=[
+                SimulationEvent(
+                    type="framework_lifecycle",
+                    name=event_name,
+                    payload=result,
+                )
+            ],
+        )
+
+    def _tool_specs(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                "name": "framework_lifecycle_status",
+                "description": "Return normalized framework lifecycle trace state, phases, sessions, and summary.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            {
+                "name": "list_framework_lifecycle_phases",
+                "description": "List lifecycle phases filtered by stage, signal, status, or session id.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "stage": {"type": "string"},
+                        "signal": {"type": "string"},
+                        "status": {"type": "string"},
+                        "session_id": {"type": "string"},
+                    },
+                },
+            },
+            {
+                "name": "inspect_framework_lifecycle_phase",
+                "description": "Inspect one lifecycle phase by id, phase_id, stage, or name.",
+                "parameters": {"type": "object", "properties": {"id": {"type": "string"}}},
+            },
+            {
+                "name": "inspect_framework_session",
+                "description": "Inspect all lifecycle phases for one framework session id.",
+                "parameters": {"type": "object", "properties": {"session_id": {"type": "string"}}},
+            },
+        ]
+
+    def _trace_artifact(self) -> SimulationArtifact:
+        return SimulationArtifact(
+            type="trace",
+            role="environment",
+            data=copy.deepcopy(self.trace),
+            metadata={"kind": "framework_lifecycle_trace", "framework": self.trace["framework"]},
+        )
+
+
 class ObservabilityReplayEnvironment(EnvironmentAdapter):
     """
     Replay production observability/regression cases as local simulation evidence.
@@ -5971,6 +6163,355 @@ def _optional_int(value: Any) -> Optional[int]:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def normalize_framework_lifecycle_trace(
+    trace: Any = None,
+    *,
+    name: str = "framework-lifecycle-trace",
+    framework: str = "custom",
+    session_id: Optional[str] = None,
+    phases: Optional[Iterable[Any]] = None,
+    state: Optional[Mapping[str, Any]] = None,
+    metadata: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Normalize setup/session/checkpoint/teardown lifecycle evidence."""
+
+    source = _coerce_plain_dict(trace)
+    if not source and isinstance(trace, (list, tuple, set)):
+        source = {"phases": list(trace)}
+    phase_source = (
+        phases
+        if phases is not None
+        else source.get("phases", source.get("events", source.get("lifecycle", [])))
+    )
+    framework_name = str(source.get("framework") or framework or "custom")
+    default_session_id = str(source.get("session_id") or source.get("thread_id") or session_id or "")
+    normalized_phases = [
+        _normalize_framework_lifecycle_phase(
+            phase,
+            framework=framework_name,
+            sequence=index + 1,
+            default_session_id=default_session_id,
+        )
+        for index, phase in enumerate(_as_iterable(phase_source))
+    ]
+    trace_state = _coerce_plain_dict(source.get("state")) or copy.deepcopy(dict(state or {}))
+    trace_metadata = {
+        **copy.deepcopy(_coerce_plain_dict(source.get("metadata"))),
+        **copy.deepcopy(dict(metadata or {})),
+    }
+    sessions = _framework_lifecycle_sessions(normalized_phases, default_session_id)
+    signals = _framework_lifecycle_signals(
+        phases=normalized_phases,
+        sessions=sessions,
+        state=trace_state,
+        metadata=trace_metadata,
+    )
+    summary = _framework_lifecycle_summary(
+        phases=normalized_phases,
+        sessions=sessions,
+        state=trace_state,
+    )
+    return {
+        "kind": "framework_lifecycle_trace",
+        "name": str(source.get("name") or name),
+        "framework": framework_name,
+        "session_id": default_session_id or None,
+        "phases": normalized_phases,
+        "sessions": sessions,
+        "state": trace_state,
+        "signals": sorted(signals),
+        "summary": summary,
+        "metadata": trace_metadata,
+    }
+
+
+def _normalize_framework_lifecycle_phase(
+    value: Any,
+    *,
+    framework: str,
+    sequence: int,
+    default_session_id: str,
+) -> Dict[str, Any]:
+    raw = _coerce_plain_dict(value)
+    if not raw:
+        raw = {"name": str(value), "stage": str(value)}
+    stage = _normalize_framework_lifecycle_stage(
+        raw.get("stage")
+        or raw.get("phase")
+        or raw.get("type")
+        or raw.get("event")
+        or raw.get("name")
+        or raw.get("operation")
+    )
+    error = raw.get("error") or raw.get("exception")
+    status = _normalize_framework_lifecycle_status(raw.get("status"), error=error)
+    session = str(
+        raw.get("session_id")
+        or raw.get("thread_id")
+        or raw.get("run_id")
+        or raw.get("conversation_id")
+        or default_session_id
+        or ""
+    )
+    state_keys = sorted(
+        {
+            str(key)
+            for key in [
+                *_as_iterable(raw.get("state_keys", [])),
+                *_coerce_plain_dict(raw.get("state")).keys(),
+                *_coerce_plain_dict(raw.get("state_delta")).keys(),
+                *_coerce_plain_dict(raw.get("checkpoint")).keys(),
+            ]
+            if str(key)
+        }
+    )
+    tool_names = sorted(
+        {
+            _normalize_framework_lifecycle_key(tool)
+            for tool in [
+                raw.get("tool_name"),
+                raw.get("tool"),
+                *_as_iterable(raw.get("tools", [])),
+                *_as_iterable(raw.get("registered_tools", [])),
+            ]
+            if _normalize_framework_lifecycle_key(tool)
+        }
+    )
+    phase = {
+        "id": str(raw.get("id") or raw.get("phase_id") or raw.get("name") or f"phase_{sequence}"),
+        "sequence": sequence,
+        "framework": str(raw.get("framework") or framework),
+        "stage": stage,
+        "name": str(raw.get("name") or raw.get("event") or stage),
+        "status": status,
+        "session_id": session or None,
+        "tool_names": tool_names,
+        "state_keys": state_keys,
+        "latency_ms": _optional_float(raw.get("latency_ms") or raw.get("duration_ms")),
+        "retry_of": raw.get("retry_of") or raw.get("parent_phase_id"),
+        "error": copy.deepcopy(error),
+        "metadata": copy.deepcopy(_coerce_plain_dict(raw.get("metadata"))),
+        "raw": copy.deepcopy(raw),
+    }
+    phase["signals"] = sorted(_framework_lifecycle_phase_signals(phase, raw))
+    return phase
+
+
+def _framework_lifecycle_phase_signals(phase: Mapping[str, Any], raw: Mapping[str, Any]) -> set[str]:
+    stage = _normalize_framework_lifecycle_key(phase.get("stage"))
+    status = _normalize_framework_lifecycle_key(phase.get("status"))
+    signals = {"lifecycle", stage, status}
+    signals.update(
+        _normalize_framework_lifecycle_key(signal)
+        for signal in _as_iterable(raw.get("signals", []))
+    )
+    if phase.get("session_id"):
+        signals.add("session")
+    if phase.get("tool_names") or stage == "tool_registration":
+        signals.add("tool_registration")
+        signals.add("tool")
+    if phase.get("state_keys"):
+        signals.add("state")
+    if raw.get("checkpoint") or stage == "checkpoint":
+        signals.add("checkpoint")
+    if stage in {"invoke", "model_call", "tool_call"}:
+        signals.add("invocation")
+    if stage == "stream":
+        signals.add("streaming")
+    if stage == "retry":
+        signals.add("retry")
+    if stage == "cancel":
+        signals.add("cancellation")
+    if stage == "resume":
+        signals.add("resume")
+    if stage in {"shutdown", "teardown", "cleanup"}:
+        signals.update({"teardown", "cleanup"})
+    if phase.get("error") or status in {"error", "failed"}:
+        signals.add("error")
+    if raw.get("recovered") or status == "recovered":
+        signals.add("recovery")
+    if raw.get("state_persisted") or raw.get("persisted") or stage in {"checkpoint", "resume"}:
+        signals.add("state_persistence")
+    return {_normalize_framework_lifecycle_key(signal) for signal in signals if _normalize_framework_lifecycle_key(signal)}
+
+
+def _framework_lifecycle_sessions(phases: Sequence[Mapping[str, Any]], default_session_id: str) -> List[Dict[str, Any]]:
+    sessions: Dict[str, Dict[str, Any]] = {}
+    for phase in phases:
+        session_id = str(phase.get("session_id") or default_session_id or "")
+        if not session_id:
+            continue
+        entry = sessions.setdefault(
+            session_id,
+            {
+                "id": session_id,
+                "phase_count": 0,
+                "stages": set(),
+                "state_keys": set(),
+                "tool_names": set(),
+                "error_count": 0,
+            },
+        )
+        entry["phase_count"] += 1
+        entry["stages"].add(str(phase.get("stage") or ""))
+        entry["state_keys"].update(str(key) for key in _as_iterable(phase.get("state_keys")) if str(key))
+        entry["tool_names"].update(str(tool) for tool in _as_iterable(phase.get("tool_names")) if str(tool))
+        if "error" in set(phase.get("signals", [])):
+            entry["error_count"] += 1
+    return [
+        {
+            **entry,
+            "stages": sorted(entry["stages"]),
+            "state_keys": sorted(entry["state_keys"]),
+            "tool_names": sorted(entry["tool_names"]),
+        }
+        for entry in sorted(sessions.values(), key=lambda item: str(item["id"]))
+    ]
+
+
+def _framework_lifecycle_signals(
+    *,
+    phases: Sequence[Mapping[str, Any]],
+    sessions: Sequence[Mapping[str, Any]],
+    state: Mapping[str, Any],
+    metadata: Mapping[str, Any],
+) -> set[str]:
+    signals = {"framework_lifecycle", "lifecycle"}
+    for phase in phases:
+        signals.update(_normalize_framework_lifecycle_key(signal) for signal in _as_iterable(phase.get("signals")))
+    if sessions:
+        signals.add("session")
+    if state:
+        signals.add("state")
+    if metadata:
+        signals.add("metadata")
+    return {signal for signal in signals if signal}
+
+
+def _framework_lifecycle_summary(
+    *,
+    phases: Sequence[Mapping[str, Any]],
+    sessions: Sequence[Mapping[str, Any]],
+    state: Mapping[str, Any],
+) -> Dict[str, Any]:
+    stage_counts: Dict[str, int] = {}
+    signal_counts: Dict[str, int] = {}
+    for phase in phases:
+        stage = str(phase.get("stage") or "")
+        if stage:
+            stage_counts[stage] = stage_counts.get(stage, 0) + 1
+        for signal in _as_iterable(phase.get("signals")):
+            normalized = _normalize_framework_lifecycle_key(signal)
+            if normalized:
+                signal_counts[normalized] = signal_counts.get(normalized, 0) + 1
+    error_count = signal_counts.get("error", 0)
+    cleanup_count = signal_counts.get("cleanup", 0)
+    return {
+        "phase_count": len(phases),
+        "session_count": len(sessions),
+        "stage_counts": stage_counts,
+        "tool_registration_count": signal_counts.get("tool_registration", 0),
+        "invocation_count": signal_counts.get("invocation", 0),
+        "streaming_event_count": signal_counts.get("streaming", 0),
+        "checkpoint_count": signal_counts.get("checkpoint", 0),
+        "retry_count": signal_counts.get("retry", 0),
+        "cancellation_count": signal_counts.get("cancellation", 0),
+        "resume_count": signal_counts.get("resume", 0),
+        "cleanup_count": cleanup_count,
+        "error_count": error_count,
+        "recovered_error_count": signal_counts.get("recovery", 0),
+        "state_persistence": bool(signal_counts.get("state_persistence") or state),
+        "cleanup_complete": cleanup_count > 0 and not any(
+            phase.get("status") in {"error", "failed"}
+            for phase in phases
+            if phase.get("stage") in {"shutdown", "teardown", "cleanup"}
+        ),
+        "terminal_status": "error" if error_count and not signal_counts.get("recovery") else "completed" if cleanup_count else "running",
+    }
+
+
+def _find_framework_lifecycle_phase(
+    phases: Sequence[Mapping[str, Any]],
+    phase_id: str,
+) -> Optional[Dict[str, Any]]:
+    query = _normalize_framework_lifecycle_key(phase_id)
+    for phase in phases:
+        candidates = {
+            _normalize_framework_lifecycle_key(phase.get("id")),
+            _normalize_framework_lifecycle_key(phase.get("name")),
+            _normalize_framework_lifecycle_key(phase.get("stage")),
+        }
+        if query in candidates:
+            return copy.deepcopy(dict(phase))
+    return None
+
+
+def _normalize_framework_lifecycle_stage(value: Any) -> str:
+    normalized = _normalize_framework_lifecycle_key(value)
+    aliases = {
+        "init": "initialize",
+        "initialized": "initialize",
+        "startup": "initialize",
+        "setup": "initialize",
+        "configure": "configure",
+        "config": "configure",
+        "register": "tool_registration",
+        "register_tool": "tool_registration",
+        "register_tools": "tool_registration",
+        "tools_list": "tool_registration",
+        "tools/list": "tool_registration",
+        "start": "start_session",
+        "session_start": "start_session",
+        "start_session": "start_session",
+        "invoke": "invoke",
+        "ainvoke": "invoke",
+        "run": "invoke",
+        "call": "invoke",
+        "model": "model_call",
+        "model_call": "model_call",
+        "tool_call": "tool_call",
+        "stream": "stream",
+        "streaming": "stream",
+        "checkpoint": "checkpoint",
+        "checkpoint_write": "checkpoint",
+        "retry": "retry",
+        "cancel": "cancel",
+        "cancellation": "cancel",
+        "resume": "resume",
+        "shutdown": "shutdown",
+        "teardown": "teardown",
+        "cleanup": "cleanup",
+    }
+    return aliases.get(normalized, normalized or "event")
+
+
+def _normalize_framework_lifecycle_status(value: Any, *, error: Any = None) -> str:
+    if error:
+        return "error"
+    normalized = _normalize_framework_lifecycle_key(value)
+    aliases = {
+        "ok": "completed",
+        "success": "completed",
+        "succeeded": "completed",
+        "done": "completed",
+        "complete": "completed",
+        "completed": "completed",
+        "failed": "error",
+        "failure": "error",
+        "exception": "error",
+        "cancelled": "cancelled",
+        "canceled": "cancelled",
+        "resumed": "resumed",
+        "recovered": "recovered",
+        "running": "running",
+    }
+    return aliases.get(normalized, normalized or "completed")
+
+
+def _normalize_framework_lifecycle_key(value: Any) -> str:
+    return str(value or "").strip().lower().replace("-", "_").replace(" ", "_").replace(".", "_")
 
 
 def normalize_framework_trace_events(

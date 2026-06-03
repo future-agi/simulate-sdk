@@ -14,6 +14,7 @@ from fi.simulate import (
     BrowserEnvironment,
     DomainPackageEnvironment,
     FileEnvironment,
+    FrameworkLifecycleEnvironment,
     FrameworkTraceEnvironment,
     ImageEnvironment,
     MultiAgentRoomEnvironment,
@@ -51,6 +52,7 @@ from fi.simulate import (
     normalize_orchestration_trace_export,
     normalize_streaming_trace_export,
     normalize_adversarial_attack_pack,
+    normalize_framework_lifecycle_trace,
     normalize_framework_trace_events,
     normalize_framework_adapter_conformance,
     normalize_observability_replay_pack,
@@ -1867,6 +1869,108 @@ async def test_framework_trace_environment_scores_adapter_conformance():
     metrics = evaluation.summary["metric_averages"]
     assert metrics["framework_trace_coverage"] == 1.0
     assert metrics["framework_adapter_conformance"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_framework_lifecycle_environment_scores_session_quality():
+    lifecycle = normalize_framework_lifecycle_trace(
+        name="langgraph-lifecycle",
+        framework="langgraph",
+        session_id="thread-123",
+        phases=[
+            {"id": "init", "stage": "initialize", "status": "completed", "state": {"config": "loaded"}},
+            {"id": "tools", "stage": "register_tools", "registered_tools": ["search_order", "issue_refund"]},
+            {"id": "start", "stage": "start_session", "state_keys": ["thread_id", "messages"]},
+            {"id": "invoke", "stage": "invoke", "latency_ms": 42, "state_keys": ["messages"]},
+            {"id": "stream", "stage": "stream", "status": "completed"},
+            {"id": "checkpoint", "stage": "checkpoint", "checkpoint": {"thread_id": "thread-123", "step": 1}},
+            {"id": "retry", "stage": "retry", "retry_of": "invoke", "error": "tool timeout", "recovered": True},
+            {"id": "cancel", "stage": "cancel", "status": "cancelled"},
+            {"id": "resume", "stage": "resume", "status": "resumed", "state_persisted": True},
+            {"id": "cleanup", "stage": "shutdown", "status": "completed"},
+        ],
+        state={"thread_id": "thread-123", "case": {"status": "resolved"}},
+    )
+    assert lifecycle["summary"]["phase_count"] == 10
+    assert lifecycle["summary"]["tool_registration_count"] == 1
+    assert lifecycle["summary"]["cleanup_complete"] is True
+
+    async def agent(input):
+        return AgentResponse(
+            content="Framework lifecycle trace inspected with setup, tool registration, checkpoint, retry, resume, and cleanup.",
+            tool_calls=[
+                {"id": "status", "name": "framework_lifecycle_status", "arguments": {}},
+                {
+                    "id": "phases",
+                    "name": "list_framework_lifecycle_phases",
+                    "arguments": {"session_id": "thread-123"},
+                },
+                {
+                    "id": "session",
+                    "name": "inspect_framework_session",
+                    "arguments": {"session_id": "thread-123"},
+                },
+            ],
+        )
+
+    report = await LocalTextEngine().run(
+        scenario=_scenario(),
+        agent_callback=agent,
+        environment=FrameworkLifecycleEnvironment(lifecycle),
+        max_turns=1,
+        min_turns=1,
+    )
+
+    result = report.results[0]
+    state = result.metadata["environment_state"]["framework_lifecycle_trace"]
+    assert state["summary"]["terminal_status"] == "completed"
+    assert any(
+        artifact.metadata.get("kind") == "framework_lifecycle_trace"
+        for artifact in result.artifacts
+    )
+
+    evaluation = evaluate_agent_report(
+        report,
+        config={
+            "required_framework_lifecycle": [
+                "framework_lifecycle",
+                "initialize",
+                "tool_registration",
+                "start_session",
+                "invocation",
+                "streaming",
+                "checkpoint",
+                "retry",
+                "cancellation",
+                "resume",
+                "cleanup",
+                "state_persistence",
+                "session",
+            ],
+            "framework_lifecycle_quality": {
+                "framework": "langgraph",
+                "required_sessions": ["thread-123"],
+                "required_stages": ["initialize", "tool_registration", "start_session", "invoke", "checkpoint", "resume", "shutdown"],
+                "min_phase_count": 10,
+                "min_tool_registrations": 1,
+                "min_invocations": 1,
+                "min_recovered_errors": 1,
+                "require_streaming": True,
+                "require_checkpoint": True,
+                "require_retry": True,
+                "require_cancellation": True,
+                "require_resume": True,
+                "require_cleanup": True,
+                "require_state_persistence": True,
+                "terminal_status": "completed",
+                "max_error_count": 1,
+            },
+        },
+        threshold=0.9,
+    )
+    metrics = evaluation.summary["metric_averages"]
+    assert metrics["framework_lifecycle_coverage"] == 1.0
+    assert metrics["framework_lifecycle_quality"] == 1.0
 
 
 @pytest.mark.asyncio
