@@ -23,8 +23,8 @@ from fi.simulate import (
 
 
 TRUST_BOUNDARY_MODEL = normalize_agent_trust_boundary_model(
-    name="futureagi-agent-trust-boundary",
-    framework="futureagi",
+    name="generic-agent-trust-boundary",
+    framework="generic_agent_runtime",
     version="2026-06",
     actors=[
         {"id": "end_user", "type": "human", "trust_level": "untrusted", "privileges": ["submit_task"], "evidence": ["actor inventory"]},
@@ -163,7 +163,7 @@ async def main():
                 "secret_exfiltration",
             ],
             "agent_trust_boundary_quality": {
-                "framework": "futureagi",
+                "framework": "generic_agent_runtime",
                 "required_controls": [
                     "agent_identity",
                     "least_privilege_tools",
