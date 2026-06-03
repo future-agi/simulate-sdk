@@ -5413,6 +5413,566 @@ class ObservabilityReplayEnvironment(EnvironmentAdapter):
         return sorted(signals)
 
 
+class OptimizerTraceEnvironment(EnvironmentAdapter):
+    """
+    Replay optimizer deliberation as local simulation evidence.
+
+    This is designed for society/council/multi-interaction optimizers where
+    proposal roles, diagnostics, credit assignment, critique, synthesis, and
+    stop decisions should become auditable trace data.
+    """
+
+    name = "optimizer_trace"
+
+    def __init__(
+        self,
+        trace: Optional[Mapping[str, Any]] = None,
+        *,
+        name: str = "optimizer-society-trace",
+        optimizer: str = "agent-opt",
+        roles: Optional[Iterable[Any]] = None,
+        proposals: Optional[Iterable[Mapping[str, Any]]] = None,
+        rounds: Optional[Iterable[Mapping[str, Any]]] = None,
+        diagnostics: Optional[Iterable[Mapping[str, Any]]] = None,
+        search_paths: Optional[Iterable[str]] = None,
+        best_candidate_id: Optional[str] = None,
+        final_score: Optional[float] = None,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        self.initial_trace = normalize_optimizer_society_trace(
+            trace,
+            name=name,
+            optimizer=optimizer,
+            roles=roles,
+            proposals=proposals,
+            rounds=rounds,
+            diagnostics=diagnostics,
+            search_paths=search_paths,
+            best_candidate_id=best_candidate_id,
+            final_score=final_score,
+            metadata=metadata,
+        )
+        self.trace: Dict[str, Any] = {}
+
+    def reset(self, **context: Any) -> EnvironmentSnapshot:
+        self.trace = copy.deepcopy(self.initial_trace)
+        events = [
+            SimulationEvent(
+                type="optimizer_trace",
+                name="optimizer_trace_ready",
+                payload={
+                    "name": self.trace.get("name"),
+                    "optimizer": self.trace.get("optimizer"),
+                    "signals": copy.deepcopy(self.trace.get("signals", [])),
+                    "summary": copy.deepcopy(self.trace.get("summary", {})),
+                },
+            )
+        ]
+        for proposal in self.trace.get("proposals", []):
+            events.append(
+                SimulationEvent(
+                    type="optimizer_proposal",
+                    name=str(proposal.get("candidate_id") or proposal.get("id") or "proposal"),
+                    payload=copy.deepcopy(dict(proposal)),
+                    metadata={"kind": "optimizer_society_trace", "role": proposal.get("role")},
+                )
+            )
+        return EnvironmentSnapshot(
+            tools=self._tool_specs(),
+            artifacts=[self._trace_artifact()],
+            events=events,
+            state={"optimizer_society_trace": self._trace_payload()},
+            metadata={
+                "optimizer_society_trace": {
+                    "name": self.trace.get("name"),
+                    "optimizer": self.trace.get("optimizer"),
+                    "signals": copy.deepcopy(self.trace.get("signals", [])),
+                    "summary": copy.deepcopy(self.trace.get("summary", {})),
+                }
+            },
+        )
+
+    def handle_tool_call(
+        self,
+        tool_call: Mapping[str, Any],
+        **context: Any,
+    ) -> Optional[ToolExecutionResult]:
+        name = _tool_name(tool_call)
+        if name not in {
+            "optimizer_trace_status",
+            "list_optimizer_proposals",
+            "inspect_optimizer_role",
+            "inspect_optimizer_candidate",
+        }:
+            return None
+        arguments = _tool_arguments(tool_call)
+        call_id = _tool_call_id(tool_call)
+
+        if name == "optimizer_trace_status":
+            result = self._trace_payload()
+            event_name = "optimizer_trace_status"
+            content = "Optimizer society trace status recorded."
+            success = True
+            error = None
+        elif name == "list_optimizer_proposals":
+            role = _normalize_optimizer_trace_key(arguments.get("role") or "")
+            path = str(arguments.get("path") or arguments.get("search_path") or "").strip()
+            min_score = _optional_float(arguments.get("min_score"))
+            proposals = [copy.deepcopy(dict(item)) for item in self.trace.get("proposals", [])]
+            if role:
+                proposals = [
+                    item
+                    for item in proposals
+                    if _normalize_optimizer_trace_key(item.get("role")) == role
+                ]
+            if path:
+                proposals = [
+                    item
+                    for item in proposals
+                    if path in set(str(value) for value in item.get("search_paths", []))
+                    or path in set(str(value) for value in dict(item.get("patch") or {}).keys())
+                ]
+            if min_score is not None:
+                proposals = [
+                    item
+                    for item in proposals
+                    if _optional_float(item.get("score")) is not None
+                    and float(item.get("score")) >= min_score
+                ]
+            result = {
+                "name": self.trace.get("name"),
+                "proposals": proposals,
+                "count": len(proposals),
+                "query": {"role": role, "path": path, "min_score": min_score},
+            }
+            event_name = "optimizer_proposals_listed"
+            content = f"Listed {len(proposals)} optimizer proposal(s)."
+            success = True
+            error = None
+        elif name == "inspect_optimizer_role":
+            role_name = _normalize_optimizer_trace_key(arguments.get("name") or arguments.get("role") or "")
+            role_record = next(
+                (
+                    role
+                    for role in self.trace.get("roles", [])
+                    if _normalize_optimizer_trace_key(role.get("name")) == role_name
+                ),
+                None,
+            )
+            role_credit = next(
+                (
+                    credit
+                    for credit in self.trace.get("role_credit", [])
+                    if _normalize_optimizer_trace_key(credit.get("role")) == role_name
+                ),
+                None,
+            )
+            success = role_record is not None or role_credit is not None
+            result = {
+                "name": self.trace.get("name"),
+                "role": copy.deepcopy(role_record),
+                "credit": copy.deepcopy(role_credit),
+                "query": role_name,
+            }
+            event_name = "optimizer_role_inspected" if success else "optimizer_role_missing"
+            content = f"Inspected optimizer role {role_name}." if success else f"Optimizer role not found: {role_name}"
+            error = None if success else "role_not_found"
+        else:
+            candidate_id = str(arguments.get("id") or arguments.get("candidate_id") or "")
+            proposal = next(
+                (
+                    item
+                    for item in self.trace.get("proposals", [])
+                    if candidate_id
+                    and candidate_id in {str(item.get("candidate_id")), str(item.get("id"))}
+                ),
+                None,
+            )
+            success = proposal is not None
+            result = {
+                "name": self.trace.get("name"),
+                "proposal": copy.deepcopy(proposal),
+                "query": candidate_id,
+            }
+            event_name = "optimizer_candidate_inspected" if success else "optimizer_candidate_missing"
+            content = f"Inspected optimizer candidate {candidate_id}." if success else f"Optimizer candidate not found: {candidate_id}"
+            error = None if success else "candidate_not_found"
+
+        return ToolExecutionResult(
+            tool_call_id=call_id,
+            tool_name=name,
+            content=content,
+            result=result,
+            success=success,
+            error=error,
+            state_updates={"optimizer_society_trace": self._trace_payload()},
+            artifacts=[self._trace_artifact()],
+            events=[
+                SimulationEvent(
+                    type="optimizer_trace",
+                    name=event_name,
+                    payload=result,
+                    metadata={"kind": "optimizer_society_trace"},
+                )
+            ],
+        )
+
+    def _tool_specs(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                "name": "optimizer_trace_status",
+                "description": "Return normalized optimizer society trace roles, proposals, credit, signals, and summary.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            {
+                "name": "list_optimizer_proposals",
+                "description": "List optimizer proposals, optionally filtered by role, search path, or minimum score.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "role": {"type": "string"},
+                        "path": {"type": "string"},
+                        "min_score": {"type": "number"},
+                    },
+                },
+            },
+            {
+                "name": "inspect_optimizer_role",
+                "description": "Inspect one optimizer role and its credit entry.",
+                "parameters": {"type": "object", "properties": {"role": {"type": "string"}}},
+            },
+            {
+                "name": "inspect_optimizer_candidate",
+                "description": "Inspect one optimizer proposal by candidate id.",
+                "parameters": {"type": "object", "properties": {"candidate_id": {"type": "string"}}},
+            },
+        ]
+
+    def _trace_artifact(self) -> SimulationArtifact:
+        return SimulationArtifact(
+            type="trace",
+            role="environment",
+            data=self._trace_payload(),
+            metadata={"kind": "optimizer_society_trace", "optimizer": self.trace.get("optimizer", "agent-opt")},
+        )
+
+    def _trace_payload(self) -> Dict[str, Any]:
+        return copy.deepcopy(self.trace)
+
+
+def normalize_optimizer_society_trace(
+    trace: Optional[Mapping[str, Any]] = None,
+    *,
+    name: str = "optimizer-society-trace",
+    optimizer: str = "agent-opt",
+    roles: Optional[Iterable[Any]] = None,
+    proposals: Optional[Iterable[Mapping[str, Any]]] = None,
+    rounds: Optional[Iterable[Mapping[str, Any]]] = None,
+    diagnostics: Optional[Iterable[Mapping[str, Any]]] = None,
+    search_paths: Optional[Iterable[str]] = None,
+    best_candidate_id: Optional[str] = None,
+    final_score: Optional[float] = None,
+    metadata: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Normalize optimizer deliberation into a portable society trace."""
+
+    source = copy.deepcopy(dict(trace or {}))
+    normalized_roles = _normalize_optimizer_roles(
+        roles if roles is not None else source.get("roles") or source.get("role_graph") or []
+    )
+    normalized_proposals = _normalize_optimizer_proposals(
+        proposals if proposals is not None else source.get("proposals") or source.get("evaluations") or []
+    )
+    normalized_rounds = [
+        copy.deepcopy(dict(item))
+        for item in _as_iterable(rounds if rounds is not None else source.get("rounds") or [])
+        if isinstance(item, Mapping)
+    ]
+    normalized_diagnostics = [
+        copy.deepcopy(dict(item))
+        for item in _as_iterable(diagnostics if diagnostics is not None else source.get("diagnostics") or [])
+        if isinstance(item, Mapping)
+    ]
+    normalized_search_paths = sorted(
+        {
+            str(path)
+            for path in _as_iterable(search_paths if search_paths is not None else source.get("search_paths") or [])
+            if str(path)
+        }
+    )
+    normalized_metadata = {
+        **copy.deepcopy(dict(source.get("metadata") or {})),
+        **copy.deepcopy(dict(metadata or {})),
+    }
+    normalized_name = str(source.get("name") or name)
+    normalized_optimizer = str(source.get("optimizer") or optimizer)
+    normalized_best_candidate_id = str(
+        best_candidate_id
+        or source.get("best_candidate_id")
+        or source.get("best_candidate")
+        or ""
+    )
+    normalized_final_score = (
+        _optional_float(final_score)
+        if final_score is not None
+        else _optional_float(source.get("final_score"))
+    )
+    if normalized_final_score is None:
+        scored = [
+            float(score)
+            for score in (_optional_float(item.get("score")) for item in normalized_proposals)
+            if score is not None
+        ]
+        normalized_final_score = max(scored) if scored else None
+    if not normalized_best_candidate_id and normalized_proposals:
+        best = max(
+            normalized_proposals,
+            key=lambda item: (_optional_float(item.get("score")) or -1.0, str(item.get("candidate_id") or "")),
+        )
+        normalized_best_candidate_id = str(best.get("candidate_id") or "")
+
+    role_credit = _optimizer_role_credit(normalized_proposals)
+    signals = _optimizer_trace_signals(
+        roles=normalized_roles,
+        proposals=normalized_proposals,
+        rounds=normalized_rounds,
+        diagnostics=normalized_diagnostics,
+        search_paths=normalized_search_paths,
+        role_credit=role_credit,
+        best_candidate_id=normalized_best_candidate_id,
+    )
+    summary = _optimizer_trace_summary(
+        roles=normalized_roles,
+        proposals=normalized_proposals,
+        rounds=normalized_rounds,
+        diagnostics=normalized_diagnostics,
+        search_paths=normalized_search_paths,
+        role_credit=role_credit,
+        best_candidate_id=normalized_best_candidate_id,
+        final_score=normalized_final_score,
+    )
+    return {
+        "kind": "optimizer_society_trace",
+        "name": normalized_name,
+        "optimizer": normalized_optimizer,
+        "roles": normalized_roles,
+        "proposals": normalized_proposals,
+        "rounds": normalized_rounds,
+        "diagnostics": normalized_diagnostics,
+        "search_paths": normalized_search_paths,
+        "role_credit": role_credit,
+        "best_candidate_id": normalized_best_candidate_id or None,
+        "final_score": normalized_final_score,
+        "signals": sorted(signals),
+        "summary": summary,
+        "metadata": normalized_metadata,
+    }
+
+
+def _normalize_optimizer_roles(values: Iterable[Any]) -> List[Dict[str, Any]]:
+    roles: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for value in _as_iterable(values):
+        if isinstance(value, Mapping):
+            role = copy.deepcopy(dict(value))
+        else:
+            role = {"name": str(value)}
+        name = _normalize_optimizer_trace_key(role.get("name") or role.get("role"))
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        role["name"] = str(role.get("name") or role.get("role"))
+        if role.get("archetype"):
+            role["archetype"] = str(role.get("archetype"))
+        if role.get("proposal_kind"):
+            role["proposal_kind"] = str(role.get("proposal_kind"))
+        roles.append(role)
+    return roles
+
+
+def _normalize_optimizer_proposals(values: Iterable[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+    proposals: List[Dict[str, Any]] = []
+    for index, value in enumerate(_as_iterable(values), start=1):
+        if not isinstance(value, Mapping):
+            continue
+        item = copy.deepcopy(dict(value))
+        metadata = copy.deepcopy(dict(item.get("metadata") or item.get("proposal_metadata") or {}))
+        patch = copy.deepcopy(dict(item.get("patch") or {}))
+        candidate_id = str(item.get("candidate_id") or item.get("id") or f"proposal_{index}")
+        role = str(item.get("role") or item.get("proposal_role") or metadata.get("role") or "unknown")
+        score = _optional_float(item.get("score") if "score" in item else item.get("average_score"))
+        search_paths = sorted(
+            {
+                str(path)
+                for path in [
+                    *_as_iterable(item.get("search_paths") or []),
+                    *patch.keys(),
+                ]
+                if str(path)
+            }
+        )
+        proposals.append(
+            {
+                "id": str(item.get("id") or candidate_id),
+                "candidate_id": candidate_id,
+                "role": role,
+                "round": _optional_int(item.get("round") or item.get("proposal_round")),
+                "score": score,
+                "reason": str(item.get("reason") or item.get("proposal_reason") or ""),
+                "parent_ids": [str(parent) for parent in _as_iterable(item.get("parent_ids") or item.get("proposal_parent_ids") or [])],
+                "patch": patch,
+                "search_paths": search_paths,
+                "role_kind": str(item.get("role_kind") or metadata.get("role_kind") or ""),
+                "role_archetype": str(item.get("role_archetype") or metadata.get("role_archetype") or ""),
+                "metadata": metadata,
+            }
+        )
+    return proposals
+
+
+def _optimizer_role_credit(proposals: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+    credit: Dict[str, Dict[str, Any]] = {}
+    for proposal in proposals:
+        role = str(proposal.get("role") or "unknown")
+        key = _normalize_optimizer_trace_key(role) or "unknown"
+        score = _optional_float(proposal.get("score"))
+        entry = credit.setdefault(
+            key,
+            {
+                "role": role,
+                "proposal_count": 0,
+                "evaluated_count": 0,
+                "best_score": None,
+                "best_candidate_id": None,
+                "search_paths": set(),
+            },
+        )
+        entry["proposal_count"] += 1
+        entry["search_paths"].update(str(path) for path in proposal.get("search_paths", []) if str(path))
+        if score is None:
+            continue
+        entry["evaluated_count"] += 1
+        if entry["best_score"] is None or score > float(entry["best_score"]):
+            entry["best_score"] = score
+            entry["best_candidate_id"] = proposal.get("candidate_id")
+    return [
+        {
+            **entry,
+            "search_paths": sorted(entry["search_paths"]),
+        }
+        for entry in sorted(credit.values(), key=lambda item: str(item["role"]))
+    ]
+
+
+def _optimizer_trace_signals(
+    *,
+    roles: Sequence[Mapping[str, Any]],
+    proposals: Sequence[Mapping[str, Any]],
+    rounds: Sequence[Mapping[str, Any]],
+    diagnostics: Sequence[Mapping[str, Any]],
+    search_paths: Sequence[str],
+    role_credit: Sequence[Mapping[str, Any]],
+    best_candidate_id: str,
+) -> set[str]:
+    signals = {"optimizer", "society_trace"}
+    if roles:
+        signals.add("role")
+    if any(role.get("archetype") for role in roles) or any(proposal.get("role_archetype") for proposal in proposals):
+        signals.add("archetype")
+    if any(role.get("proposal_kind") for role in roles) or any(proposal.get("role_kind") for proposal in proposals):
+        signals.add("role_graph")
+    if proposals:
+        signals.update({"proposal", "candidate"})
+    if any(_optional_float(proposal.get("score")) is not None for proposal in proposals):
+        signals.update({"evaluation", "score"})
+    if rounds:
+        signals.add("round")
+    if diagnostics:
+        signals.add("diagnostic")
+    if search_paths or any(proposal.get("search_paths") for proposal in proposals):
+        signals.add("search_path")
+    if role_credit:
+        signals.add("credit")
+    if best_candidate_id:
+        signals.add("best_candidate")
+    role_tokens = {
+        _normalize_optimizer_trace_key(proposal.get("role"))
+        for proposal in proposals
+    } | {
+        _normalize_optimizer_trace_key(proposal.get("role_kind"))
+        for proposal in proposals
+    }
+    if role_tokens & {"critic", "adversary", "vidura", "krishna"}:
+        signals.add("critique")
+    if role_tokens & {"synthesizer", "coverage_synthesis", "sangha"}:
+        signals.add("synthesis")
+    if role_tokens & {"steward", "dharma_steward"}:
+        signals.add("steward")
+    if proposals or rounds:
+        signals.add("stop")
+    return signals
+
+
+def _optimizer_trace_summary(
+    *,
+    roles: Sequence[Mapping[str, Any]],
+    proposals: Sequence[Mapping[str, Any]],
+    rounds: Sequence[Mapping[str, Any]],
+    diagnostics: Sequence[Mapping[str, Any]],
+    search_paths: Sequence[str],
+    role_credit: Sequence[Mapping[str, Any]],
+    best_candidate_id: str,
+    final_score: Optional[float],
+) -> Dict[str, Any]:
+    candidate_ids = [str(proposal.get("candidate_id") or "") for proposal in proposals if proposal.get("candidate_id")]
+    role_tokens = {
+        _normalize_optimizer_trace_key(proposal.get("role"))
+        for proposal in proposals
+    } | {
+        _normalize_optimizer_trace_key(proposal.get("role_kind"))
+        for proposal in proposals
+    }
+    return {
+        "role_count": len(roles),
+        "proposal_count": len(proposals),
+        "evaluation_count": sum(1 for proposal in proposals if _optional_float(proposal.get("score")) is not None),
+        "round_count": len(rounds) or len({proposal.get("round") for proposal in proposals if proposal.get("round") is not None}),
+        "diagnostic_count": len(diagnostics),
+        "search_path_count": len(search_paths),
+        "role_credit_count": len(role_credit),
+        "duplicate_candidate_count": max(0, len(candidate_ids) - len(set(candidate_ids))),
+        "best_candidate_id": best_candidate_id or None,
+        "final_score": final_score,
+        "has_role_graph": any(role.get("proposal_kind") for role in roles),
+        "has_critique": bool(role_tokens & {"critic", "adversary", "vidura", "krishna"}),
+        "has_synthesis": bool(role_tokens & {"synthesizer", "coverage_synthesis", "sangha"}),
+        "has_steward": bool(role_tokens & {"steward", "dharma_steward"}),
+        "terminal_status": "completed" if best_candidate_id or final_score is not None else "running",
+    }
+
+
+def _normalize_optimizer_trace_key(value: Any) -> str:
+    return str(value or "").strip().lower().replace("-", "_").replace(" ", "_").replace(".", "_")
+
+
+def _optional_float(value: Any) -> Optional[float]:
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _optional_int(value: Any) -> Optional[int]:
+    if value in (None, ""):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def normalize_framework_trace_events(
     framework: str,
     records: Iterable[Any],

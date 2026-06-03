@@ -18,6 +18,7 @@ from fi.simulate import (
     ImageEnvironment,
     MultiAgentRoomEnvironment,
     ObservabilityReplayEnvironment,
+    OptimizerTraceEnvironment,
     OrchestrationTraceEnvironment,
     RetrievalMemoryEnvironment,
     StreamingTraceEnvironment,
@@ -53,6 +54,7 @@ from fi.simulate import (
     normalize_framework_trace_events,
     normalize_framework_adapter_conformance,
     normalize_observability_replay_pack,
+    normalize_optimizer_society_trace,
     normalize_framework_trace_export,
     normalize_mcp_tool_session_export,
     normalize_openai_responses_trace,
@@ -1988,6 +1990,139 @@ async def test_observability_replay_environment_replays_regression_pack():
         required_trace_signals=["agent", "model", "tool"],
     )
     assert isinstance(loaded, ObservabilityReplayEnvironment)
+
+
+@pytest.mark.asyncio
+async def test_optimizer_trace_environment_emits_society_trace_and_scores_quality():
+    trace = normalize_optimizer_society_trace(
+        name="role-graph-optimizer",
+        optimizer="SocietyAgentOptimizer",
+        roles=[
+            {"name": "sutradhara", "proposal_kind": "specialist", "archetype": "orchestrator"},
+            {"name": "vidura", "proposal_kind": "adversary", "archetype": "prudent_critic"},
+            {"name": "sangha", "proposal_kind": "coverage_synthesis", "archetype": "collective_synthesis"},
+            {"name": "dharma_steward", "proposal_kind": "steward", "archetype": "minimal_process_guardian"},
+        ],
+        proposals=[
+            {"candidate_id": "candidate_seed", "role": "seed", "round": 0, "score": 0.2, "patch": {}},
+            {
+                "candidate_id": "candidate_sutradhara",
+                "role": "sutradhara",
+                "round": 1,
+                "score": 0.55,
+                "patch": {"multi_agent.handoff.contract": "explicit_policy"},
+                "role_kind": "specialist",
+                "role_archetype": "orchestrator",
+            },
+            {
+                "candidate_id": "candidate_vidura",
+                "role": "vidura",
+                "round": 1,
+                "score": 0.72,
+                "patch": {"security.adversarial_review": "red_team"},
+                "role_kind": "adversary",
+                "role_archetype": "prudent_critic",
+            },
+            {
+                "candidate_id": "candidate_sangha",
+                "role": "sangha",
+                "round": 2,
+                "score": 1.0,
+                "patch": {
+                    "multi_agent.handoff.contract": "explicit_policy",
+                    "security.adversarial_review": "red_team",
+                },
+                "role_kind": "coverage_synthesis",
+                "role_archetype": "collective_synthesis",
+            },
+            {
+                "candidate_id": "candidate_steward",
+                "role": "dharma_steward",
+                "round": 3,
+                "score": 0.97,
+                "patch": {"multi_agent.handoff.contract": "explicit_policy"},
+                "role_kind": "steward",
+                "role_archetype": "minimal_process_guardian",
+            },
+        ],
+        rounds=[{"round": 1}, {"round": 2}, {"round": 3}],
+        diagnostics=[{"component": "multi_agent", "failure_mode": "coordination_failure"}],
+        search_paths=["multi_agent.handoff.contract", "security.adversarial_review"],
+        best_candidate_id="candidate_sangha",
+        final_score=1.0,
+    )
+
+    async def agent(input):
+        return AgentResponse(
+            content="Optimizer society trace inspected with role credit and synthesis.",
+            tool_calls=[
+                {"id": "status", "name": "optimizer_trace_status", "arguments": {}},
+                {"id": "role", "name": "inspect_optimizer_role", "arguments": {"role": "sangha"}},
+                {
+                    "id": "proposals",
+                    "name": "list_optimizer_proposals",
+                    "arguments": {"role": "sangha", "min_score": 0.9},
+                },
+            ],
+        )
+
+    report = await LocalTextEngine().run(
+        scenario=_scenario(),
+        agent_callback=agent,
+        environment=OptimizerTraceEnvironment(trace),
+        max_turns=1,
+        min_turns=1,
+    )
+    result = report.results[0]
+    state = result.metadata["environment_state"]["optimizer_society_trace"]
+    assert state["summary"]["proposal_count"] == 5
+    assert state["summary"]["has_synthesis"] is True
+    assert any(
+        artifact.metadata.get("kind") == "optimizer_society_trace"
+        for artifact in result.artifacts
+    )
+
+    evaluation = evaluate_agent_report(
+        report,
+        config={
+            "required_optimizer_trace": [
+                "optimizer_trace",
+                "role",
+                "role_graph",
+                "proposal",
+                "evaluation",
+                "score",
+                "credit",
+                "diagnostic",
+                "search_path",
+                "critique",
+                "synthesis",
+                "steward",
+                "best_candidate",
+            ],
+            "optimizer_trace_quality": {
+                "required_roles": ["sutradhara", "vidura", "sangha", "dharma_steward"],
+                "min_role_count": 4,
+                "min_proposal_count": 5,
+                "min_round_count": 3,
+                "min_credit_entries": 4,
+                "required_archetypes": ["collective_synthesis", "prudent_critic"],
+                "required_search_paths": ["multi_agent.handoff.contract"],
+                "min_best_score": 0.99,
+                "required_best_role": "sangha",
+                "require_role_graph": True,
+                "require_diagnostics": True,
+                "require_critique": True,
+                "require_synthesis": True,
+                "require_steward": True,
+                "max_duplicate_candidate_count": 0,
+            },
+        },
+        threshold=0.9,
+    )
+    metrics = evaluation.summary["metric_averages"]
+    assert metrics["optimizer_trace_coverage"] == 1.0
+    assert metrics["optimizer_trace_quality"] == 1.0
 
 
 @pytest.mark.asyncio
