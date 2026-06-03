@@ -2,8 +2,9 @@
 Replay a local LangGraph/LangChain event stream and score transcript quality.
 
 The fixture mirrors LangGraph/LangChain `stream_events(..., version="v3")`
-protocol events: messages, tool calls, state updates, and final values. It runs
-offline with no framework import, no model, and no API keys.
+protocol events: messages, tool calls, state updates, checkpoint/session
+persistence, and final values. It runs offline with no framework import, no
+model, and no API keys.
 
 Requires:
     pip install agent-simulate ai-evaluation
@@ -60,6 +61,34 @@ LANGGRAPH_EVENTS = [
     },
     {
         "seq": 5,
+        "method": "checkpoints",
+        "params": {
+            "namespace": ["refund_graph:run_1", "policy_node:task_2"],
+            "data": {
+                "config": {
+                    "configurable": {
+                        "thread_id": "refund-thread-1",
+                        "checkpoint_ns": "refund_graph",
+                        "checkpoint_id": "ckpt-002",
+                    }
+                },
+                "parent_config": {
+                    "configurable": {
+                        "thread_id": "refund-thread-1",
+                        "checkpoint_ns": "refund_graph",
+                        "checkpoint_id": "ckpt-001",
+                    }
+                },
+                "checkpoint": {
+                    "values": {"case": {"status": "resolved", "approval": "captured"}},
+                    "updated_channels": ["case"],
+                },
+                "metadata": {"source": "loop", "step": 2},
+            },
+        },
+    },
+    {
+        "seq": 6,
         "method": "values",
         "params": {
             "namespace": ["refund_graph:run_1", "support_agent:task_1"],
@@ -106,13 +135,19 @@ async def main():
         config={
             "required_tools": ["framework_trace_status", "list_framework_spans"],
             "available_tools": ["framework_trace_status", "list_framework_spans"],
-            "required_framework_trace": ["model", "tool", "state"],
+            "required_framework_trace": ["model", "tool", "state", "checkpoint", "session"],
             "framework_transcript_quality": {
-                "required_event_methods": ["messages", "tools", "updates"],
+                "required_event_methods": ["messages", "tools", "updates", "checkpoints"],
                 "required_nodes": ["support_agent", "policy_node"],
                 "required_subgraphs": ["refund_graph"],
                 "expected_tool_sequence": ["lookup_order", "issue_refund"],
                 "expected_state": {"case": {"status": "resolved", "approval": "captured"}},
+                "min_checkpoints": 1,
+                "required_checkpoint_ids": ["ckpt-002"],
+                "required_checkpoint_namespaces": ["refund_graph"],
+                "required_thread_ids": ["refund-thread-1"],
+                "expected_checkpoint_state": {"case": {"status": "resolved", "approval": "captured"}},
+                "require_checkpoint_parent": True,
                 "output_contains": ["Refund approved for order ord_123"],
             },
             "metric_weights": {"framework_transcript_quality": 4.0},

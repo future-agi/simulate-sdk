@@ -2184,6 +2184,66 @@ def test_framework_trace_loader_preserves_memory_and_skill_events():
     assert records[1]["framework_event"]["skill"]["steps"] == ["lookup", "verify", "respond"]
 
 
+def test_langgraph_event_stream_promotes_checkpoint_and_session_state():
+    environment = load_langgraph_event_stream(
+        {
+            "events": [
+                {
+                    "seq": 5,
+                    "method": "checkpoints",
+                    "params": {
+                        "namespace": ["refund_graph:run_1", "policy_node:task_2"],
+                        "data": {
+                            "config": {
+                                "configurable": {
+                                    "thread_id": "refund-thread-1",
+                                    "checkpoint_ns": "refund_graph",
+                                    "checkpoint_id": "ckpt-002",
+                                }
+                            },
+                            "parent_config": {
+                                "configurable": {
+                                    "thread_id": "refund-thread-1",
+                                    "checkpoint_ns": "refund_graph",
+                                    "checkpoint_id": "ckpt-001",
+                                }
+                            },
+                            "checkpoint": {
+                                "values": {
+                                    "case": {
+                                        "status": "resolved",
+                                        "approval": "captured",
+                                    }
+                                },
+                                "updated_channels": ["case"],
+                            },
+                            "metadata": {"source": "loop", "step": 2},
+                        },
+                    },
+                }
+            ]
+        }
+    )
+
+    trace_state = environment.reset().state["framework_trace"]
+    record = trace_state["events"][0]
+    signals = set(record["signals"])
+
+    assert {"checkpoint", "session", "state", "memory"} <= signals
+    assert record["checkpoint"]["id"] == "ckpt-002"
+    assert record["checkpoint"]["thread_id"] == "refund-thread-1"
+    assert record["checkpoint"]["parent_checkpoint_id"] == "ckpt-001"
+    assert record["checkpoint"]["values"]["case"]["status"] == "resolved"
+    assert record["session"] == {
+        "id": "refund-thread-1",
+        "thread_id": "refund-thread-1",
+        "namespace": "refund_graph",
+        "checkpoint_id": "ckpt-002",
+    }
+    assert trace_state["checkpoints"][0]["id"] == "ckpt-002"
+    assert trace_state["sessions"][0]["thread_id"] == "refund-thread-1"
+
+
 def test_multi_agent_framework_transcript_loaders_preserve_speakers_handoffs_and_tools():
     autogen_events = [
         {

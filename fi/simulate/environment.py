@@ -4583,6 +4583,8 @@ class FrameworkTraceEnvironment(EnvironmentAdapter):
             "framework": self.framework,
             "spans": copy.deepcopy(self.spans),
             "events": copy.deepcopy(self.events),
+            "checkpoints": self._checkpoint_payloads(),
+            "sessions": self._session_payloads(),
             "signals": sorted(self._observed_signals()),
             "state": copy.deepcopy(self.state),
             "metadata": copy.deepcopy(self.metadata),
@@ -4596,6 +4598,28 @@ class FrameworkTraceEnvironment(EnvironmentAdapter):
         for span in [*self.spans, *self.events]:
             signals.update(span.get("signals", []))
         return signals
+
+    def _checkpoint_payloads(self) -> List[Dict[str, Any]]:
+        checkpoints: List[Dict[str, Any]] = []
+        for span in [*self.spans, *self.events]:
+            checkpoint = _coerce_plain_dict(span.get("checkpoint"))
+            if checkpoint:
+                checkpoints.append(checkpoint)
+        return checkpoints
+
+    def _session_payloads(self) -> List[Dict[str, Any]]:
+        sessions: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        for span in [*self.spans, *self.events]:
+            session = _coerce_plain_dict(span.get("session"))
+            if not session:
+                continue
+            key = json.dumps(session, sort_keys=True, default=str)
+            if key in seen:
+                continue
+            seen.add(key)
+            sessions.append(session)
+        return sessions
 
 
 def normalize_framework_trace_events(
@@ -8055,6 +8079,10 @@ def _normalize_framework_span(
         signals.add("memory")
     if protocol_event.get("skill"):
         signals.add("skill")
+    if protocol_event.get("checkpoint"):
+        signals.update({"checkpoint", "state", "memory"})
+    if protocol_event.get("session"):
+        signals.add("session")
     latency_ms = _first_number(
         raw,
         attributes,
@@ -8130,6 +8158,8 @@ def _normalize_framework_span(
             ("final_output", "final_output"),
             ("memory", "memory"),
             ("skill", "skill"),
+            ("checkpoint", "checkpoint"),
+            ("session", "session"),
             ("sequence", "sequence"),
         ):
             value = protocol_event.get(source_key)
@@ -8282,6 +8312,7 @@ def _framework_protocol_event(
     )
     memory = _framework_memory_payload_from_sources(
         raw,
+        params,
         params_data,
         data,
         payload,
@@ -8290,11 +8321,31 @@ def _framework_protocol_event(
     )
     skill = _framework_skill_payload_from_sources(
         raw,
+        params,
         params_data,
         data,
         payload,
         span_data,
         attributes,
+    )
+    checkpoint = _framework_checkpoint_payload_from_sources(
+        raw,
+        params,
+        params_data,
+        data,
+        payload,
+        span_data,
+        attributes,
+    )
+    session = _framework_session_payload_from_sources(
+        raw,
+        params,
+        params_data,
+        data,
+        payload,
+        span_data,
+        attributes,
+        checkpoint=checkpoint,
     )
     final_output = _first_present(
         (params_data, data, payload, raw),
@@ -8326,6 +8377,8 @@ def _framework_protocol_event(
         "final_output": final_output,
         "memory": memory,
         "skill": skill,
+        "checkpoint": checkpoint,
+        "session": session,
         "data": params_data,
     }
     return {key: copy.deepcopy(value) for key, value in event.items() if value not in (None, "", [], {})}
@@ -8539,6 +8592,198 @@ def _framework_skill_payload_from_sources(*sources: Mapping[str, Any]) -> Dict[s
         for key, value in nested.items():
             payload.setdefault(str(key), copy.deepcopy(value))
     return {key: copy.deepcopy(value) for key, value in payload.items() if value not in (None, "", [], {})}
+
+
+def _framework_checkpoint_payload_from_sources(*sources: Mapping[str, Any]) -> Dict[str, Any]:
+    text = _framework_sources_text(*sources)
+    method = str(
+        _framework_value_from_sources(sources, ("method", "type", "event"))
+        or ""
+    ).lower()
+    checkpoint_hint = (
+        "checkpoint" in text
+        or method in {"checkpoint", "checkpoints"}
+        or _framework_value_from_sources(
+            sources,
+            (
+                "checkpoint_id",
+                "checkpoint.id",
+                "checkpoint.checkpoint_id",
+                "config.configurable.checkpoint_id",
+                "metadata.checkpoint_id",
+            ),
+        )
+        not in (None, "", [], {})
+    )
+    if not checkpoint_hint:
+        return {}
+
+    checkpoint = _framework_mapping_from_sources(
+        sources,
+        (
+            "checkpoint",
+            "checkpoint_state",
+            "langgraph.checkpoint",
+            "langgraph_checkpoint",
+        ),
+    )
+    config = _framework_mapping_from_sources(sources, ("config", "checkpoint_config"))
+    parent_config = _framework_mapping_from_sources(
+        sources,
+        ("parent_config", "parentConfig", "parent_checkpoint_config", "parentCheckpointConfig"),
+    )
+    metadata = _framework_mapping_from_sources(sources, ("checkpoint_metadata", "metadata"))
+    configurable = _coerce_plain_dict(config.get("configurable"))
+    parent_configurable = _coerce_plain_dict(parent_config.get("configurable"))
+
+    checkpoint_id = _first_framework_value(
+        checkpoint.get("id"),
+        checkpoint.get("checkpoint_id"),
+        checkpoint.get("checkpointId"),
+        configurable.get("checkpoint_id"),
+        configurable.get("checkpointId"),
+        metadata.get("checkpoint_id"),
+        _framework_value_from_sources(
+            sources,
+            ("checkpoint_id", "checkpointId", "checkpoint.id", "checkpoint.checkpoint_id"),
+        ),
+    )
+    parent_checkpoint_id = _first_framework_value(
+        checkpoint.get("parent_checkpoint_id"),
+        checkpoint.get("parentCheckpointId"),
+        parent_configurable.get("checkpoint_id"),
+        parent_configurable.get("checkpointId"),
+        _framework_value_from_sources(
+            sources,
+            (
+                "parent_checkpoint_id",
+                "parentCheckpointId",
+                "parent_config.configurable.checkpoint_id",
+                "parentConfig.configurable.checkpointId",
+            ),
+        ),
+    )
+    thread_id = _first_framework_value(
+        checkpoint.get("thread_id"),
+        checkpoint.get("threadId"),
+        configurable.get("thread_id"),
+        configurable.get("threadId"),
+        metadata.get("thread_id"),
+        _framework_value_from_sources(
+            sources,
+            ("thread_id", "threadId", "session_id", "sessionId", "config.configurable.thread_id"),
+        ),
+    )
+    namespace = _first_framework_value(
+        checkpoint.get("checkpoint_ns"),
+        checkpoint.get("checkpoint_namespace"),
+        checkpoint.get("namespace"),
+        configurable.get("checkpoint_ns"),
+        configurable.get("checkpointNamespace"),
+        _framework_value_from_sources(
+            sources,
+            ("checkpoint_ns", "checkpoint_namespace", "checkpoint.namespace", "namespace", "ns"),
+        ),
+    )
+    values = _first_framework_value(
+        checkpoint.get("values"),
+        checkpoint.get("channel_values"),
+        checkpoint.get("channelValues"),
+        checkpoint.get("state"),
+        _framework_value_from_sources(
+            sources,
+            ("values", "channel_values", "channelValues", "state", "checkpoint.values", "checkpoint.channel_values"),
+        ),
+    )
+    updates = _first_framework_value(
+        checkpoint.get("updates"),
+        checkpoint.get("writes"),
+        checkpoint.get("updated_channels"),
+        checkpoint.get("updatedChannels"),
+        _framework_value_from_sources(
+            sources,
+            ("updates", "writes", "updated_channels", "updatedChannels", "checkpoint.updates"),
+        ),
+    )
+    payload: Dict[str, Any] = {}
+    for key, value in (
+        ("id", checkpoint_id),
+        ("thread_id", thread_id),
+        ("namespace", namespace),
+        ("parent_checkpoint_id", parent_checkpoint_id),
+        ("values", values),
+        ("updates", updates),
+        ("metadata", metadata),
+        ("config", config),
+        ("parent_config", parent_config),
+    ):
+        if value not in (None, "", [], {}):
+            payload[key] = copy.deepcopy(value)
+    return payload
+
+
+def _framework_session_payload_from_sources(
+    *sources: Mapping[str, Any],
+    checkpoint: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    checkpoint = checkpoint or {}
+    text = _framework_sources_text(*sources)
+    thread_id = _first_framework_value(
+        checkpoint.get("thread_id"),
+        _framework_value_from_sources(
+            sources,
+            (
+                "thread_id",
+                "threadId",
+                "session_id",
+                "sessionId",
+                "conversation_id",
+                "conversationId",
+                "config.configurable.thread_id",
+            ),
+        ),
+    )
+    session_id = _first_framework_value(
+        _framework_value_from_sources(
+            sources,
+            ("session_id", "sessionId", "conversation_id", "conversationId"),
+        ),
+        thread_id,
+    )
+    if session_id in (None, "", [], {}) and "session" not in text and not checkpoint:
+        return {}
+
+    namespace = _first_framework_value(
+        checkpoint.get("namespace"),
+        _framework_value_from_sources(
+            sources,
+            ("checkpoint_ns", "checkpoint_namespace", "namespace", "ns", "config.configurable.checkpoint_ns"),
+        ),
+    )
+    checkpoint_id = _first_framework_value(
+        checkpoint.get("id"),
+        _framework_value_from_sources(
+            sources,
+            ("checkpoint_id", "checkpointId", "config.configurable.checkpoint_id"),
+        ),
+    )
+    payload: Dict[str, Any] = {}
+    for key, value in (
+        ("id", session_id),
+        ("thread_id", thread_id),
+        ("namespace", namespace),
+        ("checkpoint_id", checkpoint_id),
+    ):
+        if value not in (None, "", [], {}):
+            payload[key] = copy.deepcopy(value)
+    return payload
+
+
+def _first_framework_value(*values: Any) -> Any:
+    for value in values:
+        if value not in (None, "", [], {}):
+            return value
+    return None
 
 
 def _framework_value_from_sources(
@@ -8781,6 +9026,10 @@ def _framework_signals(
     for signal, tokens in explicit_signal_groups.items():
         if any(token in span_kind or token in operation for token in tokens):
             signals.add(signal)
+    if "checkpoint" in text:
+        signals.update({"checkpoint", "state"})
+    if "session" in text:
+        signals.add("session")
     if any(token in text for token in ("checkpoint", "session")):
         signals.add("memory")
     if any(str(key).startswith("mcp.resource") for key in attributes.keys()):
