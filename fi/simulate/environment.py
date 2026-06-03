@@ -5986,6 +5986,283 @@ class FrameworkPortabilityEnvironment(EnvironmentAdapter):
         )
 
 
+class AgentTrustBoundaryEnvironment(EnvironmentAdapter):
+    """
+    Replay an agent trust-boundary/threat-model certificate.
+
+    Use this before adversarial replay to prove the agent/framework inventory:
+    actors, assets, tools, untrusted surfaces, permissions, isolation, audit
+    logging, canaries, human approval, memory isolation, network egress, and
+    mitigated threat categories.
+    """
+
+    name = "agent_trust_boundary"
+
+    def __init__(
+        self,
+        model: Any = None,
+        *,
+        name: str = "agent-trust-boundary-model",
+        framework: str = "custom",
+        version: Optional[str] = None,
+        actors: Optional[Iterable[Any]] = None,
+        assets: Optional[Iterable[Any]] = None,
+        tools: Optional[Iterable[Any]] = None,
+        surfaces: Optional[Iterable[Any]] = None,
+        controls: Optional[Iterable[Any]] = None,
+        canaries: Optional[Iterable[Any]] = None,
+        threats: Optional[Iterable[Any]] = None,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        self.model = normalize_agent_trust_boundary_model(
+            model,
+            name=name,
+            framework=framework,
+            version=version,
+            actors=actors,
+            assets=assets,
+            tools=tools,
+            surfaces=surfaces,
+            controls=controls,
+            canaries=canaries,
+            threats=threats,
+            metadata=metadata,
+        )
+
+    def reset(self, **context: Any) -> EnvironmentSnapshot:
+        return EnvironmentSnapshot(
+            tools=self._tool_specs(),
+            artifacts=[self._model_artifact()],
+            events=[
+                SimulationEvent(
+                    type="agent_trust_boundary",
+                    name="agent_trust_boundary_ready",
+                    payload={
+                        "framework": self.model["framework"],
+                        "control_count": self.model["summary"]["control_count"],
+                        "control_rate": self.model["summary"]["control_rate"],
+                        "required_control_rate": self.model["summary"]["required_control_rate"],
+                        "threat_count": self.model["summary"]["threat_count"],
+                        "signals": copy.deepcopy(self.model["signals"]),
+                    },
+                ),
+                *[
+                    SimulationEvent(
+                        type="agent_trust_boundary",
+                        name="agent_trust_control",
+                        payload=copy.deepcopy(control),
+                    )
+                    for control in self.model["controls"]
+                ],
+                *[
+                    SimulationEvent(
+                        type="agent_trust_boundary",
+                        name="agent_trust_threat",
+                        payload=copy.deepcopy(threat),
+                    )
+                    for threat in self.model["threats"]
+                ],
+            ],
+            state={"agent_trust_boundary_model": copy.deepcopy(self.model)},
+            metadata={"agent_trust_boundary_model": copy.deepcopy(self.model)},
+        )
+
+    def observe(self, **context: Any) -> EnvironmentSnapshot:
+        return EnvironmentSnapshot(
+            artifacts=[self._model_artifact()],
+            state={"agent_trust_boundary_model": copy.deepcopy(self.model)},
+            metadata={"agent_trust_boundary_model": copy.deepcopy(self.model)},
+        )
+
+    def handle_tool_call(
+        self,
+        tool_call: Mapping[str, Any],
+        **context: Any,
+    ) -> Optional[ToolExecutionResult]:
+        name = _tool_name(tool_call)
+        if name not in {
+            "agent_trust_boundary_status",
+            "list_agent_trust_assets",
+            "list_agent_trust_tools",
+            "list_agent_trust_surfaces",
+            "list_agent_trust_controls",
+            "inspect_agent_trust_control",
+            "list_agent_trust_gaps",
+        }:
+            return None
+        arguments = _tool_arguments(tool_call)
+        call_id = _tool_call_id(tool_call)
+        success = True
+        error = None
+
+        if name == "agent_trust_boundary_status":
+            result = copy.deepcopy(self.model)
+            event_name = "agent_trust_boundary_status"
+            content = f"{self.model['framework']} trust-boundary model status recorded."
+        elif name == "list_agent_trust_assets":
+            sensitivity = _normalize_agent_trust_boundary_key(arguments.get("sensitivity") or "")
+            assets = copy.deepcopy(self.model["assets"])
+            if sensitivity:
+                assets = [asset for asset in assets if asset.get("sensitivity") == sensitivity]
+            result = {"framework": self.model["framework"], "assets": assets, "filters": {"sensitivity": sensitivity}}
+            event_name = "agent_trust_assets_listed"
+            content = f"Listed {len(assets)} agent trust asset(s)."
+        elif name == "list_agent_trust_tools":
+            permission = _normalize_agent_trust_boundary_key(arguments.get("permission") or "")
+            high_risk = arguments.get("high_risk")
+            tools = copy.deepcopy(self.model["tools"])
+            if permission:
+                tools = [
+                    tool
+                    for tool in tools
+                    if permission in {_normalize_agent_trust_boundary_key(item) for item in _as_iterable(tool.get("permissions"))}
+                ]
+            if high_risk is not None:
+                tools = [tool for tool in tools if bool(tool.get("high_risk")) is bool(high_risk)]
+            result = {"framework": self.model["framework"], "tools": tools, "filters": {"permission": permission, "high_risk": high_risk}}
+            event_name = "agent_trust_tools_listed"
+            content = f"Listed {len(tools)} agent trust tool(s)."
+        elif name == "list_agent_trust_surfaces":
+            trust_level = _normalize_agent_trust_boundary_key(arguments.get("trust_level") or "")
+            surface_type = _normalize_agent_trust_boundary_key(arguments.get("type") or arguments.get("surface_type") or "")
+            surfaces = copy.deepcopy(self.model["surfaces"])
+            if trust_level:
+                surfaces = [surface for surface in surfaces if surface.get("trust_level") == trust_level]
+            if surface_type:
+                surfaces = [surface for surface in surfaces if surface.get("type") == surface_type]
+            result = {
+                "framework": self.model["framework"],
+                "surfaces": surfaces,
+                "filters": {"trust_level": trust_level, "type": surface_type},
+            }
+            event_name = "agent_trust_surfaces_listed"
+            content = f"Listed {len(surfaces)} agent trust surface(s)."
+        elif name == "list_agent_trust_controls":
+            category = _normalize_agent_trust_boundary_category(arguments.get("category") or "")
+            status = _normalize_agent_trust_boundary_status(arguments.get("status") or "")
+            required = arguments.get("required")
+            controls = copy.deepcopy(self.model["controls"])
+            if category:
+                controls = [control for control in controls if control.get("category") == category]
+            if status:
+                controls = [control for control in controls if control.get("status") == status]
+            if required is not None:
+                controls = [control for control in controls if bool(control.get("required")) is bool(required)]
+            result = {
+                "framework": self.model["framework"],
+                "controls": controls,
+                "filters": {"category": category, "status": status, "required": required},
+            }
+            event_name = "agent_trust_controls_listed"
+            content = f"Listed {len(controls)} agent trust control(s)."
+        elif name == "list_agent_trust_gaps":
+            result = {
+                "framework": self.model["framework"],
+                "controls": [
+                    copy.deepcopy(control)
+                    for control in self.model["controls"]
+                    if control.get("status") in {"partial", "missing", "blocked"}
+                ],
+                "threats": [
+                    copy.deepcopy(threat)
+                    for threat in self.model["threats"]
+                    if threat.get("status") in {"partial", "unmitigated"}
+                ],
+                "summary": copy.deepcopy(self.model["summary"]),
+            }
+            event_name = "agent_trust_gaps_listed"
+            content = (
+                f"Listed {len(result['controls'])} control gap(s) and "
+                f"{len(result['threats'])} threat gap(s)."
+            )
+        else:
+            control_id = str(arguments.get("id") or arguments.get("name") or arguments.get("control") or arguments.get("category") or "")
+            control = _find_agent_trust_control(self.model["controls"], control_id)
+            success = control is not None
+            result = {"framework": self.model["framework"], "control": copy.deepcopy(control), "query": control_id}
+            event_name = "agent_trust_control_inspected" if success else "agent_trust_control_missing"
+            content = f"Inspected agent trust control {control_id}." if success else f"Agent trust control not found: {control_id}"
+            error = None if success else "control_not_found"
+
+        return ToolExecutionResult(
+            tool_call_id=call_id,
+            tool_name=name,
+            content=content,
+            result=result,
+            success=success,
+            error=error,
+            state_updates={"agent_trust_boundary_model": copy.deepcopy(self.model)},
+            artifacts=[self._model_artifact()],
+            events=[
+                SimulationEvent(
+                    type="agent_trust_boundary",
+                    name=event_name,
+                    payload=result,
+                )
+            ],
+        )
+
+    def _tool_specs(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                "name": "agent_trust_boundary_status",
+                "description": "Return normalized agent trust-boundary model state and summary.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            {
+                "name": "list_agent_trust_assets",
+                "description": "List protected assets filtered by sensitivity.",
+                "parameters": {"type": "object", "properties": {"sensitivity": {"type": "string"}}},
+            },
+            {
+                "name": "list_agent_trust_tools",
+                "description": "List tools filtered by permission or high-risk status.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"permission": {"type": "string"}, "high_risk": {"type": "boolean"}},
+                },
+            },
+            {
+                "name": "list_agent_trust_surfaces",
+                "description": "List input/output surfaces filtered by trust level or type.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"trust_level": {"type": "string"}, "type": {"type": "string"}},
+                },
+            },
+            {
+                "name": "list_agent_trust_controls",
+                "description": "List trust-boundary controls filtered by category, status, or required flag.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "category": {"type": "string"},
+                        "status": {"type": "string"},
+                        "required": {"type": "boolean"},
+                    },
+                },
+            },
+            {
+                "name": "inspect_agent_trust_control",
+                "description": "Inspect one trust-boundary control by id, name, or category.",
+                "parameters": {"type": "object", "properties": {"id": {"type": "string"}}},
+            },
+            {
+                "name": "list_agent_trust_gaps",
+                "description": "List partial, missing, or blocked controls plus unmitigated threat gaps.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        ]
+
+    def _model_artifact(self) -> SimulationArtifact:
+        return SimulationArtifact(
+            type="trace",
+            role="environment",
+            data=copy.deepcopy(self.model),
+            metadata={"kind": "agent_trust_boundary_model", "framework": self.model["framework"]},
+        )
+
+
 class ObservabilityReplayEnvironment(EnvironmentAdapter):
     """
     Replay production observability/regression cases as local simulation evidence.
@@ -8465,6 +8742,740 @@ def _normalize_framework_portability_key(value: Any) -> str:
         "graph": "orchestration",
         "policy": "security",
         "guardrails": "security",
+    }
+    return aliases.get(normalized, normalized)
+
+
+def normalize_agent_trust_boundary_model(
+    model: Any = None,
+    *,
+    name: str = "agent-trust-boundary-model",
+    framework: str = "custom",
+    version: Optional[str] = None,
+    actors: Optional[Iterable[Any]] = None,
+    assets: Optional[Iterable[Any]] = None,
+    tools: Optional[Iterable[Any]] = None,
+    surfaces: Optional[Iterable[Any]] = None,
+    controls: Optional[Iterable[Any]] = None,
+    canaries: Optional[Iterable[Any]] = None,
+    threats: Optional[Iterable[Any]] = None,
+    metadata: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Normalize agent trust-boundary/threat-model evidence."""
+
+    source = _coerce_plain_dict(model)
+    model_name = str(source.get("name") or source.get("id") or name)
+    framework_name = str(source.get("framework") or source.get("runtime") or framework)
+    model_version = source.get("version") or source.get("framework_version") or version
+    normalized_actors = [
+        _normalize_agent_trust_actor(item)
+        for item in _as_iterable(actors if actors is not None else source.get("actors") or source.get("principals") or [])
+    ]
+    normalized_assets = [
+        _normalize_agent_trust_asset(item)
+        for item in _as_iterable(assets if assets is not None else source.get("assets") or source.get("protected_assets") or [])
+    ]
+    normalized_tools = [
+        _normalize_agent_trust_tool(item)
+        for item in _as_iterable(tools if tools is not None else source.get("tools") or source.get("tool_inventory") or [])
+    ]
+    normalized_surfaces = [
+        _normalize_agent_trust_surface(item)
+        for item in _as_iterable(
+            surfaces
+            if surfaces is not None
+            else source.get("surfaces")
+            or source.get("trust_boundaries")
+            or source.get("untrusted_surfaces")
+            or []
+        )
+    ]
+    normalized_controls = [
+        _normalize_agent_trust_control(item)
+        for item in _as_iterable(
+            controls
+            if controls is not None
+            else source.get("controls")
+            or source.get("mitigations")
+            or source.get("guardrails")
+            or []
+        )
+    ]
+    normalized_canaries = [
+        _normalize_agent_trust_canary(item)
+        for item in _as_iterable(canaries if canaries is not None else source.get("canaries") or source.get("honeytokens") or [])
+    ]
+    normalized_threats = [
+        _normalize_agent_trust_threat(item)
+        for item in _as_iterable(threats if threats is not None else source.get("threats") or source.get("risks") or [])
+    ]
+    normalized_actors = [item for item in normalized_actors if item.get("id")]
+    normalized_assets = [item for item in normalized_assets if item.get("id")]
+    normalized_tools = [item for item in normalized_tools if item.get("id")]
+    normalized_surfaces = [item for item in normalized_surfaces if item.get("id")]
+    normalized_controls = [item for item in normalized_controls if item.get("id")]
+    normalized_canaries = [item for item in normalized_canaries if item.get("id")]
+    normalized_threats = [item for item in normalized_threats if item.get("id")]
+    model_metadata = {**_coerce_plain_dict(source.get("metadata")), **copy.deepcopy(dict(metadata or {}))}
+    summary = _agent_trust_boundary_summary(
+        normalized_actors,
+        normalized_assets,
+        normalized_tools,
+        normalized_surfaces,
+        normalized_controls,
+        normalized_canaries,
+        normalized_threats,
+    )
+    signals = _agent_trust_boundary_signals(
+        normalized_actors,
+        normalized_assets,
+        normalized_tools,
+        normalized_surfaces,
+        normalized_controls,
+        normalized_canaries,
+        normalized_threats,
+        source.get("signals"),
+    )
+    return {
+        "kind": "agent_trust_boundary_model",
+        "name": model_name,
+        "framework": framework_name,
+        "version": str(model_version or ""),
+        "actors": normalized_actors,
+        "assets": normalized_assets,
+        "tools": normalized_tools,
+        "surfaces": normalized_surfaces,
+        "controls": normalized_controls,
+        "canaries": normalized_canaries,
+        "threats": normalized_threats,
+        "summary": summary,
+        "signals": signals,
+        "metadata": model_metadata,
+    }
+
+
+def _normalize_agent_trust_actor(value: Any) -> Dict[str, Any]:
+    raw = {"id": value, "name": value} if isinstance(value, str) else _coerce_plain_dict(value)
+    actor_id = _normalize_agent_trust_boundary_key(raw.get("id") or raw.get("name") or raw.get("role") or "")
+    privileges = [
+        _normalize_agent_trust_boundary_key(item)
+        for item in _as_iterable(raw.get("privileges") or raw.get("permissions") or raw.get("scopes"))
+        if _normalize_agent_trust_boundary_key(item)
+    ]
+    evidence = _normalize_agent_trust_evidence(raw)
+    signals = {
+        "agent_trust_boundary",
+        "actor",
+        actor_id,
+        _normalize_agent_trust_boundary_key(raw.get("type")),
+        _normalize_agent_trust_boundary_key(raw.get("trust_level")),
+        *privileges,
+    }
+    return {
+        "id": str(raw.get("id") or actor_id),
+        "name": str(raw.get("name") or raw.get("role") or actor_id),
+        "type": _normalize_agent_trust_boundary_key(raw.get("type") or raw.get("kind") or "principal"),
+        "trust_level": _normalize_agent_trust_boundary_key(raw.get("trust_level") or raw.get("trust") or "unknown"),
+        "privileges": sorted(set(privileges)),
+        "evidence": evidence,
+        "signals": sorted(signal for signal in signals if signal),
+        "metadata": _coerce_plain_dict(raw.get("metadata")),
+    }
+
+
+def _normalize_agent_trust_asset(value: Any) -> Dict[str, Any]:
+    raw = {"id": value, "name": value} if isinstance(value, str) else _coerce_plain_dict(value)
+    asset_id = _normalize_agent_trust_boundary_key(raw.get("id") or raw.get("name") or raw.get("asset") or "")
+    sensitivity = _normalize_agent_trust_sensitivity(raw.get("sensitivity") or raw.get("classification") or raw.get("risk") or "medium")
+    evidence = _normalize_agent_trust_evidence(raw)
+    signals = {
+        "agent_trust_boundary",
+        "asset",
+        asset_id,
+        sensitivity,
+        _normalize_agent_trust_boundary_key(raw.get("type") or raw.get("category")),
+    }
+    return {
+        "id": str(raw.get("id") or asset_id),
+        "name": str(raw.get("name") or raw.get("asset") or asset_id),
+        "type": _normalize_agent_trust_boundary_key(raw.get("type") or raw.get("category") or "data"),
+        "sensitivity": sensitivity,
+        "owner": str(raw.get("owner") or ""),
+        "required": bool(raw.get("required", True)),
+        "evidence": evidence,
+        "signals": sorted(signal for signal in signals if signal),
+        "metadata": _coerce_plain_dict(raw.get("metadata")),
+    }
+
+
+def _normalize_agent_trust_tool(value: Any) -> Dict[str, Any]:
+    raw = {"id": value, "name": value} if isinstance(value, str) else _coerce_plain_dict(value)
+    tool_id = _normalize_agent_trust_boundary_key(raw.get("id") or raw.get("name") or raw.get("tool") or "")
+    permission_scope = _normalize_agent_trust_boundary_key(
+        raw.get("permission_scope") or raw.get("scope") or raw.get("permission") or "read"
+    )
+    permissions = [
+        _normalize_agent_trust_boundary_key(item)
+        for item in _as_iterable(raw.get("permissions") or raw.get("scopes") or permission_scope)
+        if _normalize_agent_trust_boundary_key(item)
+    ]
+    destructive = bool(raw.get("destructive") or raw.get("mutates_state") or raw.get("write"))
+    external = bool(raw.get("external") or raw.get("network") or raw.get("remote"))
+    auth_required = bool(raw.get("auth_required") or raw.get("authenticated") or raw.get("requires_auth"))
+    high_risk_permissions = {"admin", "delete", "deploy", "exec", "execute", "network", "secret", "secrets", "write"}
+    high_risk = bool(raw.get("high_risk") or destructive or external or auth_required or high_risk_permissions.intersection(permissions))
+    controls = [
+        _normalize_agent_trust_boundary_category(item)
+        for item in _as_iterable(raw.get("controls") or raw.get("mitigations"))
+        if _normalize_agent_trust_boundary_category(item)
+    ]
+    evidence = _normalize_agent_trust_evidence(raw)
+    signals = {
+        "agent_trust_boundary",
+        "tool",
+        tool_id,
+        permission_scope,
+        *permissions,
+        *controls,
+    }
+    if high_risk:
+        signals.add("privileged_tool")
+    if external:
+        signals.add("external_tool")
+    return {
+        "id": str(raw.get("id") or tool_id),
+        "name": str(raw.get("name") or raw.get("tool") or tool_id),
+        "permission_scope": permission_scope,
+        "permissions": sorted(set(permissions)),
+        "destructive": destructive,
+        "external": external,
+        "auth_required": auth_required,
+        "required": bool(raw.get("required", True)),
+        "high_risk": high_risk,
+        "controls": sorted(set(controls)),
+        "evidence": evidence,
+        "signals": sorted(signal for signal in signals if signal),
+        "metadata": _coerce_plain_dict(raw.get("metadata")),
+    }
+
+
+def _normalize_agent_trust_surface(value: Any) -> Dict[str, Any]:
+    raw = {"id": value, "name": value} if isinstance(value, str) else _coerce_plain_dict(value)
+    surface_id = _normalize_agent_trust_boundary_key(raw.get("id") or raw.get("name") or raw.get("surface") or "")
+    surface_type = _normalize_agent_trust_boundary_key(raw.get("type") or raw.get("category") or raw.get("source") or "input")
+    trust_level = _normalize_agent_trust_boundary_key(raw.get("trust_level") or raw.get("trust") or "untrusted")
+    threats = [
+        _normalize_agent_trust_boundary_key(item)
+        for item in _as_iterable(raw.get("threats") or raw.get("risks"))
+        if _normalize_agent_trust_boundary_key(item)
+    ]
+    controls = [
+        _normalize_agent_trust_boundary_category(item)
+        for item in _as_iterable(raw.get("controls") or raw.get("mitigations"))
+        if _normalize_agent_trust_boundary_category(item)
+    ]
+    evidence = _normalize_agent_trust_evidence(raw)
+    signals = {
+        "agent_trust_boundary",
+        "surface",
+        surface_id,
+        surface_type,
+        trust_level,
+        *threats,
+        *controls,
+    }
+    return {
+        "id": str(raw.get("id") or surface_id),
+        "name": str(raw.get("name") or raw.get("surface") or surface_id),
+        "type": surface_type,
+        "source": str(raw.get("source") or ""),
+        "trust_level": trust_level,
+        "threats": sorted(set(threats)),
+        "controls": sorted(set(controls)),
+        "required": bool(raw.get("required", True)),
+        "evidence": evidence,
+        "signals": sorted(signal for signal in signals if signal),
+        "metadata": _coerce_plain_dict(raw.get("metadata")),
+    }
+
+
+def _normalize_agent_trust_control(value: Any) -> Dict[str, Any]:
+    raw = {"id": value, "name": value, "status": "present"} if isinstance(value, str) else _coerce_plain_dict(value)
+    control_id = _normalize_agent_trust_boundary_key(raw.get("id") or raw.get("name") or raw.get("control") or raw.get("category") or "")
+    category = _agent_trust_control_category(raw, control_id)
+    status = _agent_trust_control_status_from_record(raw)
+    threats = [
+        _normalize_agent_trust_boundary_key(item)
+        for item in _as_iterable(raw.get("threats") or raw.get("risks") or raw.get("covers"))
+        if _normalize_agent_trust_boundary_key(item)
+    ]
+    evidence = _normalize_agent_trust_evidence(raw)
+    signals = {
+        "agent_trust_boundary",
+        "control",
+        control_id,
+        category,
+        status,
+        *threats,
+    }
+    return {
+        "id": str(raw.get("id") or control_id),
+        "name": str(raw.get("name") or raw.get("control") or control_id),
+        "category": category,
+        "status": status,
+        "required": bool(raw.get("required", True)),
+        "evidence": evidence,
+        "threats": sorted(set(threats)),
+        "signals": sorted(signal for signal in signals if signal),
+        "notes": str(raw.get("notes") or raw.get("reason") or ""),
+        "metadata": _coerce_plain_dict(raw.get("metadata")),
+    }
+
+
+def _normalize_agent_trust_canary(value: Any) -> Dict[str, Any]:
+    raw = {"id": value, "name": value} if isinstance(value, str) else _coerce_plain_dict(value)
+    canary_id = _normalize_agent_trust_boundary_key(raw.get("id") or raw.get("name") or raw.get("canary") or raw.get("token") or "")
+    evidence = _normalize_agent_trust_evidence(raw)
+    value = str(raw.get("value") or raw.get("token") or "")
+    redacted = bool(raw.get("redacted", False))
+    signals = {
+        "agent_trust_boundary",
+        "canary",
+        "canaries",
+        canary_id,
+        _normalize_agent_trust_boundary_key(raw.get("surface") or raw.get("location")),
+    }
+    return {
+        "id": str(raw.get("id") or canary_id),
+        "name": str(raw.get("name") or raw.get("canary") or canary_id),
+        "location": str(raw.get("location") or raw.get("path") or ""),
+        "surface": _normalize_agent_trust_boundary_key(raw.get("surface") or raw.get("source") or ""),
+        "value": value,
+        "redacted": redacted,
+        "evidence": evidence,
+        "signals": sorted(signal for signal in signals if signal),
+        "metadata": _coerce_plain_dict(raw.get("metadata")),
+    }
+
+
+def _normalize_agent_trust_threat(value: Any) -> Dict[str, Any]:
+    raw = {"id": value, "name": value} if isinstance(value, str) else _coerce_plain_dict(value)
+    threat_id = _normalize_agent_trust_boundary_key(raw.get("id") or raw.get("name") or raw.get("threat") or raw.get("category") or "")
+    category = _normalize_agent_trust_boundary_key(raw.get("category") or raw.get("type") or threat_id or "general")
+    status = _normalize_agent_trust_threat_status(raw.get("status") or raw.get("mitigation_status") or raw.get("state"))
+    if not status:
+        status = "mitigated" if raw.get("mitigated") is True else "unmitigated"
+    severity = _normalize_agent_trust_severity(raw.get("severity") or raw.get("risk") or raw.get("priority") or "medium")
+    controls = [
+        _normalize_agent_trust_boundary_category(item)
+        for item in _as_iterable(raw.get("controls") or raw.get("mitigations"))
+        if _normalize_agent_trust_boundary_category(item)
+    ]
+    evidence = _normalize_agent_trust_evidence(raw)
+    signals = {
+        "agent_trust_boundary",
+        "threat",
+        threat_id,
+        category,
+        status,
+        severity,
+        _normalize_agent_trust_boundary_key(raw.get("surface")),
+        _normalize_agent_trust_boundary_key(raw.get("tool")),
+        _normalize_agent_trust_boundary_key(raw.get("asset")),
+        *controls,
+    }
+    return {
+        "id": str(raw.get("id") or threat_id),
+        "name": str(raw.get("name") or raw.get("threat") or threat_id),
+        "category": category,
+        "severity": severity,
+        "status": status,
+        "surface": _normalize_agent_trust_boundary_key(raw.get("surface") or ""),
+        "tool": _normalize_agent_trust_boundary_key(raw.get("tool") or ""),
+        "asset": _normalize_agent_trust_boundary_key(raw.get("asset") or ""),
+        "controls": sorted(set(controls)),
+        "evidence": evidence,
+        "signals": sorted(signal for signal in signals if signal),
+        "metadata": _coerce_plain_dict(raw.get("metadata")),
+    }
+
+
+def _agent_trust_boundary_summary(
+    actors: Sequence[Mapping[str, Any]],
+    assets: Sequence[Mapping[str, Any]],
+    tools: Sequence[Mapping[str, Any]],
+    surfaces: Sequence[Mapping[str, Any]],
+    controls: Sequence[Mapping[str, Any]],
+    canaries: Sequence[Mapping[str, Any]],
+    threats: Sequence[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    present = [control for control in controls if control.get("status") == "present"]
+    partial = [control for control in controls if control.get("status") == "partial"]
+    missing = [control for control in controls if control.get("status") == "missing"]
+    blocked = [control for control in controls if control.get("status") == "blocked"]
+    required = [control for control in controls if control.get("required")]
+    required_present = [control for control in required if control.get("status") == "present"]
+    categories = sorted({_normalize_agent_trust_boundary_category(control.get("category")) for control in controls if control.get("category")})
+    present_categories = sorted(
+        {_normalize_agent_trust_boundary_category(control.get("category")) for control in present if control.get("category")}
+    )
+    missing_categories = sorted(
+        {
+            _normalize_agent_trust_boundary_category(control.get("category"))
+            for control in [*partial, *missing, *blocked]
+            if control.get("category")
+        }
+    )
+    mitigated_threats = [threat for threat in threats if threat.get("status") == "mitigated"]
+    unmitigated_threats = [threat for threat in threats if threat.get("status") in {"partial", "unmitigated"}]
+    high_risk_threats = [threat for threat in threats if threat.get("severity") in {"high", "critical"}]
+    high_risk_unmitigated = [
+        threat
+        for threat in high_risk_threats
+        if threat.get("status") in {"partial", "unmitigated"}
+    ]
+    evidence_count = sum(
+        len(_as_iterable(record.get("evidence")))
+        for collection in (actors, assets, tools, surfaces, controls, canaries, threats)
+        for record in collection
+    )
+    gap_controls = sorted(
+        control.get("id") or control.get("name")
+        for control in [*partial, *missing, *blocked]
+        if control.get("id") or control.get("name")
+    )
+    gap_threats = sorted(
+        threat.get("id") or threat.get("name")
+        for threat in unmitigated_threats
+        if threat.get("id") or threat.get("name")
+    )
+    present_category_set = set(present_categories)
+    return {
+        "actor_count": len(actors),
+        "asset_count": len(assets),
+        "tool_count": len(tools),
+        "surface_count": len(surfaces),
+        "control_count": len(controls),
+        "canary_count": len(canaries),
+        "threat_count": len(threats),
+        "present_control_count": len(present),
+        "partial_control_count": len(partial),
+        "missing_control_count": len(missing),
+        "blocked_control_count": len(blocked),
+        "required_control_count": len(required),
+        "required_present_control_count": len(required_present),
+        "control_rate": round(len(present) / len(controls), 4) if controls else 1.0,
+        "required_control_rate": round(len(required_present) / len(required), 4) if required else 1.0,
+        "evidence_count": evidence_count,
+        "untrusted_surface_count": len(
+            [surface for surface in surfaces if surface.get("trust_level") in {"untrusted", "external", "unknown"}]
+        ),
+        "privileged_tool_count": len([tool for tool in tools if tool.get("high_risk")]),
+        "external_tool_count": len([tool for tool in tools if tool.get("external")]),
+        "sensitive_asset_count": len([asset for asset in assets if asset.get("sensitivity") in {"high", "critical", "secret"}]),
+        "high_risk_threat_count": len(high_risk_threats),
+        "mitigated_threat_count": len(mitigated_threats),
+        "unmitigated_threat_count": len(unmitigated_threats),
+        "high_risk_unmitigated_count": len(high_risk_unmitigated),
+        "categories": categories,
+        "present_categories": present_categories,
+        "missing_categories": missing_categories,
+        "controls": sorted(control.get("id") or control.get("name") for control in controls if control.get("id") or control.get("name")),
+        "present_controls": sorted(control.get("id") or control.get("name") for control in present if control.get("id") or control.get("name")),
+        "partial_controls": sorted(control.get("id") or control.get("name") for control in partial if control.get("id") or control.get("name")),
+        "missing_controls": sorted(control.get("id") or control.get("name") for control in missing if control.get("id") or control.get("name")),
+        "blocked_controls": sorted(control.get("id") or control.get("name") for control in blocked if control.get("id") or control.get("name")),
+        "threats": sorted(threat.get("id") or threat.get("name") for threat in threats if threat.get("id") or threat.get("name")),
+        "mitigated_threats": sorted(threat.get("id") or threat.get("name") for threat in mitigated_threats if threat.get("id") or threat.get("name")),
+        "unmitigated_threats": gap_threats,
+        "gaps": sorted({*gap_controls, *gap_threats}),
+        "has_identity": "identity" in present_category_set,
+        "has_permissions": "permissions" in present_category_set,
+        "has_sandbox": "sandbox" in present_category_set,
+        "has_audit": "audit" in present_category_set,
+        "has_canaries": "canaries" in present_category_set or bool(canaries),
+        "has_human_approval": "human_approval" in present_category_set,
+        "has_memory_isolation": "memory_isolation" in present_category_set,
+        "has_network_egress_controls": "network_egress" in present_category_set,
+        "has_tool_allowlist": "tool_allowlist" in present_category_set,
+        "has_data_boundary": "data_boundary" in present_category_set,
+        "has_secret_handling": "secret_handling" in present_category_set,
+    }
+
+
+def _agent_trust_boundary_signals(
+    actors: Sequence[Mapping[str, Any]],
+    assets: Sequence[Mapping[str, Any]],
+    tools: Sequence[Mapping[str, Any]],
+    surfaces: Sequence[Mapping[str, Any]],
+    controls: Sequence[Mapping[str, Any]],
+    canaries: Sequence[Mapping[str, Any]],
+    threats: Sequence[Mapping[str, Any]],
+    raw_signals: Any = None,
+) -> List[str]:
+    signals = {"agent_trust_boundary", "trust_boundary", "threat_model", "security"}
+    for signal in _as_iterable(raw_signals):
+        normalized = _normalize_agent_trust_boundary_key(signal)
+        if normalized:
+            signals.add(normalized)
+    for collection in (actors, assets, tools, surfaces, controls, canaries, threats):
+        for record in collection:
+            for signal in _as_iterable(record.get("signals")):
+                normalized = _normalize_agent_trust_boundary_key(signal)
+                if normalized:
+                    signals.add(normalized)
+            for key in ("id", "name", "type", "category", "status", "severity", "trust_level"):
+                normalized = _normalize_agent_trust_boundary_key(record.get(key))
+                if normalized:
+                    signals.add(normalized)
+    return sorted(signals)
+
+
+def _normalize_agent_trust_evidence(raw: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    return [
+        _normalize_framework_evidence(item)
+        for item in _as_iterable(raw.get("evidence") or raw.get("proof") or raw.get("examples"))
+    ]
+
+
+def _agent_trust_control_category(raw: Mapping[str, Any], control_id: str) -> str:
+    category = _normalize_agent_trust_boundary_category(
+        raw.get("category")
+        or raw.get("domain")
+        or raw.get("surface")
+        or raw.get("group")
+        or raw.get("control")
+        or ""
+    )
+    if category and category != "general":
+        return category
+    probe = " ".join(
+        str(item or "").lower()
+        for item in (control_id, raw.get("name"), raw.get("notes"), raw.get("reason"))
+    )
+    inference = (
+        ("identity", ("identity", "authn", "authentication", "principal", "actor")),
+        ("permissions", ("permission", "authorization", "rbac", "abac", "least_privilege", "least privilege")),
+        ("sandbox", ("sandbox", "isolation", "container", "runtime")),
+        ("audit", ("audit", "logging", "telemetry", "trace")),
+        ("canaries", ("canary", "honeytoken", "tripwire")),
+        ("human_approval", ("human", "approval", "hitl", "escalation")),
+        ("memory_isolation", ("memory", "session", "cross_trial", "tenant")),
+        ("network_egress", ("network", "egress", "dns", "internet")),
+        ("tool_allowlist", ("allowlist", "allow_list", "tool registry", "tool_registry")),
+        ("data_boundary", ("data boundary", "data_boundary", "pii", "tenant data")),
+        ("secret_handling", ("secret", "credential", "api_key", "api key")),
+    )
+    for inferred, tokens in inference:
+        if any(token in probe for token in tokens):
+            return inferred
+    return category or "general"
+
+
+def _agent_trust_control_status_from_record(raw: Mapping[str, Any]) -> str:
+    status = raw.get("status")
+    if status in (None, ""):
+        if raw.get("blocked") is True:
+            status = "blocked"
+        elif raw.get("present") is False or raw.get("implemented") is False or raw.get("available") is False:
+            status = "missing"
+        elif raw.get("partial") is True:
+            status = "partial"
+        elif raw.get("present") is True or raw.get("implemented") is True or raw.get("available") is True:
+            status = "present"
+        else:
+            status = "present"
+    return _normalize_agent_trust_boundary_status(status) or "present"
+
+
+def _find_agent_trust_control(
+    controls: Iterable[Mapping[str, Any]],
+    control_id: str,
+) -> Optional[Dict[str, Any]]:
+    query = _normalize_agent_trust_boundary_key(control_id)
+    if not query:
+        return None
+    for control in controls:
+        control_dict = copy.deepcopy(dict(control))
+        aliases = {
+            _normalize_agent_trust_boundary_key(control_dict.get("id")),
+            _normalize_agent_trust_boundary_key(control_dict.get("name")),
+            _normalize_agent_trust_boundary_key(control_dict.get("category")),
+        }
+        if query in aliases:
+            return control_dict
+    return None
+
+
+def _normalize_agent_trust_boundary_status(value: Any) -> str:
+    normalized = _normalize_agent_trust_boundary_key(value)
+    aliases = {
+        "yes": "present",
+        "true": "present",
+        "enabled": "present",
+        "implemented": "present",
+        "available": "present",
+        "pass": "present",
+        "passed": "present",
+        "success": "present",
+        "limited": "partial",
+        "degraded": "partial",
+        "planned": "partial",
+        "partial_mitigation": "partial",
+        "no": "missing",
+        "false": "missing",
+        "absent": "missing",
+        "unsupported": "missing",
+        "fail": "missing",
+        "failed": "missing",
+        "denied": "blocked",
+        "forbidden": "blocked",
+        "policy_blocked": "blocked",
+    }
+    normalized = aliases.get(normalized, normalized)
+    return normalized if normalized in {"present", "partial", "missing", "blocked"} else ""
+
+
+def _normalize_agent_trust_threat_status(value: Any) -> str:
+    normalized = _normalize_agent_trust_boundary_key(value)
+    aliases = {
+        "yes": "mitigated",
+        "true": "mitigated",
+        "covered": "mitigated",
+        "controlled": "mitigated",
+        "resolved": "mitigated",
+        "closed": "mitigated",
+        "limited": "partial",
+        "partially_mitigated": "partial",
+        "open": "unmitigated",
+        "uncovered": "unmitigated",
+        "uncontrolled": "unmitigated",
+        "missing": "unmitigated",
+        "no": "unmitigated",
+        "false": "unmitigated",
+    }
+    normalized = aliases.get(normalized, normalized)
+    return normalized if normalized in {"mitigated", "partial", "unmitigated"} else ""
+
+
+def _normalize_agent_trust_severity(value: Any) -> str:
+    normalized = _normalize_agent_trust_boundary_key(value)
+    aliases = {
+        "sev1": "critical",
+        "p0": "critical",
+        "blocker": "critical",
+        "severe": "critical",
+        "sev2": "high",
+        "p1": "high",
+        "important": "high",
+        "sev3": "medium",
+        "p2": "medium",
+        "moderate": "medium",
+        "sev4": "low",
+        "p3": "low",
+        "minor": "low",
+    }
+    normalized = aliases.get(normalized, normalized)
+    return normalized if normalized in {"low", "medium", "high", "critical"} else "medium"
+
+
+def _normalize_agent_trust_sensitivity(value: Any) -> str:
+    normalized = _normalize_agent_trust_boundary_key(value)
+    aliases = {
+        "p0": "critical",
+        "p1": "high",
+        "restricted": "critical",
+        "confidential": "high",
+        "credential": "secret",
+        "credentials": "secret",
+        "secrets": "secret",
+        "private": "high",
+        "internal": "medium",
+        "public": "low",
+    }
+    normalized = aliases.get(normalized, normalized)
+    return normalized if normalized in {"low", "medium", "high", "critical", "secret"} else "medium"
+
+
+def _normalize_agent_trust_boundary_category(value: Any) -> str:
+    normalized = _normalize_agent_trust_boundary_key(value)
+    aliases = {
+        "auth": "identity",
+        "authn": "identity",
+        "authentication": "identity",
+        "principal": "identity",
+        "principals": "identity",
+        "actor_identity": "identity",
+        "authorization": "permissions",
+        "access_control": "permissions",
+        "access_controls": "permissions",
+        "rbac": "permissions",
+        "abac": "permissions",
+        "least_privilege": "permissions",
+        "tool_permission": "permissions",
+        "tool_permissions": "permissions",
+        "runtime_isolation": "sandbox",
+        "container": "sandbox",
+        "containers": "sandbox",
+        "logs": "audit",
+        "logging": "audit",
+        "trace": "audit",
+        "tracing": "audit",
+        "telemetry": "audit",
+        "honeytoken": "canaries",
+        "honeytokens": "canaries",
+        "canary": "canaries",
+        "approval": "human_approval",
+        "approvals": "human_approval",
+        "hitl": "human_approval",
+        "human_in_the_loop": "human_approval",
+        "human_review": "human_approval",
+        "memory": "memory_isolation",
+        "session_memory": "memory_isolation",
+        "tenant_memory": "memory_isolation",
+        "network": "network_egress",
+        "egress": "network_egress",
+        "internet": "network_egress",
+        "allowlist": "tool_allowlist",
+        "tool_registry": "tool_allowlist",
+        "tool_allow_list": "tool_allowlist",
+        "data": "data_boundary",
+        "data_boundaries": "data_boundary",
+        "pii": "data_boundary",
+        "secret": "secret_handling",
+        "secrets": "secret_handling",
+        "credential": "secret_handling",
+        "credentials": "secret_handling",
+        "input_validation": "data_boundary",
+        "output_filtering": "data_boundary",
+    }
+    return aliases.get(normalized, normalized or "general")
+
+
+def _normalize_agent_trust_boundary_key(value: Any) -> str:
+    normalized = (
+        str(value or "")
+        .strip()
+        .lower()
+        .replace("-", "_")
+        .replace(" ", "_")
+        .replace(".", "_")
+        .replace("/", "_")
+        .replace(":", "_")
+    )
+    aliases = {
+        "tool_use": "tool_calling",
+        "function_call": "tool_calling",
+        "function_calling": "tool_calling",
+        "prompt_injection": "indirect_prompt_injection",
+        "indirect_prompt": "indirect_prompt_injection",
+        "credential_exfiltration": "secret_exfiltration",
+        "secrets_exfiltration": "secret_exfiltration",
+        "human_approval_gate": "human_approval",
+        "approval_gate": "human_approval",
+        "allow_list": "allowlist",
+        "deny_list": "denylist",
+        "api_key": "api_key",
     }
     return aliases.get(normalized, normalized)
 
