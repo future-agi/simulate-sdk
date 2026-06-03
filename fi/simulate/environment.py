@@ -3442,6 +3442,242 @@ class AdversarialEnvironmentPack(EnvironmentAdapter):
         return "\n\n".join(str(attack.get("payload") or self.payload) for attack in attacks)
 
 
+def normalize_world_attack_replay(
+    *,
+    world_contract: Optional[Mapping[str, Any]] = None,
+    attack_pack: Optional[Mapping[str, Any]] = None,
+    state: Optional[Mapping[str, Any]] = None,
+    metadata: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Normalize a combined world-contract plus adversarial replay payload."""
+
+    world = _coerce_plain_dict(world_contract)
+    if world and str(world.get("kind") or "") != "world_contract":
+        world = normalize_world_contract(
+            name=str(world.get("name") or world.get("id") or "world"),
+            actors=_as_iterable(world.get("actors")),
+            resources=_as_iterable(world.get("resources")),
+            transitions=_as_iterable(world.get("transitions")),
+            invariants=_as_iterable(world.get("invariants")),
+            success_conditions=_as_iterable(world.get("success_conditions") or world.get("success")),
+            policy_gates=_as_iterable(world.get("policy_gates") or world.get("policies")),
+            adversarial_surfaces=_as_iterable(world.get("adversarial_surfaces") or world.get("surfaces")),
+            initial_state=_as_mapping(world.get("initial_state") or world.get("state")),
+            metadata=_as_mapping(world.get("metadata")),
+        )
+    attack = _coerce_plain_dict(attack_pack)
+    if attack and str(attack.get("kind") or "") != "adversarial_attack_pack":
+        attack = normalize_adversarial_attack_pack(
+            attacks=_as_iterable(attack.get("attacks") or attack.get("attack_cases")),
+            surfaces=[str(surface) for surface in _as_iterable(attack.get("surfaces"))],
+            payload=attack.get("payload"),
+            canaries=attack.get("canaries") or attack.get("canary_secrets"),
+            blocked_tools=[str(tool) for tool in _as_iterable(attack.get("blocked_tools"))],
+            metadata=_as_mapping(attack.get("metadata")),
+        )
+    state_payload = _coerce_plain_dict(state)
+    signals = {
+        "world_attack_replay",
+        "world_contract",
+        "adversarial_attack_pack",
+        *(_as_iterable(world.get("signals")) if world else []),
+        *(_as_iterable(attack.get("signals")) if attack else []),
+    }
+    world_summary = _as_mapping(world.get("summary")) if world else {}
+    attack_summary = _as_mapping(attack.get("summary")) if attack else {}
+    return {
+        "kind": "world_attack_replay",
+        "world_contract": world,
+        "attack_pack": attack,
+        "state": state_payload,
+        "signals": sorted(_normalize_world_contract_key(signal) for signal in signals if signal),
+        "summary": {
+            "world_name": world.get("name") if world else None,
+            "world_terminal_status": world_summary.get("terminal_status"),
+            "completed_required_transition_count": world_summary.get("completed_required_transition_count"),
+            "required_transition_count": world_summary.get("required_transition_count"),
+            "invariant_violation_count": world_summary.get("invariant_violation_count"),
+            "attack_count": attack_summary.get("attack_count", 0),
+            "surface_count": attack_summary.get("surface_count", 0),
+            "canary_count": attack_summary.get("canary_count", 0),
+            "blocked_tool_count": attack_summary.get("blocked_tool_count", 0),
+        },
+        "metadata": copy.deepcopy(dict(metadata or {})),
+    }
+
+
+def load_world_attack_replay(
+    source: str | Mapping[str, Any],
+    *,
+    headers: Optional[Mapping[str, str]] = None,
+    timeout: float = 30.0,
+) -> "WorldAttackReplayEnvironment":
+    """Load a portable world-attack replay export into a local environment."""
+
+    data = (
+        copy.deepcopy(dict(source))
+        if isinstance(source, Mapping)
+        else _load_framework_trace_export_source(source, headers=headers, timeout=timeout)
+    )
+    if not isinstance(data, Mapping):
+        raise TypeError("World attack replay export must be a mapping")
+    return WorldAttackReplayEnvironment(
+        world_contract=data.get("world_contract") or data.get("contract") or data.get("world"),
+        attack_pack=data.get("attack_pack") or data.get("adversarial") or data.get("attacks"),
+        metadata=_as_mapping(data.get("metadata")),
+    )
+
+
+class WorldAttackReplayEnvironment(EnvironmentAdapter):
+    """
+    Combined world-contract and adversarial attack-pack replay environment.
+
+    Use this when a simulation should verify both state-machine progress and
+    resilience to hostile environment content in the same local replay.
+    """
+
+    name = "world_attack_replay"
+
+    def __init__(
+        self,
+        *,
+        world_contract: Optional[Mapping[str, Any] | WorldContractEnvironment] = None,
+        attack_pack: Optional[Mapping[str, Any]] = None,
+        include_blocked_tools: bool = True,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        self.world = (
+            world_contract
+            if isinstance(world_contract, WorldContractEnvironment)
+            else load_world_contract(world_contract or {"name": "world"})
+        )
+        normalized_attack = load_adversarial_attack_pack(attack_pack or {})
+        self.adversarial = AdversarialEnvironmentPack(
+            attacks=normalized_attack["attacks"],
+            surfaces=normalized_attack["surfaces"],
+            canaries=normalized_attack["canaries"],
+            blocked_tools=normalized_attack["blocked_tools"],
+            include_blocked_tools=include_blocked_tools,
+            metadata=normalized_attack.get("metadata", {}),
+        )
+        self.metadata = copy.deepcopy(dict(metadata or {}))
+        self.state: Dict[str, Any] = {}
+
+    def reset(self, **context: Any) -> EnvironmentSnapshot:
+        self.state = {}
+        world_snapshot = self.world.reset(**context)
+        adversarial_snapshot = self.adversarial.reset(**context)
+        snapshot = _merge_environment_snapshots(world_snapshot, adversarial_snapshot)
+        _deep_merge(self.state, snapshot.state)
+        return _merge_environment_snapshots(snapshot, self._snapshot("world_attack_replay_ready"))
+
+    def observe(self, **context: Any) -> EnvironmentSnapshot:
+        snapshot = _merge_environment_snapshots(
+            self.world.observe(**context),
+            self.adversarial.observe(**context),
+        )
+        _deep_merge(self.state, snapshot.state)
+        return _merge_environment_snapshots(snapshot, self._snapshot("world_attack_replay_observed", include_event=False))
+
+    def handle_tool_call(
+        self,
+        tool_call: Mapping[str, Any],
+        **context: Any,
+    ) -> Optional[ToolExecutionResult]:
+        name = _tool_name(tool_call)
+        if name == "world_attack_replay_status":
+            payload = self._payload()
+            return ToolExecutionResult(
+                tool_call_id=_tool_call_id(tool_call),
+                tool_name="world_attack_replay_status",
+                content="World attack replay status recorded.",
+                result=payload,
+                success=True,
+                state_updates={"world_attack_replay": payload},
+                artifacts=[self._artifact()],
+                events=[
+                    SimulationEvent(
+                        type="world_attack_replay",
+                        name="world_attack_replay_status",
+                        payload=payload,
+                    )
+                ],
+            )
+
+        result = self.world.handle_tool_call(tool_call, **context)
+        if result is None:
+            result = self.adversarial.handle_tool_call(tool_call, **context)
+        if result is None:
+            return None
+
+        _deep_merge(self.state, result.state_updates)
+        payload = self._payload()
+        merged_updates = copy.deepcopy(result.state_updates)
+        merged_updates["world_attack_replay"] = payload
+        result.state_updates = merged_updates
+        result.artifacts.append(self._artifact())
+        result.events.append(
+            SimulationEvent(
+                type="world_attack_replay",
+                name=f"{result.tool_name}_world_attack_replay_update",
+                payload=payload,
+            )
+        )
+        return result
+
+    def _snapshot(self, name: str, *, include_event: bool = True) -> EnvironmentSnapshot:
+        payload = self._payload()
+        tools = [
+            {
+                "name": "world_attack_replay_status",
+                "description": "Return the combined world contract, adversarial attack pack, current state, and replay summary.",
+                "parameters": {"type": "object", "properties": {}},
+            }
+        ]
+        events = []
+        if include_event:
+            events.append(
+                SimulationEvent(
+                    type="world_attack_replay",
+                    name=name,
+                    payload=payload,
+                )
+            )
+        return EnvironmentSnapshot(
+            tools=tools,
+            artifacts=[self._artifact()],
+            events=events,
+            state={"world_attack_replay": payload},
+            metadata={"world_attack_replay": payload},
+        )
+
+    def _artifact(self) -> SimulationArtifact:
+        return SimulationArtifact(
+            type="trace",
+            role="environment",
+            data=self._payload(),
+            metadata={"kind": "world_attack_replay"},
+        )
+
+    def _payload(self) -> Dict[str, Any]:
+        world_payload = _coerce_plain_dict(self.state.get("world_contract"))
+        if not world_payload:
+            world_payload = _coerce_plain_dict(getattr(self.world, "_state_payload")())
+        adversarial_payload = _coerce_plain_dict(self.state.get("adversarial"))
+        attack_pack = _coerce_plain_dict(adversarial_payload.get("attack_pack")) or copy.deepcopy(
+            self.adversarial.attack_pack
+        )
+        return normalize_world_attack_replay(
+            world_contract=world_payload,
+            attack_pack=attack_pack,
+            state={
+                "world_contract": world_payload,
+                "adversarial": adversarial_payload,
+            },
+            metadata=self.metadata,
+        )
+
+
 class RetrievalMemoryEnvironment(EnvironmentAdapter):
     """Local retrieval and memory environment with citation/attribution trace evidence."""
 
@@ -5930,6 +6166,27 @@ def coerce_environment_adapters(
     if isinstance(environment, EnvironmentAdapter):
         return [environment]
     return list(environment)
+
+
+def _merge_environment_snapshots(*snapshots: EnvironmentSnapshot) -> EnvironmentSnapshot:
+    tools: List[Dict[str, Any]] = []
+    artifacts: List[SimulationArtifact] = []
+    events: List[SimulationEvent] = []
+    state: Dict[str, Any] = {}
+    metadata: Dict[str, Any] = {}
+    for snapshot in snapshots:
+        tools.extend(copy.deepcopy(snapshot.tools))
+        artifacts.extend(copy.deepcopy(snapshot.artifacts))
+        events.extend(copy.deepcopy(snapshot.events))
+        _deep_merge(state, snapshot.state)
+        _deep_merge(metadata, snapshot.metadata)
+    return EnvironmentSnapshot(
+        tools=tools,
+        artifacts=artifacts,
+        events=events,
+        state=state,
+        metadata=metadata,
+    )
 
 
 def _coerce_tool_result(
