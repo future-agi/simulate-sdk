@@ -270,7 +270,8 @@ See [`examples/local_multimodal_simulation.py`](examples/local_multimodal_simula
 
 Use environment adapters when the agent needs a world to act on: mocked APIs,
 transient tool/API faults, browser/CUA state, voice turns, image fixtures,
-files, framework traces, orchestration graph traces, or multi-agent handoffs.
+files, framework traces, streaming/session traces, orchestration graph traces,
+or multi-agent handoffs.
 Browser adapters can emit DOM snapshots, screenshots, coordinate-region
 assertions, screenshot/action diff evidence, prompt-injection surfaces, action
 replay, console/network logs, HAR/resource-body replay, OpenAI Computer Use and
@@ -295,6 +296,11 @@ turn, and termination evidence from exported framework transcripts.
 Orchestration trace adapters project arbitrary runtime records into portable
 workflow graph evidence: nodes, edges/routes, steps, retries, recovery,
 latency, cost, terminal status, and state.
+Streaming trace adapters replay incremental chunks, tool-call deltas,
+interruptions, drops/backpressure, first-token latency, inter-chunk gaps, usage,
+finalization, and state from LangChain/LangGraph stream modes, OpenAI Agents
+stream events, LiveKit session events, Pipecat frames, OpenTelemetry GenAI
+attributes, or custom runtimes.
 Adversarial packs add hostile retrieved context,
 file content, browser DOM, and memory-like context for indirect prompt-injection
 tests. The local engine exposes environment tools through `AgentInput.tools`,
@@ -318,6 +324,7 @@ from fi.simulate import (
     MultiAgentRoomEnvironment,
     OrchestrationTraceEnvironment,
     RetrievalMemoryEnvironment,
+    StreamingTraceEnvironment,
     StructuredArtifactEnvironment,
     ToolFaultInjectionEnvironment,
     ToolMockEnvironment,
@@ -326,12 +333,14 @@ from fi.simulate import (
     load_browser_trace_export,
     load_framework_trace_export,
     load_orchestration_trace_export,
+    load_streaming_trace_export,
     load_autogen_groupchat_transcript,
     load_crewai_event_log,
     load_openai_agents_trace,
     load_langchain_event_stream,
     load_langgraph_event_stream,
     normalize_orchestration_trace_events,
+    normalize_streaming_trace_events,
     normalize_framework_trace_events,
     normalize_browser_trace_export,
 )
@@ -373,6 +382,18 @@ report = await TestRunner().run_test(
                 {"name": "policy_agent retry succeeded", "node": "policy_agent", "attempt": 2, "recovered": True},
             ],
             state={"case": {"status": "resolved"}},
+        ),
+        StreamingTraceEnvironment(
+            framework="mixed-realtime",
+            events=[
+                {"type": "messages", "delta": "Refund ", "latency_ms": 120},
+                {"type": "raw_response_event", "tool_call_chunks": [{"name": "lookup_order"}]},
+                {"event": "user_interruption_detected"},
+                {"event": "agent_false_interruption", "status": "resumed"},
+                {"type": "messages", "delta": "approved.", "gap_ms": 18},
+                {"event": "response.completed", "status": "completed"},
+            ],
+            state={"response": {"status": "completed"}},
         ),
         load_langgraph_event_stream({
             "events": [
@@ -482,6 +503,9 @@ environment = FrameworkTraceEnvironment.from_export(framework="traceai", export=
 # LangChain/LangGraph stream_events replay:
 environment = load_langgraph_event_stream({"events": langgraph_stream_events})
 
+# Framework-neutral streaming/session trace replay:
+environment = load_streaming_trace_export({"events": streaming_events})
+
 # Multi-agent framework transcript replay:
 environment = load_autogen_groupchat_transcript({"events": autogen_groupchat_events})
 environment = load_crewai_event_log("crewai-events.jsonl")
@@ -501,6 +525,7 @@ See [`examples/local_voice_media_decode.py`](examples/local_voice_media_decode.p
 See [`examples/local_framework_trace_replay.py`](examples/local_framework_trace_replay.py) for a framework trace replay cookbook with native spans/events and TraceAI/OpenTelemetry export payloads from orchestration frameworks.
 See [`examples/local_langgraph_event_stream_replay.py`](examples/local_langgraph_event_stream_replay.py) for a LangGraph/LangChain event-stream replay cookbook with message/tool/state projections and transcript-quality scoring.
 See [`examples/local_orchestration_graph_trace.py`](examples/local_orchestration_graph_trace.py) for a framework-neutral workflow graph cookbook with nodes, routes, retries, recovery, latency/cost budgets, terminal status, and state checks.
+See [`examples/local_streaming_trace_replay.py`](examples/local_streaming_trace_replay.py) for a framework-neutral streaming/session trace cookbook with chunks, tool deltas, interruption recovery, drops, latency, gaps, usage, finalization, and state checks.
 See [`examples/local_cross_trial_memory_skill.py`](examples/local_cross_trial_memory_skill.py) for a LangGraph/LangChain-style memory and skill replay cookbook with cross-trial memory precision/recall, recall-after-write, persistence, and skill-regression scoring.
 See [`examples/local_multi_agent_framework_transcript.py`](examples/local_multi_agent_framework_transcript.py) for an AutoGen/CrewAI/OpenAI Agents-style multi-agent transcript replay cookbook with speaker, handoff, tool-owner, turn, and termination scoring.
 See [`examples/local_retrieval_memory_attribution.py`](examples/local_retrieval_memory_attribution.py) for a retrieval/memory attribution cookbook with queries, ranked documents, retrieval scores, citations, memory reads/writes, and freshness evidence.
@@ -697,6 +722,18 @@ evaluation = evaluate_agent_report(
             "required_terminal_status": "success",
             "expected_state": {"case": {"status": "resolved"}},
         },
+        "required_streaming_trace": ["stream", "chunk", "tool_delta", "interruption", "recovered", "drop", "latency", "gap", "usage", "final", "state"],
+        "streaming_trace_quality": {
+            "expected_output_contains": ["refund approved"],
+            "expected_chunk_sequence": ["Refund ", "approved."],
+            "expected_tool_deltas": [{"name": "lookup_order", "arguments": {"order_id": "ord_123"}}],
+            "max_first_token_latency_ms": 200,
+            "max_gap_ms": 50,
+            "max_dropped_events": 1,
+            "require_completion": True,
+            "require_interruption_recovery": True,
+            "expected_state": {"response": {"status": "completed"}},
+        },
         "framework_transcript_quality": {
             "required_event_methods": ["messages", "tools", "updates"],
             "required_nodes": ["support_agent", "policy_node"],
@@ -816,7 +853,7 @@ Traces from simulations flow into `Monitor`, scores flow into `Evaluate`, and fa
 - [x] OpenAI / Anthropic / Gemini / LangChain wrappers
 - [x] Generic framework adapter presets
 - [x] Multimodal artifacts + event trajectories
-- [x] Local environment adapters for mocked tools/APIs, framework trace replay with TraceAI/OpenTelemetry export ingestion, LangChain/LangGraph event-stream replay with memory/skill trace normalization, orchestration graph traces with route/retry/recovery/budget evidence, AutoGen/CrewAI/OpenAI Agents-style multi-agent transcript replay, structured artifact fixtures, retrieval/memory attribution, autonomy-loop traces, multi-agent handoff traces, browser/CUA trace replay with Playwright trace/video import, HAR/resource bodies, OpenAI Computer Use and Browser Use trace import, actionability timelines, coordinate regions, image-derived pixel screenshot diffs, semantic/masked visual-diff regions, storage-state/runtime/performance capture, layout-shift distributions, stale-screenshot and layout-shift perturbations, voice frame replay/routing/noise/overlap/export replay/waveform/diarization/perceptual metrics/local WAV and PCM media decoding, images, files, adversarial packs, and multi-agent rooms
+- [x] Local environment adapters for mocked tools/APIs, framework trace replay with TraceAI/OpenTelemetry export ingestion, LangChain/LangGraph event-stream replay with memory/skill trace normalization, streaming/session trace replay with chunk/tool-delta/interruption/finalization evidence, orchestration graph traces with route/retry/recovery/budget evidence, AutoGen/CrewAI/OpenAI Agents-style multi-agent transcript replay, structured artifact fixtures, retrieval/memory attribution, autonomy-loop traces, multi-agent handoff traces, browser/CUA trace replay with Playwright trace/video import, HAR/resource bodies, OpenAI Computer Use and Browser Use trace import, actionability timelines, coordinate regions, image-derived pixel screenshot diffs, semantic/masked visual-diff regions, storage-state/runtime/performance capture, layout-shift distributions, stale-screenshot and layout-shift perturbations, voice frame replay/routing/noise/overlap/export replay/waveform/diarization/perceptual metrics/local WAV and PCM media decoding, images, files, adversarial packs, and multi-agent rooms
 - [x] Deterministic synthetic data generator
 - [x] Self-contained synthetic tool-world generator with schemas, mocks, state expectations, and evaluator config
 - [x] Self-contained synthetic trajectory-template generator with ordered tool calls, policy, browser action safety, memory correctness, state, and multimodal faithfulness expectations
@@ -824,7 +861,7 @@ Traces from simulations flow into `Monitor`, scores flow into `Evaluate`, and fa
 - [x] Per-speaker + combined audio capture
 - [x] Scenario auto-generation from a topic
 - [x] `evaluate_report` integration with `ai-evaluation`
-- [x] Local `evaluate_agent_report` scoring for trajectory, trajectory templates, agent goal accuracy, tool-call accuracy/F1, policy adherence, tools, memory correctness, multimodal faithfulness, framework trace coverage, framework transcript quality, orchestration trace coverage/flow quality, cross-trial memory/skill quality, retrieval/memory attribution, source contradiction, artifact grounding quality, artifact semantics quality, autonomy-loop coverage, autonomy-loop quality, multi-agent trace coverage, multi-agent coordination quality, browser/CUA action outcome and grounding quality, browser trace coverage, voice trace coverage, voice interaction quality, environment injection, and pentest signals
+- [x] Local `evaluate_agent_report` scoring for trajectory, trajectory templates, agent goal accuracy, tool-call accuracy/F1, policy adherence, tools, memory correctness, multimodal faithfulness, framework trace coverage, framework transcript quality, orchestration trace coverage/flow quality, streaming trace coverage/interaction quality, cross-trial memory/skill quality, retrieval/memory attribution, source contradiction, artifact grounding quality, artifact semantics quality, autonomy-loop coverage, autonomy-loop quality, multi-agent trace coverage, multi-agent coordination quality, browser/CUA action outcome and grounding quality, browser trace coverage, voice trace coverage, voice interaction quality, environment injection, and pentest signals
 - [x] Tool-call capture in wrapper responses
 
 </td>

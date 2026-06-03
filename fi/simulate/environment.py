@@ -12,7 +12,7 @@ import wave
 import zipfile
 import zlib
 from abc import ABC
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence
 from urllib.parse import unquote, urlparse
 
 from pydantic import BaseModel, Field
@@ -3750,6 +3750,363 @@ def load_orchestration_trace_export(
     )
 
 
+class StreamingTraceEnvironment(EnvironmentAdapter):
+    """
+    Replay framework-neutral streaming/session events as simulation evidence.
+
+    Use this for LangChain/LangGraph stream chunks, OpenAI Agents streaming
+    events, LiveKit AgentSession events, Pipecat frames, OpenTelemetry GenAI
+    streaming attributes, or custom runtimes that emit incremental output.
+    """
+
+    name = "streaming_trace"
+
+    def __init__(
+        self,
+        *,
+        framework: str,
+        events: Optional[Iterable[str | Mapping[str, Any]]] = None,
+        trace_export: Optional[Any] = None,
+        export_source: Optional[str | os.PathLike[str]] = None,
+        export_headers: Optional[Mapping[str, str]] = None,
+        export_timeout: float = 30.0,
+        state: Optional[Mapping[str, Any]] = None,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        self.framework = str(framework)
+        export_events: List[Dict[str, Any]] = []
+        export_metadata: Dict[str, Any] = {}
+        if export_source is not None:
+            loaded_export = _load_framework_trace_export_source(
+                export_source,
+                headers=export_headers,
+                timeout=export_timeout,
+            )
+            export_trace = normalize_streaming_trace_export(loaded_export, framework=self.framework)
+            export_events.extend(_as_iterable(export_trace.get("events")))
+            export_metadata["export_source"] = _framework_trace_source_label(export_source)
+        if trace_export is not None:
+            export_trace = normalize_streaming_trace_export(trace_export, framework=self.framework)
+            export_events.extend(_as_iterable(export_trace.get("events")))
+        inline_trace = normalize_streaming_trace_events(
+            self.framework,
+            events or [],
+        )
+        self.initial_events = export_events + _as_iterable(inline_trace.get("events"))
+        self.initial_state = copy.deepcopy(dict(state or {}))
+        self.metadata = copy.deepcopy(dict(metadata or {}))
+        if export_metadata:
+            self.metadata.setdefault("streaming_export", {}).update(export_metadata)
+        self.events: List[Dict[str, Any]] = []
+        self.state = copy.deepcopy(self.initial_state)
+
+    @classmethod
+    def from_export(
+        cls,
+        *,
+        framework: str = "streaming",
+        export: Optional[Any] = None,
+        source: Optional[str | os.PathLike[str]] = None,
+        headers: Optional[Mapping[str, str]] = None,
+        timeout: float = 30.0,
+        state: Optional[Mapping[str, Any]] = None,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> "StreamingTraceEnvironment":
+        return cls(
+            framework=framework,
+            trace_export=export,
+            export_source=source,
+            export_headers=headers,
+            export_timeout=timeout,
+            state=state,
+            metadata=metadata,
+        )
+
+    def reset(self, **context: Any) -> EnvironmentSnapshot:
+        self.events = copy.deepcopy(self.initial_events)
+        self.state = copy.deepcopy(self.initial_state)
+        trace_events = [
+            SimulationEvent(
+                type="streaming_trace_event",
+                name=str(event.get("type") or "stream_event"),
+                payload=copy.deepcopy(event),
+            )
+            for event in self.events
+        ]
+        return EnvironmentSnapshot(
+            tools=self._tool_specs(),
+            artifacts=[self._trace_artifact()],
+            events=[
+                SimulationEvent(
+                    type="streaming_trace",
+                    name="streaming_trace_ready",
+                    payload={
+                        "framework": self.framework,
+                        "event_count": len(self.events),
+                        "signals": sorted(self._observed_signals()),
+                        "summary": _streaming_trace_summary(self.events),
+                    },
+                ),
+                *trace_events,
+            ],
+            state={"streaming_trace": self._state_payload()},
+            metadata={
+                "streaming_trace": {
+                    "framework": self.framework,
+                    "event_count": len(self.events),
+                    "signals": sorted(self._observed_signals()),
+                    "summary": _streaming_trace_summary(self.events),
+                }
+            },
+        )
+
+    def handle_tool_call(
+        self,
+        tool_call: Mapping[str, Any],
+        **context: Any,
+    ) -> Optional[ToolExecutionResult]:
+        name = _tool_name(tool_call)
+        if name not in {"streaming_trace_status", "list_stream_events", "inspect_stream_event"}:
+            return None
+        arguments = _tool_arguments(tool_call)
+        call_id = _tool_call_id(tool_call)
+
+        if name == "streaming_trace_status":
+            result = self._trace_payload()
+            event_name = "streaming_trace_status"
+            content = f"{self.framework} streaming trace status recorded."
+        elif name == "list_stream_events":
+            signal = _normalize_streaming_trace_key(arguments.get("signal") or arguments.get("kind") or "")
+            event_type = _normalize_streaming_trace_key(arguments.get("type") or "")
+            source = str(arguments.get("source") or "").strip().lower()
+            role = str(arguments.get("role") or "").strip().lower()
+            events = [*self.events]
+            if signal:
+                events = [event for event in events if signal in set(event.get("signals", []))]
+            if event_type:
+                events = [
+                    event
+                    for event in events
+                    if event_type == _normalize_streaming_trace_key(event.get("type"))
+                ]
+            if source:
+                events = [
+                    event
+                    for event in events
+                    if source in str(event.get("source") or "").lower()
+                ]
+            if role:
+                events = [
+                    event
+                    for event in events
+                    if role == str(event.get("role") or "").lower()
+                ]
+            result = {"framework": self.framework, "events": copy.deepcopy(events)}
+            event_name = "streaming_events_listed"
+            content = f"Listed {len(events)} {self.framework} streaming event(s)."
+        else:
+            event_id = str(
+                arguments.get("id")
+                or arguments.get("event_id")
+                or arguments.get("sequence")
+                or arguments.get("type")
+                or ""
+            )
+            event = _find_streaming_event(self.events, event_id)
+            success = event is not None
+            result = {"framework": self.framework, "event": copy.deepcopy(event), "query": event_id}
+            event_name = "streaming_event_inspected" if success else "streaming_event_missing"
+            content = f"Inspected streaming event {event_id}." if success else f"Streaming event not found: {event_id}"
+            return ToolExecutionResult(
+                tool_call_id=call_id,
+                tool_name=name,
+                content=content,
+                result=result,
+                success=success,
+                error=None if success else "event_not_found",
+                state_updates={"streaming_trace": self._state_payload()},
+                artifacts=[self._trace_artifact()],
+                events=[
+                    SimulationEvent(
+                        type="streaming_trace",
+                        name=event_name,
+                        payload=result,
+                    )
+                ],
+            )
+
+        return ToolExecutionResult(
+            tool_call_id=call_id,
+            tool_name=name,
+            content=content,
+            result=result,
+            state_updates={"streaming_trace": self._state_payload()},
+            artifacts=[self._trace_artifact()],
+            events=[
+                SimulationEvent(
+                    type="streaming_trace",
+                    name=event_name,
+                    payload=result,
+                )
+            ],
+        )
+
+    def _tool_specs(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                "name": "streaming_trace_status",
+                "description": "Return normalized streaming trace events, summary, and observed signals.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            {
+                "name": "list_stream_events",
+                "description": "List normalized streaming events, optionally filtered by signal, type, source, or role.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "signal": {"type": "string"},
+                        "type": {"type": "string"},
+                        "source": {"type": "string"},
+                        "role": {"type": "string"},
+                    },
+                },
+            },
+            {
+                "name": "inspect_stream_event",
+                "description": "Inspect one streaming event by id, event_id, sequence, or type.",
+                "parameters": {"type": "object", "properties": {"id": {"type": "string"}}},
+            },
+        ]
+
+    def _trace_artifact(self) -> SimulationArtifact:
+        return SimulationArtifact(
+            type="trace",
+            role="environment",
+            data=self._trace_payload(),
+            metadata={"kind": "streaming_trace", "framework": self.framework},
+        )
+
+    def _trace_payload(self) -> Dict[str, Any]:
+        trace = normalize_streaming_trace_events(
+            self.framework,
+            self.events,
+            state=self.state,
+            metadata=self.metadata,
+        )
+        trace["metadata"] = copy.deepcopy(self.metadata)
+        return trace
+
+    def _state_payload(self) -> Dict[str, Any]:
+        return self._trace_payload()
+
+    def _observed_signals(self) -> set[str]:
+        signals: set[str] = set()
+        for event in self.events:
+            signals.update(event.get("signals", []))
+        return signals
+
+
+def normalize_streaming_trace_events(
+    framework: str,
+    records: Iterable[Any],
+    *,
+    state: Optional[Mapping[str, Any]] = None,
+    metadata: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Normalize incremental streaming/session records into one replayable trace.
+
+    Supported inputs include token chunks, tool-call deltas, LiveKit session
+    events, Pipecat frames, OpenAI Agents stream events, LangChain/LangGraph
+    stream modes, OpenTelemetry span/event dictionaries, and custom records.
+    """
+
+    normalized_events = [
+        _normalize_streaming_event(record, framework=str(framework), sequence=index + 1)
+        for index, record in enumerate(records)
+    ]
+    signals = _streaming_trace_signals(normalized_events)
+    summary = _streaming_trace_summary(normalized_events)
+    return {
+        "kind": "streaming_trace",
+        "framework": str(framework),
+        "events": normalized_events,
+        "chunks": [
+            copy.deepcopy(event)
+            for event in normalized_events
+            if "chunk" in set(event.get("signals", []))
+        ],
+        "tool_deltas": [
+            copy.deepcopy(event)
+            for event in normalized_events
+            if "tool_delta" in set(event.get("signals", []))
+        ],
+        "interruptions": [
+            copy.deepcopy(event)
+            for event in normalized_events
+            if "interruption" in set(event.get("signals", []))
+        ],
+        "signals": sorted(signals),
+        "summary": summary,
+        "state": copy.deepcopy(dict(state or {})),
+        "metadata": copy.deepcopy(dict(metadata or {})),
+    }
+
+
+def normalize_streaming_trace_export(
+    trace_export: Any,
+    *,
+    framework: str = "streaming",
+) -> Dict[str, Any]:
+    """Normalize a wrapped JSON/JSONL streaming export into a streaming trace."""
+
+    export_dict = _coerce_plain_dict(trace_export)
+    export_framework = str(export_dict.get("framework") or export_dict.get("provider") or framework)
+    state = _coerce_plain_dict(export_dict.get("state"))
+    metadata = _coerce_plain_dict(export_dict.get("metadata"))
+    if not metadata and export_dict:
+        metadata = {
+            key: copy.deepcopy(value)
+            for key, value in export_dict.items()
+            if key not in {"events", "stream_events", "records", "items", "chunks", "frames", "data", "state"}
+            and value not in (None, "", [], {})
+        }
+    return normalize_streaming_trace_events(
+        export_framework,
+        _streaming_trace_export_records(trace_export),
+        state=state,
+        metadata=metadata,
+    )
+
+
+def load_streaming_trace_export(
+    source: str | os.PathLike[str] | Mapping[str, Any] | Iterable[Any],
+    *,
+    framework: str = "streaming",
+    headers: Optional[Mapping[str, str]] = None,
+    timeout: float = 30.0,
+    state: Optional[Mapping[str, Any]] = None,
+    metadata: Optional[Mapping[str, Any]] = None,
+) -> StreamingTraceEnvironment:
+    """Load a local/HTTP streaming export and return a replay environment."""
+
+    if isinstance(source, (str, os.PathLike)):
+        return StreamingTraceEnvironment.from_export(
+            framework=framework,
+            source=source,
+            headers=headers,
+            timeout=timeout,
+            state=state,
+            metadata=metadata,
+        )
+    return StreamingTraceEnvironment.from_export(
+        framework=framework,
+        export=source,
+        state=state,
+        metadata=metadata,
+    )
+
+
 class AutonomyLoopEnvironment(EnvironmentAdapter):
     """
     Local autonomy-loop harness for observe/orient/plan/act/verify/reflect traces.
@@ -5733,6 +6090,627 @@ def _find_framework_span(
         if span_id in {str(span.get("id")), str(span.get("span_id")), str(span.get("name"))}:
             return span
     return None
+
+
+def _streaming_trace_export_records(trace_export: Any) -> List[Any]:
+    if trace_export is None:
+        return []
+    if isinstance(trace_export, str):
+        stripped = trace_export.strip()
+        if not stripped:
+            return []
+        try:
+            parsed = json.loads(stripped)
+            return _streaming_trace_export_records(parsed)
+        except json.JSONDecodeError:
+            return [{"type": "chunk", "delta": trace_export}]
+    if isinstance(trace_export, Mapping):
+        export = _coerce_plain_dict(trace_export)
+        if export.get("kind") == "streaming_trace" and isinstance(export.get("events"), list):
+            return list(export.get("events") or [])
+        records: List[Any] = []
+        for key in ("events", "stream_events", "records", "items", "chunks", "frames"):
+            if key in export:
+                records.extend(_streaming_trace_export_records(export.get(key)))
+        if records:
+            return records
+        if _looks_like_streaming_record(export):
+            return [export]
+        data = export.get("data")
+        if data is not None and data is not export:
+            records.extend(_streaming_trace_export_records(data))
+        if records:
+            return records
+        return [export]
+    if isinstance(trace_export, Iterable):
+        records = []
+        for item in trace_export:
+            records.extend(_streaming_trace_export_records(item))
+        return records
+    return [trace_export]
+
+
+def _looks_like_streaming_record(export: Mapping[str, Any]) -> bool:
+    return any(
+        key in export
+        for key in (
+            "id",
+            "event_id",
+            "type",
+            "event",
+            "kind",
+            "frame_type",
+            "frame",
+            "delta",
+            "content",
+            "text",
+            "tool_call",
+            "tool_calls",
+            "tool_call_chunks",
+            "timestamp_ms",
+            "timestamp",
+            "latency_ms",
+            "gap_ms",
+        )
+    )
+
+
+def _normalize_streaming_event(record: Any, *, framework: str, sequence: int) -> Dict[str, Any]:
+    if isinstance(record, str):
+        raw: Dict[str, Any] = {"type": "chunk", "delta": record}
+    else:
+        raw = _coerce_plain_dict(record)
+        if not raw:
+            raw = {"type": "event", "value": copy.deepcopy(record)}
+
+    data = _coerce_plain_dict(raw.get("data"))
+    payload = _coerce_plain_dict(raw.get("payload"))
+    metadata = _coerce_plain_dict(raw.get("metadata"))
+    attributes = _coerce_plain_dict(raw.get("attributes") or raw.get("attrs"))
+    chunk = _coerce_plain_dict(raw.get("chunk") or data.get("chunk") or payload.get("chunk"))
+    delta_payload = _coerce_plain_dict(raw.get("delta") or data.get("delta") or payload.get("delta"))
+    sources = (raw, data, payload, chunk, delta_payload, attributes, metadata)
+
+    event_type = _streaming_event_type(raw, data, payload, chunk, delta_payload)
+    role = _streaming_value_from_sources(sources, ("role", "message.role", "delta.role", "chunk.role"))
+    source = _streaming_value_from_sources(
+        sources,
+        ("source", "processor", "node", "agent", "provider", "model", "name", "span_name"),
+    )
+    timestamp_ms = _streaming_timestamp_ms(sources)
+    latency_ms = _streaming_latency_ms(sources)
+    gap_ms = _streaming_numeric_value(sources, ("gap_ms", "inter_chunk_gap_ms", "chunk_gap_ms"))
+    usage = _streaming_mapping_from_sources(
+        sources,
+        ("usage", "usage_metadata", "response.usage", "gen_ai.usage"),
+    )
+    tool_call = _streaming_tool_call(raw, data, payload, chunk, delta_payload)
+    text_delta = _streaming_text_delta(raw, data, payload, chunk, delta_payload)
+    status = _streaming_value_from_sources(
+        sources,
+        ("status", "finish_reason", "response.status", "state", "agent_state", "user_state"),
+    )
+    error = _streaming_value_from_sources(
+        sources,
+        ("error", "exception", "error.type", "error_type", "error.message"),
+    )
+    dropped = _streaming_value_from_sources(
+        sources,
+        ("dropped", "drop_count", "dropped_count", "discarded", "discarded_count"),
+    )
+    buffer_size = _streaming_numeric_value(
+        sources,
+        ("buffer_size", "queue_size", "pending_frames", "pending_events"),
+    )
+
+    event: Dict[str, Any] = {
+        "id": str(
+            _streaming_value_from_sources(
+                sources,
+                ("id", "event_id", "span_id", "spanId", "run_id", "item_id"),
+            )
+            or f"stream_event_{sequence}"
+        ),
+        "type": event_type,
+        "sequence": sequence,
+        "framework": framework,
+        "raw": copy.deepcopy(raw),
+    }
+    if role not in (None, "", [], {}):
+        event["role"] = str(role)
+    if source not in (None, "", [], {}):
+        event["source"] = str(source)
+    if text_delta:
+        event["delta"] = text_delta
+    if tool_call:
+        event["tool_call"] = tool_call
+    if timestamp_ms is not None:
+        event["timestamp_ms"] = timestamp_ms
+    if latency_ms is not None:
+        event["latency_ms"] = latency_ms
+    if gap_ms is not None:
+        event["gap_ms"] = gap_ms
+    if usage:
+        event["usage"] = usage
+    if status not in (None, "", [], {}):
+        event["status"] = str(status)
+    if error not in (None, "", [], {}):
+        event["error"] = error
+    if dropped not in (None, "", [], {}):
+        event["dropped"] = dropped
+    if buffer_size is not None:
+        event["buffer_size"] = buffer_size
+    event["signals"] = sorted(_streaming_event_signals(event, raw, data, payload, attributes, framework))
+    return event
+
+
+def _streaming_event_type(
+    raw: Mapping[str, Any],
+    data: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    chunk: Mapping[str, Any],
+    delta_payload: Mapping[str, Any],
+) -> str:
+    raw_type = str(
+        raw.get("type")
+        or raw.get("event")
+        or raw.get("kind")
+        or data.get("type")
+        or payload.get("type")
+        or raw.get("frame_type")
+        or raw.get("frame")
+        or raw.get("name")
+        or ""
+    )
+    normalized = _normalize_streaming_trace_key(raw_type)
+    text = " ".join([raw_type, _framework_sources_text(raw, data, payload, chunk, delta_payload)])
+    lowered = text.lower()
+    if any(token in lowered for token in ("tool_call_delta", "tool_call_chunk", "function_call_arguments.delta")):
+        return "tool_delta"
+    if any(
+        source.get(key) not in (None, "", [], {})
+        for source in (raw, data, payload, chunk, delta_payload)
+        for key in ("tool_call_chunks", "tool_calls")
+    ):
+        return "tool_delta"
+    if any(token in lowered for token in ("response.output_text.delta", "text_delta", "message_delta")):
+        return "chunk"
+    if any(token in lowered for token in ("final", "completed", "complete", "message_end", "response.done", "fullresponseend")):
+        return "final"
+    if any(token in lowered for token in ("interrupt", "barge", "cancel")):
+        return "interruption"
+    if any(token in lowered for token in ("drop", "discard")):
+        return "drop"
+    if any(token in lowered for token in ("usage", "metrics")):
+        return "usage"
+    if any(token in lowered for token in ("error", "exception")):
+        return "error"
+    if normalized in {"tool_delta", "final", "interruption", "drop", "usage", "error", "start", "message"}:
+        return normalized
+    if any(
+        source.get(key) not in (None, "", [], {})
+        for source in (raw, data, payload, chunk, delta_payload)
+        for key in ("delta", "content", "text")
+    ):
+        return "chunk"
+    return normalized or "event"
+
+
+def _streaming_event_signals(
+    event: Mapping[str, Any],
+    raw: Mapping[str, Any],
+    data: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    attributes: Mapping[str, Any],
+    framework: str,
+) -> set[str]:
+    signals = {_normalize_streaming_trace_key(event.get("type"))}
+    text = " ".join(
+        [
+            framework,
+            str(event.get("type", "")),
+            str(event.get("status", "")),
+            _framework_sources_text(raw, data, payload, attributes),
+        ]
+    ).lower()
+    keyword_signals = {
+        "stream": "stream",
+        "chunk": "chunk",
+        "delta": "chunk",
+        "token": "chunk",
+        "message": "message",
+        "text": "chunk",
+        "tool": "tool_delta",
+        "function": "tool_delta",
+        "final": "final",
+        "completed": "final",
+        "complete": "final",
+        "finish": "final",
+        "usage": "usage",
+        "metric": "usage",
+        "latency": "latency",
+        "duration": "latency",
+        "time_to_first_chunk": "latency",
+        "gap": "gap",
+        "inter_chunk": "gap",
+        "drop": "drop",
+        "discard": "drop",
+        "interrupt": "interruption",
+        "barge": "interruption",
+        "cancel": "interruption",
+        "recover": "recovered",
+        "resume": "recovered",
+        "error": "error",
+        "exception": "error",
+        "buffer": "backpressure",
+        "queue": "backpressure",
+        "backpressure": "backpressure",
+        "livekit": "livekit",
+        "pipecat": "pipecat",
+        "langchain": "langchain",
+        "langgraph": "langgraph",
+        "openai": "openai_agents",
+        "otel": "otel",
+        "opentelemetry": "otel",
+    }
+    for token, signal in keyword_signals.items():
+        if token in text:
+            signals.add(signal)
+    if event.get("delta"):
+        signals.add("chunk")
+    if event.get("tool_call"):
+        signals.add("tool_delta")
+    if event.get("latency_ms") is not None:
+        signals.add("latency")
+    if event.get("gap_ms") is not None:
+        signals.add("gap")
+    if event.get("usage"):
+        signals.add("usage")
+    if event.get("error") not in (None, "", [], {}):
+        signals.add("error")
+    if event.get("dropped") not in (None, "", [], {}, False, 0):
+        signals.add("drop")
+    if event.get("buffer_size") not in (None, "", [], {}):
+        signals.add("backpressure")
+    if _normalize_streaming_trace_key(event.get("type")) == "tool_delta":
+        signals.discard("chunk")
+    return {_normalize_streaming_trace_key(signal) for signal in signals if signal}
+
+
+def _streaming_trace_summary(events: Iterable[Mapping[str, Any]]) -> Dict[str, Any]:
+    records = [_coerce_plain_dict(event) for event in events]
+    chunk_events = [event for event in records if "chunk" in set(event.get("signals", []))]
+    tool_delta_events = [event for event in records if "tool_delta" in set(event.get("signals", []))]
+    interruption_events = [event for event in records if "interruption" in set(event.get("signals", []))]
+    dropped_events = [
+        event
+        for event in records
+        if "drop" in set(event.get("signals", [])) or event.get("dropped") not in (None, "", [], {}, False, 0)
+    ]
+    error_events = [event for event in records if "error" in set(event.get("signals", []))]
+    timestamps = [
+        float(event["timestamp_ms"])
+        for event in records
+        if isinstance(event.get("timestamp_ms"), (int, float))
+    ]
+    explicit_gaps = [
+        float(event["gap_ms"])
+        for event in records
+        if isinstance(event.get("gap_ms"), (int, float))
+    ]
+    ordered_timestamps = [
+        float(event["timestamp_ms"])
+        for event in sorted(chunk_events, key=lambda item: item.get("sequence", 0))
+        if isinstance(event.get("timestamp_ms"), (int, float))
+    ]
+    computed_gaps = [
+        max(0.0, ordered_timestamps[index] - ordered_timestamps[index - 1])
+        for index in range(1, len(ordered_timestamps))
+    ]
+    first_token_latency = _streaming_first_token_latency(records, chunk_events)
+    completion_status = _streaming_completion_status(records)
+    usage = _streaming_usage_summary(records)
+    summary: Dict[str, Any] = {
+        "event_count": len(records),
+        "chunk_count": len(chunk_events),
+        "tool_delta_count": len(tool_delta_events),
+        "interruption_count": len(interruption_events),
+        "dropped_event_count": len(dropped_events),
+        "error_count": len(error_events),
+        "assembled_text": "".join(str(event.get("delta") or "") for event in chunk_events),
+        "completion_status": completion_status,
+    }
+    if first_token_latency is not None:
+        summary["first_token_latency_ms"] = round(first_token_latency, 4)
+    if explicit_gaps:
+        summary["max_gap_ms"] = round(max(explicit_gaps), 4)
+    elif computed_gaps:
+        summary["max_gap_ms"] = round(max(computed_gaps), 4)
+    if timestamps:
+        summary["total_latency_ms"] = round(max(timestamps) - min(timestamps), 4)
+    if usage:
+        summary["usage"] = usage
+    if any("recovered" in set(event.get("signals", [])) for event in records):
+        summary["recovered_interruption_count"] = sum(
+            1 for event in records if "recovered" in set(event.get("signals", []))
+        )
+    return summary
+
+
+def _streaming_trace_signals(events: Iterable[Mapping[str, Any]]) -> set[str]:
+    signals: set[str] = set()
+    for event in events:
+        signals.update(event.get("signals", []))
+    return signals
+
+
+def _streaming_first_token_latency(
+    records: Sequence[Mapping[str, Any]],
+    chunk_events: Sequence[Mapping[str, Any]],
+) -> Optional[float]:
+    for event in chunk_events:
+        value = event.get("latency_ms")
+        if isinstance(value, (int, float)):
+            return float(value)
+    request_timestamps = [
+        float(event["timestamp_ms"])
+        for event in records
+        if isinstance(event.get("timestamp_ms"), (int, float))
+        and any(signal in set(event.get("signals", [])) for signal in ("start", "stream"))
+    ]
+    all_timestamps = [
+        float(event["timestamp_ms"])
+        for event in records
+        if isinstance(event.get("timestamp_ms"), (int, float))
+    ]
+    chunk_timestamps = [
+        float(event["timestamp_ms"])
+        for event in chunk_events
+        if isinstance(event.get("timestamp_ms"), (int, float))
+    ]
+    if chunk_timestamps and (request_timestamps or all_timestamps):
+        return min(chunk_timestamps) - min(request_timestamps or all_timestamps)
+    return None
+
+
+def _streaming_completion_status(records: Sequence[Mapping[str, Any]]) -> str:
+    for event in reversed(records):
+        status = str(event.get("status") or "").strip()
+        signals = set(event.get("signals", []))
+        if "final" in signals:
+            return status or "completed"
+        if status.lower() in {"complete", "completed", "success", "succeeded", "done", "closed"}:
+            return status
+    if any("error" in set(event.get("signals", [])) for event in records):
+        return "error"
+    return "unknown"
+
+
+def _streaming_usage_summary(records: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+    merged: Dict[str, Any] = {}
+    for event in records:
+        usage = _coerce_plain_dict(event.get("usage"))
+        for key, value in usage.items():
+            if isinstance(value, (int, float)):
+                merged[key] = merged.get(key, 0) + value
+            elif key not in merged:
+                merged[key] = copy.deepcopy(value)
+    return merged
+
+
+def _find_streaming_event(
+    events: Iterable[Mapping[str, Any]],
+    event_id: str,
+) -> Optional[Dict[str, Any]]:
+    normalized_query = str(event_id or "").strip().lower()
+    if not normalized_query:
+        return None
+    for event in events:
+        event_dict = _coerce_plain_dict(event)
+        candidates = {
+            str(event_dict.get("id") or "").lower(),
+            str(event_dict.get("event_id") or "").lower(),
+            str(event_dict.get("sequence") or "").lower(),
+            str(event_dict.get("type") or "").lower(),
+            _normalize_streaming_trace_key(event_dict.get("type")),
+        }
+        if normalized_query in candidates:
+            return event_dict
+    return None
+
+
+def _streaming_text_delta(
+    raw: Mapping[str, Any],
+    data: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    chunk: Mapping[str, Any],
+    delta_payload: Mapping[str, Any],
+) -> str:
+    for source in (raw, data, payload, chunk, delta_payload):
+        value = _streaming_value_from_sources(
+            (source,),
+            (
+                "delta",
+                "text",
+                "content",
+                "transcript",
+                "output_text",
+                "message.content",
+                "chunk.content",
+                "delta.content",
+            ),
+        )
+        text = _streaming_text_from_value(value)
+        if text:
+            return text
+    return ""
+
+
+def _streaming_text_from_value(value: Any) -> str:
+    if value in (None, "", [], {}):
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (int, float, bool)):
+        return str(value)
+    if isinstance(value, Mapping):
+        parts: List[str] = []
+        for key in ("text", "content", "delta", "transcript", "value"):
+            text = _streaming_text_from_value(value.get(key))
+            if text:
+                parts.append(text)
+        if not parts and value.get("type") in {"text", "output_text"}:
+            parts.append(_streaming_text_from_value(value.get("value")))
+        return "".join(parts)
+    if isinstance(value, Iterable):
+        return "".join(_streaming_text_from_value(item) for item in value)
+    return str(value)
+
+
+def _streaming_tool_call(
+    raw: Mapping[str, Any],
+    data: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    chunk: Mapping[str, Any],
+    delta_payload: Mapping[str, Any],
+) -> Dict[str, Any]:
+    for source in (raw, data, payload, chunk, delta_payload):
+        for key in ("tool_call", "tool_calls", "tool_call_chunks", "function_call", "function"):
+            value = source.get(key)
+            if value not in (None, "", [], {}):
+                return {"field": key, "value": copy.deepcopy(value)}
+    return {}
+
+
+def _streaming_value_from_sources(
+    sources: Iterable[Mapping[str, Any]],
+    keys: Iterable[str],
+) -> Any:
+    for source in sources:
+        if not isinstance(source, Mapping):
+            continue
+        for key in keys:
+            if key in source and source.get(key) not in (None, ""):
+                return source.get(key)
+            current: Any = source
+            for part in key.split("."):
+                if isinstance(current, Mapping) and part in current:
+                    current = current.get(part)
+                else:
+                    current = None
+                    break
+            if current not in (None, ""):
+                return current
+    return None
+
+
+def _streaming_mapping_from_sources(
+    sources: Iterable[Mapping[str, Any]],
+    keys: Iterable[str],
+) -> Dict[str, Any]:
+    value = _streaming_value_from_sources(sources, keys)
+    return _coerce_plain_dict(value)
+
+
+def _streaming_numeric_value(
+    sources: Iterable[Mapping[str, Any]],
+    keys: Iterable[str],
+) -> Optional[float]:
+    value = _streaming_value_from_sources(sources, keys)
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return None
+    return None
+
+
+def _streaming_timestamp_ms(sources: Iterable[Mapping[str, Any]]) -> Optional[float]:
+    value = _streaming_value_from_sources(
+        sources,
+        ("timestamp_ms", "ts_ms", "time_ms", "created_at_ms", "start_time_ms"),
+    )
+    if isinstance(value, (int, float)):
+        return float(value)
+    value = _streaming_value_from_sources(sources, ("timestamp", "time", "created_at"))
+    if isinstance(value, (int, float)):
+        return float(value * 1000 if value < 10_000_000_000 else value)
+    if isinstance(value, str):
+        try:
+            numeric = float(value)
+            return numeric * 1000 if numeric < 10_000_000_000 else numeric
+        except ValueError:
+            return None
+    return None
+
+
+def _streaming_latency_ms(sources: Iterable[Mapping[str, Any]]) -> Optional[float]:
+    value = _streaming_numeric_value(
+        sources,
+        (
+            "latency_ms",
+            "duration_ms",
+            "elapsed_ms",
+            "first_token_latency_ms",
+            "time_to_first_chunk_ms",
+            "gen_ai.response.time_to_first_chunk_ms",
+        ),
+    )
+    if value is not None:
+        return value
+    seconds = _streaming_numeric_value(
+        sources,
+        ("time_to_first_chunk", "gen_ai.response.time_to_first_chunk"),
+    )
+    if seconds is not None:
+        return seconds * 1000
+    return None
+
+
+def _normalize_streaming_trace_key(value: Any) -> str:
+    normalized = str(value or "").strip().lower().replace("-", "_").replace(" ", "_").replace(".", "_")
+    aliases = {
+        "streaming_trace": "trace",
+        "streaming_trace_status": "trace",
+        "streaming_trace_event": "event",
+        "stream_event": "event",
+        "raw_response_event": "chunk",
+        "raw_model_stream_event": "chunk",
+        "response_output_text_delta": "chunk",
+        "response_text_delta_event": "chunk",
+        "ai_message_chunk": "chunk",
+        "textframe": "chunk",
+        "transcriptionframe": "chunk",
+        "outputaudiorawframe": "chunk",
+        "inputaudiorawframe": "chunk",
+        "tool_call_chunk": "tool_delta",
+        "tool_call_chunks": "tool_delta",
+        "function_call_arguments_delta": "tool_delta",
+        "run_item_stream_event": "tool_delta",
+        "conversation_item_added": "message",
+        "llmfullresponsestartframe": "start",
+        "llmfullresponseendframe": "final",
+        "response_completed": "final",
+        "response_done": "final",
+        "close": "final",
+        "completed": "final",
+        "done": "final",
+        "cancel": "interruption",
+        "cancelframe": "interruption",
+        "interruptionframe": "interruption",
+        "user_interruption_detected": "interruption",
+        "overlapping_speech": "interruption",
+        "agent_false_interruption": "recovered",
+        "session_usage_updated": "usage",
+        "metrics_collected": "usage",
+        "dropped": "drop",
+        "discarded": "drop",
+        "queue": "backpressure",
+        "buffer": "backpressure",
+    }
+    return aliases.get(normalized, normalized)
 
 
 ORCHESTRATION_TRACE_ALIASES = {

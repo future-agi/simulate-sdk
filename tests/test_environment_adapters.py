@@ -18,6 +18,7 @@ from fi.simulate import (
     MultiAgentRoomEnvironment,
     OrchestrationTraceEnvironment,
     RetrievalMemoryEnvironment,
+    StreamingTraceEnvironment,
     StructuredArtifactEnvironment,
     ToolFaultInjectionEnvironment,
     ToolMockEnvironment,
@@ -26,12 +27,14 @@ from fi.simulate import (
     load_voice_export,
     load_playwright_trace_export,
     load_framework_trace_export,
+    load_streaming_trace_export,
     load_autogen_groupchat_transcript,
     load_crewai_event_log,
     load_openai_agents_trace,
     load_langchain_event_stream,
     load_langgraph_event_stream,
     normalize_orchestration_trace_export,
+    normalize_streaming_trace_export,
     normalize_framework_trace_events,
     normalize_framework_trace_export,
     normalize_browser_trace_export,
@@ -1597,6 +1600,154 @@ async def test_orchestration_trace_environment_replays_graph_runtime_evidence():
     assert any(edge["from"] == "triage_agent" and edge["to"] == "policy_agent" for edge in trace_state["edges"])
     assert trace_artifacts and trace_artifacts[-1]["steps"]
     assert any(event.type == "orchestration_step" and event.name == "policy_agent retry succeeded" for event in result.events)
+
+
+@pytest.mark.asyncio
+async def test_streaming_trace_environment_replays_chunks_tools_and_interruptions():
+    seen_tools = []
+
+    async def agent(input):
+        seen_tools.extend(tool["name"] for tool in input.tools)
+        return AgentResponse(
+            content="I inspected streaming chunks, tool deltas, interruption recovery, and final output.",
+            tool_calls=[
+                {"id": "status", "name": "streaming_trace_status", "arguments": {}},
+                {"id": "chunks", "name": "list_stream_events", "arguments": {"signal": "chunk"}},
+                {"id": "tool", "name": "inspect_stream_event", "arguments": {"id": "tool_delta"}},
+            ],
+        )
+
+    events = [
+        {
+            "id": "start",
+            "type": "LLMFullResponseStartFrame",
+            "timestamp_ms": 1000,
+            "source": "pipecat.pipeline",
+        },
+        {
+            "id": "chunk_1",
+            "type": "messages",
+            "delta": "Refund ",
+            "role": "assistant",
+            "timestamp_ms": 1120,
+            "latency_ms": 120,
+            "source": "langgraph:model_node",
+        },
+        {
+            "id": "tool_delta",
+            "type": "raw_response_event",
+            "data": {
+                "type": "response.function_call_arguments.delta",
+                "delta": "{\"order_id\":\"ord_123\"",
+            },
+            "tool_call_chunks": [{"name": "lookup_order", "args": "{\"order_id\":\"ord_123\""}],
+            "timestamp_ms": 1148,
+        },
+        {
+            "id": "interruption",
+            "event": "user_interruption_detected",
+            "payload": {"probability": 0.91},
+            "timestamp_ms": 1175,
+        },
+        {
+            "id": "drop",
+            "frame_type": "CancelFrame",
+            "dropped_count": 2,
+            "timestamp_ms": 1180,
+        },
+        {
+            "id": "recovered",
+            "event": "agent_false_interruption",
+            "status": "resumed",
+            "timestamp_ms": 1210,
+        },
+        {
+            "id": "chunk_2",
+            "type": "messages",
+            "delta": "approved.",
+            "gap_ms": 18,
+            "timestamp_ms": 1228,
+        },
+        {
+            "id": "usage",
+            "event": "session_usage_updated",
+            "usage": {"output_tokens": 9},
+            "timestamp_ms": 1240,
+        },
+        {
+            "id": "final",
+            "event": "response.completed",
+            "status": "completed",
+            "timestamp_ms": 1250,
+        },
+    ]
+
+    report = await LocalTextEngine().run(
+        scenario=_scenario(),
+        agent_callback=agent,
+        environment=StreamingTraceEnvironment(
+            framework="mixed-realtime",
+            events=events,
+            state={"response": {"status": "completed"}},
+        ),
+        max_turns=1,
+        min_turns=1,
+    )
+
+    result = report.results[0]
+    trace_state = result.metadata["environment_state"]["streaming_trace"]
+    trace_artifacts = [
+        artifact.data
+        for artifact in result.artifacts
+        if artifact.type == "trace" and artifact.metadata.get("kind") == "streaming_trace"
+    ]
+
+    assert {"streaming_trace_status", "list_stream_events", "inspect_stream_event"} <= set(seen_tools)
+    assert trace_state["framework"] == "mixed-realtime"
+    assert {
+        "chunk",
+        "tool_delta",
+        "interruption",
+        "recovered",
+        "drop",
+        "latency",
+        "gap",
+        "usage",
+        "final",
+    } <= set(trace_state["signals"])
+    assert trace_state["summary"]["assembled_text"] == "Refund approved."
+    assert trace_state["summary"]["first_token_latency_ms"] == 120
+    assert trace_state["summary"]["tool_delta_count"] == 1
+    assert trace_state["summary"]["interruption_count"] >= 1
+    assert trace_state["summary"]["dropped_event_count"] >= 1
+    assert trace_state["summary"]["completion_status"] == "completed"
+    assert trace_artifacts and trace_artifacts[-1]["chunks"]
+    assert any(event.type == "streaming_trace_event" and event.name == "tool_delta" for event in result.events)
+
+
+def test_normalize_streaming_trace_export_projects_common_runtime_events():
+    trace = normalize_streaming_trace_export(
+        {
+            "framework": "openai-agents",
+            "events": [
+                {"type": "raw_response_event", "data": {"type": "response.output_text.delta", "delta": "Hi"}, "timestamp": 1.0},
+                {"type": "run_item_stream_event", "tool_calls": [{"name": "lookup_order"}], "timestamp": 1.1},
+                {"event": "response.completed", "status": "completed", "usage": {"output_tokens": 3}, "timestamp": 1.2},
+            ],
+            "state": {"done": True},
+        }
+    )
+
+    assert trace["kind"] == "streaming_trace"
+    assert trace["framework"] == "openai-agents"
+    assert {"chunk", "tool_delta", "final", "usage"} <= set(trace["signals"])
+    assert trace["summary"]["assembled_text"] == "Hi"
+    assert trace["summary"]["completion_status"] == "completed"
+    assert trace["summary"]["usage"]["output_tokens"] == 3
+
+    environment = load_streaming_trace_export(trace)
+    snapshot = environment.reset()
+    assert snapshot.state["streaming_trace"]["summary"]["chunk_count"] == 1
 
 
 def test_normalize_orchestration_trace_export_projects_otlp_workflow_graph():
