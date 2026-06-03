@@ -3413,6 +3413,343 @@ def load_openai_agents_trace(
     )
 
 
+class OrchestrationTraceEnvironment(EnvironmentAdapter):
+    """
+    Replay normalized workflow graph evidence from arbitrary agent frameworks.
+
+    Framework traces preserve native spans and events. This adapter projects
+    those records into a portable graph contract: nodes, edges, execution steps,
+    retries, recovery, latency, cost, and final state.
+    """
+
+    name = "orchestration_trace"
+
+    def __init__(
+        self,
+        *,
+        framework: str,
+        records: Optional[Iterable[str | Mapping[str, Any]]] = None,
+        trace_export: Optional[Any] = None,
+        export_source: Optional[str | os.PathLike[str]] = None,
+        export_headers: Optional[Mapping[str, str]] = None,
+        export_timeout: float = 30.0,
+        nodes: Optional[Iterable[Mapping[str, Any]]] = None,
+        edges: Optional[Iterable[Mapping[str, Any]]] = None,
+        steps: Optional[Iterable[Mapping[str, Any]]] = None,
+        state: Optional[Mapping[str, Any]] = None,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        self.framework = str(framework)
+        export_records: List[Any] = []
+        export_metadata: Dict[str, Any] = {}
+        if export_source is not None:
+            loaded_export = _load_framework_trace_export_source(
+                export_source,
+                headers=export_headers,
+                timeout=export_timeout,
+            )
+            export_records.extend(_framework_trace_export_records(loaded_export))
+            export_metadata["export_source"] = _framework_trace_source_label(export_source)
+        if trace_export is not None:
+            export_records.extend(_framework_trace_export_records(trace_export))
+
+        trace = normalize_orchestration_trace_events(
+            self.framework,
+            [*(records or []), *export_records],
+            nodes=nodes,
+            edges=edges,
+            steps=steps,
+            state=state,
+            metadata=metadata,
+        )
+        if export_metadata:
+            trace.setdefault("metadata", {}).setdefault("trace_export", {}).update(export_metadata)
+        self.initial_trace = trace
+        self.trace: Dict[str, Any] = {}
+
+    @classmethod
+    def from_export(
+        cls,
+        *,
+        framework: str = "traceai",
+        export: Optional[Any] = None,
+        source: Optional[str | os.PathLike[str]] = None,
+        headers: Optional[Mapping[str, str]] = None,
+        timeout: float = 30.0,
+        state: Optional[Mapping[str, Any]] = None,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> "OrchestrationTraceEnvironment":
+        return cls(
+            framework=framework,
+            trace_export=export,
+            export_source=source,
+            export_headers=headers,
+            export_timeout=timeout,
+            state=state,
+            metadata=metadata,
+        )
+
+    def reset(self, **context: Any) -> EnvironmentSnapshot:
+        self.trace = copy.deepcopy(self.initial_trace)
+        events = [
+            SimulationEvent(
+                type="orchestration_trace",
+                name="orchestration_trace_ready",
+                payload={
+                    "framework": self.framework,
+                    "node_count": len(self.trace.get("nodes", [])),
+                    "edge_count": len(self.trace.get("edges", [])),
+                    "step_count": len(self.trace.get("steps", [])),
+                    "signals": copy.deepcopy(self.trace.get("signals", [])),
+                    "summary": copy.deepcopy(self.trace.get("summary", {})),
+                },
+            )
+        ]
+        events.extend(_orchestration_step_event(step, self.framework) for step in self.trace.get("steps", []))
+        return EnvironmentSnapshot(
+            tools=self._tool_specs(),
+            artifacts=[self._trace_artifact()],
+            events=events,
+            state={"orchestration_trace": self._state_payload()},
+            metadata={
+                "orchestration_trace": {
+                    "framework": self.framework,
+                    "node_count": len(self.trace.get("nodes", [])),
+                    "edge_count": len(self.trace.get("edges", [])),
+                    "step_count": len(self.trace.get("steps", [])),
+                    "signals": copy.deepcopy(self.trace.get("signals", [])),
+                    "summary": copy.deepcopy(self.trace.get("summary", {})),
+                }
+            },
+        )
+
+    def handle_tool_call(
+        self,
+        tool_call: Mapping[str, Any],
+        **context: Any,
+    ) -> Optional[ToolExecutionResult]:
+        name = _tool_name(tool_call)
+        if name not in {
+            "orchestration_trace_status",
+            "list_orchestration_steps",
+            "inspect_orchestration_node",
+            "inspect_orchestration_edge",
+        }:
+            return None
+        arguments = _tool_arguments(tool_call)
+        call_id = _tool_call_id(tool_call)
+
+        if name == "orchestration_trace_status":
+            result = self._trace_payload()
+            event_name = "orchestration_trace_status"
+            content = f"{self.framework} orchestration trace status recorded."
+            success = True
+            error = None
+        elif name == "list_orchestration_steps":
+            signal = _normalize_orchestration_trace_key(arguments.get("signal") or arguments.get("kind") or "")
+            node = _normalize_orchestration_name(arguments.get("node") or arguments.get("name") or "")
+            steps = [copy.deepcopy(dict(step)) for step in self.trace.get("steps", [])]
+            if signal:
+                steps = [step for step in steps if signal in set(step.get("signals", []))]
+            if node:
+                steps = [
+                    step
+                    for step in steps
+                    if _normalize_orchestration_name(step.get("node") or step.get("name")) == node
+                ]
+            result = {"framework": self.framework, "steps": steps, "query": {"signal": signal, "node": node}}
+            event_name = "orchestration_steps_listed"
+            content = f"Listed {len(steps)} orchestration step(s)."
+            success = True
+            error = None
+        elif name == "inspect_orchestration_node":
+            node_id = str(arguments.get("id") or arguments.get("node") or arguments.get("name") or "")
+            node_record = _find_orchestration_record(self.trace.get("nodes", []), node_id)
+            success = node_record is not None
+            result = {"framework": self.framework, "node": copy.deepcopy(node_record), "query": node_id}
+            event_name = "orchestration_node_inspected" if success else "orchestration_node_missing"
+            content = f"Inspected orchestration node {node_id}." if success else f"Orchestration node not found: {node_id}"
+            error = None if success else "node_not_found"
+        else:
+            edge_id = str(arguments.get("id") or arguments.get("edge") or "")
+            from_node = arguments.get("from") or arguments.get("source")
+            to_node = arguments.get("to") or arguments.get("target")
+            edge_record = _find_orchestration_edge(
+                self.trace.get("edges", []),
+                edge_id=edge_id,
+                from_node=from_node,
+                to_node=to_node,
+            )
+            success = edge_record is not None
+            result = {
+                "framework": self.framework,
+                "edge": copy.deepcopy(edge_record),
+                "query": {"id": edge_id, "from": from_node, "to": to_node},
+            }
+            event_name = "orchestration_edge_inspected" if success else "orchestration_edge_missing"
+            content = "Inspected orchestration edge." if success else "Orchestration edge not found."
+            error = None if success else "edge_not_found"
+
+        return ToolExecutionResult(
+            tool_call_id=call_id,
+            tool_name=name,
+            content=content,
+            result=result,
+            success=success,
+            error=error,
+            state_updates={"orchestration_trace": self._state_payload()},
+            artifacts=[self._trace_artifact()],
+            events=[
+                SimulationEvent(
+                    type="orchestration_trace",
+                    name=event_name,
+                    payload=result,
+                    metadata={"framework": self.framework},
+                )
+            ],
+        )
+
+    def _tool_specs(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                "name": "orchestration_trace_status",
+                "description": "Return normalized workflow graph trace state, nodes, edges, steps, signals, and summary.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            {
+                "name": "list_orchestration_steps",
+                "description": "List workflow execution steps, optionally filtered by signal or node.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"signal": {"type": "string"}, "node": {"type": "string"}},
+                },
+            },
+            {
+                "name": "inspect_orchestration_node",
+                "description": "Inspect one workflow node by id or name.",
+                "parameters": {"type": "object", "properties": {"id": {"type": "string"}}},
+            },
+            {
+                "name": "inspect_orchestration_edge",
+                "description": "Inspect one workflow route/edge by id or from/to node pair.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string"},
+                        "from": {"type": "string"},
+                        "to": {"type": "string"},
+                    },
+                },
+            },
+        ]
+
+    def _trace_artifact(self) -> SimulationArtifact:
+        return SimulationArtifact(
+            type="trace",
+            role="environment",
+            data=self._trace_payload(),
+            metadata={"kind": "orchestration_trace", "framework": self.framework},
+        )
+
+    def _trace_payload(self) -> Dict[str, Any]:
+        return copy.deepcopy(self.trace)
+
+    def _state_payload(self) -> Dict[str, Any]:
+        return self._trace_payload()
+
+
+def normalize_orchestration_trace_events(
+    framework: str,
+    records: Iterable[Any],
+    *,
+    nodes: Optional[Iterable[Mapping[str, Any]]] = None,
+    edges: Optional[Iterable[Mapping[str, Any]]] = None,
+    steps: Optional[Iterable[Mapping[str, Any]]] = None,
+    state: Optional[Mapping[str, Any]] = None,
+    metadata: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Normalize native workflow/runtime records into a portable graph trace."""
+
+    normalized_steps = [
+        _normalize_orchestration_step(record, framework=str(framework), index=index)
+        for index, record in enumerate(records or [])
+    ]
+    normalized_steps.extend(
+        _normalize_orchestration_step(step, framework=str(framework), index=len(normalized_steps) + index)
+        for index, step in enumerate(steps or [])
+    )
+    normalized_nodes = [
+        _normalize_orchestration_node(node, framework=str(framework))
+        for node in nodes or []
+    ]
+    normalized_edges = [
+        _normalize_orchestration_edge(edge, framework=str(framework))
+        for edge in edges or []
+    ]
+    projected_nodes, projected_edges = _orchestration_graph_from_steps(normalized_steps, framework=str(framework))
+    normalized_nodes = _dedupe_orchestration_records([*normalized_nodes, *projected_nodes])
+    normalized_edges = _dedupe_orchestration_records([*normalized_edges, *projected_edges])
+    signals = _orchestration_trace_signals(normalized_nodes, normalized_edges, normalized_steps, state)
+    summary = _orchestration_trace_summary(normalized_steps, normalized_edges)
+    return {
+        "kind": "orchestration_trace",
+        "framework": str(framework),
+        "nodes": normalized_nodes,
+        "edges": normalized_edges,
+        "steps": normalized_steps,
+        "signals": sorted(signals),
+        "summary": summary,
+        "state": copy.deepcopy(dict(state or {})),
+        "metadata": copy.deepcopy(dict(metadata or {})),
+    }
+
+
+def normalize_orchestration_trace_export(
+    trace_export: Any,
+    *,
+    framework: str = "traceai",
+    state: Optional[Mapping[str, Any]] = None,
+    metadata: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Normalize TraceAI/OpenTelemetry/framework exports into an orchestration graph trace."""
+
+    records = _framework_trace_export_records(trace_export)
+    return normalize_orchestration_trace_events(
+        framework,
+        records,
+        state=state,
+        metadata=metadata,
+    )
+
+
+def load_orchestration_trace_export(
+    source: str | os.PathLike[str] | Mapping[str, Any] | Iterable[Any],
+    *,
+    framework: str = "traceai",
+    headers: Optional[Mapping[str, str]] = None,
+    timeout: float = 30.0,
+    state: Optional[Mapping[str, Any]] = None,
+    metadata: Optional[Mapping[str, Any]] = None,
+) -> OrchestrationTraceEnvironment:
+    """Load local/HTTP/inline workflow trace evidence into a graph replay environment."""
+
+    if isinstance(source, (str, os.PathLike)):
+        return OrchestrationTraceEnvironment.from_export(
+            framework=framework,
+            source=source,
+            headers=headers,
+            timeout=timeout,
+            state=state,
+            metadata=metadata,
+        )
+    return OrchestrationTraceEnvironment.from_export(
+        framework=framework,
+        export=source,
+        state=state,
+        metadata=metadata,
+    )
+
+
 class AutonomyLoopEnvironment(EnvironmentAdapter):
     """
     Local autonomy-loop harness for observe/orient/plan/act/verify/reflect traces.
@@ -5396,6 +5733,707 @@ def _find_framework_span(
         if span_id in {str(span.get("id")), str(span.get("span_id")), str(span.get("name"))}:
             return span
     return None
+
+
+ORCHESTRATION_TRACE_ALIASES = {
+    "invoke_workflow": "workflow",
+    "workflow": "workflow",
+    "graph": "workflow",
+    "flow": "workflow",
+    "chain": "workflow",
+    "invoke_agent": "agent",
+    "agent": "agent",
+    "node": "node",
+    "task": "task",
+    "execute_tool": "tool",
+    "function": "tool",
+    "function_call": "tool",
+    "function_tool": "tool",
+    "tool_call": "tool",
+    "route": "route",
+    "routing": "route",
+    "edge": "route",
+    "handoff": "handoff",
+    "transfer": "handoff",
+    "delegation": "handoff",
+    "retry": "retry",
+    "attempt": "retry",
+    "recover": "recovered",
+    "recovered": "recovered",
+    "error": "error",
+    "exception": "error",
+    "failure": "error",
+    "timeout": "error",
+    "state": "state",
+    "updates": "state",
+    "values": "state",
+    "checkpoint": "checkpoint",
+    "memory": "memory",
+    "memory_update": "memory",
+    "memory_retrieval": "memory",
+    "retrieval": "retrieval",
+    "retriever": "retrieval",
+    "model": "model",
+    "llm": "model",
+    "chat": "model",
+    "generation": "model",
+    "duration": "latency",
+    "duration_ms": "latency",
+    "latency": "latency",
+    "cost": "cost",
+    "tokens": "cost",
+    "usage": "cost",
+    "voice": "voice",
+    "livekit": "voice",
+    "pipecat": "voice",
+    "frame": "frame",
+    "interrupt": "interrupt",
+    "barge": "interrupt",
+}
+
+
+def _normalize_orchestration_trace_key(value: Any) -> str:
+    normalized = str(value).strip().lower().replace("-", "_").replace(" ", "_").replace(".", "_")
+    return ORCHESTRATION_TRACE_ALIASES.get(normalized, normalized)
+
+
+def _normalize_orchestration_step(
+    value: Any,
+    *,
+    framework: str,
+    index: int,
+) -> Dict[str, Any]:
+    raw = _framework_record_to_dict(value)
+    raw.setdefault("framework", framework)
+    span_data = _coerce_plain_dict(raw.get("span_data") or raw.get("span"))
+    data = _coerce_plain_dict(raw.get("data"))
+    payload = _coerce_plain_dict(raw.get("payload"))
+    attributes = _nested_dict(raw, ("attributes", "attrs", "metadata", "data", "payload", "span_data", "resource"))
+    params = _coerce_plain_dict(raw.get("params") or data.get("params") or payload.get("params"))
+    params_data = _coerce_plain_dict(params.get("data"))
+    if not params_data:
+        params_data = _coerce_plain_dict(data.get("data") or payload.get("data"))
+
+    name = _framework_record_name(raw, span_data=span_data, data=data, payload=payload)
+    operation = _first_present(
+        (raw, span_data, data, payload, attributes),
+        ("gen_ai.operation.name", "operation", "operation.name", "event", "method", "type"),
+    )
+    node = _orchestration_node_name(raw, span_data, data, payload, params, params_data, attributes)
+    route_from = _orchestration_route_source(raw, span_data, data, payload, params_data, attributes)
+    route_to = _orchestration_route_target(raw, span_data, data, payload, params_data, attributes)
+    status = _orchestration_status(raw, data, payload, attributes)
+    error = _framework_error(raw, data=data, payload=payload, attributes=attributes)
+    latency_ms = _first_number(raw, attributes, ("latency_ms", "duration_ms", "elapsed_ms", "duration"))
+    if latency_ms is None:
+        latency_ms = _duration_ms_from_span(raw, attributes)
+    cost = _framework_usage(raw, span_data=span_data, data=data, attributes=attributes)
+    attempt = _orchestration_attempt(raw, data, payload, attributes)
+    recoverable = _orchestration_recoverable(raw, data, payload, attributes)
+    recovered = _orchestration_recovered(raw, data, payload, attributes)
+    signals = _orchestration_step_signals(
+        raw,
+        attributes,
+        name,
+        operation=operation,
+        node=node,
+        route_from=route_from,
+        route_to=route_to,
+        status=status,
+        error=error,
+        attempt=attempt,
+        recoverable=recoverable,
+        recovered=recovered,
+        latency_ms=latency_ms,
+        cost=cost,
+    )
+    state = _orchestration_state_payload(raw, data, payload, params_data)
+    step_id = str(
+        raw.get("id")
+        or raw.get("span_id")
+        or raw.get("spanId")
+        or raw.get("run_id")
+        or raw.get("task_id")
+        or f"step_{index + 1}"
+    )
+    result = {
+        "id": step_id,
+        "name": name,
+        "framework": str(raw.get("framework") or framework),
+        "type": _normalize_orchestration_trace_key(operation or raw.get("type") or raw.get("kind") or name),
+        "node": node,
+        "route_from": route_from,
+        "route_to": route_to,
+        "status": status,
+        "attempt": attempt,
+        "recoverable": recoverable,
+        "recovered": recovered,
+        "error": error,
+        "latency_ms": latency_ms,
+        "cost": cost,
+        "signals": sorted(signals),
+        "state": state,
+        "input": _first_present((raw, span_data, data, payload, attributes), ("input", "input.value", "gen_ai.input", "gen_ai.input.messages")),
+        "output": _first_present((raw, span_data, data, payload, attributes), ("output", "output.value", "result", "gen_ai.output", "gen_ai.output.messages")),
+        "tool_name": _framework_tool_name_from_payload(params_data)
+        or _framework_tool_name_from_payload(raw)
+        or _framework_tool_name_from_payload(data)
+        or _framework_tool_name_from_payload(payload)
+        or _framework_tool_name_from_payload(span_data)
+        or _framework_tool_name_from_payload(attributes),
+        "attributes": attributes,
+    }
+    for key in (
+        "trace_id",
+        "traceId",
+        "span_id",
+        "spanId",
+        "parent_id",
+        "parent_span_id",
+        "parentSpanId",
+        "timestamp_ms",
+        "start_time",
+        "end_time",
+        "startTimeUnixNano",
+        "endTimeUnixNano",
+    ):
+        if raw.get(key) not in (None, "", [], {}):
+            result[key] = raw.get(key)
+    return {key: copy.deepcopy(val) for key, val in result.items() if val not in (None, "", [], {})}
+
+
+def _normalize_orchestration_node(value: Mapping[str, Any], *, framework: str) -> Dict[str, Any]:
+    data = copy.deepcopy(dict(value))
+    node_id = str(data.get("id") or data.get("node") or data.get("name") or data.get("agent") or "")
+    name = str(data.get("name") or data.get("node") or data.get("agent") or node_id)
+    signals = {_normalize_orchestration_trace_key(signal) for signal in _as_iterable(data.get("signals"))}
+    signals.update(_orchestration_text_signals(" ".join([name, str(data.get("type", "")), str(data.get("role", ""))])))
+    result = {
+        "id": node_id or _normalize_orchestration_name(name),
+        "name": name or node_id,
+        "framework": str(data.get("framework") or framework),
+        "type": data.get("type") or data.get("role") or "node",
+        "status": data.get("status"),
+        "signals": sorted(signal for signal in signals if signal),
+        "metadata": copy.deepcopy(data.get("metadata", {})),
+    }
+    return {key: value for key, value in result.items() if value not in (None, "", [], {})}
+
+
+def _normalize_orchestration_edge(value: Mapping[str, Any], *, framework: str) -> Dict[str, Any]:
+    data = copy.deepcopy(dict(value))
+    source = data.get("from") or data.get("source") or data.get("source_node") or data.get("route_from")
+    target = data.get("to") or data.get("target") or data.get("target_node") or data.get("route_to")
+    edge_id = str(data.get("id") or f"{source}->{target}")
+    edge_type = _normalize_orchestration_trace_key(data.get("type") or data.get("kind") or data.get("route_type") or "route")
+    signals = {_normalize_orchestration_trace_key(signal) for signal in _as_iterable(data.get("signals"))}
+    signals.update({"route", edge_type})
+    result = {
+        "id": edge_id,
+        "from": str(source) if source not in (None, "", [], {}) else None,
+        "to": str(target) if target not in (None, "", [], {}) else None,
+        "framework": str(data.get("framework") or framework),
+        "type": edge_type,
+        "condition": data.get("condition"),
+        "signals": sorted(signal for signal in signals if signal),
+        "metadata": copy.deepcopy(data.get("metadata", {})),
+    }
+    return {key: value for key, value in result.items() if value not in (None, "", [], {})}
+
+
+def _orchestration_node_name(*sources: Mapping[str, Any]) -> str:
+    for source in sources:
+        if not isinstance(source, Mapping):
+            continue
+        for key in (
+            "node",
+            "current_node",
+            "langgraph_node",
+            "processor",
+            "processor_name",
+            "agent",
+            "agent_name",
+            "speaker",
+            "source",
+            "gen_ai.agent.name",
+            "gen_ai.workflow.name",
+            "crewai.agent.role",
+            "openai.agent.name",
+        ):
+            value = source.get(key)
+            if value not in (None, "", [], {}):
+                return str(value)
+    namespace = _framework_value_from_sources(sources, ("namespace", "ns"))
+    segments = _framework_namespace_segments(namespace)
+    if segments:
+        return segments[-1]
+    for source in sources:
+        if not isinstance(source, Mapping):
+            continue
+        if len(source) == 1:
+            key = next(iter(source.keys()))
+            if key not in {"input", "output", "metadata", "attributes"}:
+                return str(key)
+    return ""
+
+
+def _orchestration_route_source(*sources: Mapping[str, Any]) -> str:
+    return str(
+        _framework_value_from_sources(
+            sources,
+            ("route_from", "from", "from_node", "source_node", "source", "old_state", "handoff_from", "parent_node"),
+        )
+        or ""
+    )
+
+
+def _orchestration_route_target(*sources: Mapping[str, Any]) -> str:
+    return str(
+        _framework_value_from_sources(
+            sources,
+            ("route_to", "to", "to_node", "target_node", "target", "new_state", "handoff_to", "recipient", "next_node"),
+        )
+        or ""
+    )
+
+
+def _orchestration_status(
+    raw: Mapping[str, Any],
+    data: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    attributes: Mapping[str, Any],
+) -> str:
+    for source in (raw, data, payload, attributes):
+        value = source.get("status") or source.get("state")
+        if isinstance(value, Mapping):
+            value = value.get("code") or value.get("status")
+        if value not in (None, "", [], {}):
+            text = str(value).lower()
+            if text in {"2", "error", "status_code_error", "failed", "failure"}:
+                return "error"
+            if text in {"ok", "1", "success", "succeeded", "complete", "completed", "finished"}:
+                return "success"
+            return str(value)
+    if _framework_error(raw, data=data, payload=payload, attributes=attributes):
+        return "error"
+    return "success"
+
+
+def _orchestration_attempt(
+    raw: Mapping[str, Any],
+    data: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    attributes: Mapping[str, Any],
+) -> Optional[int]:
+    value = _framework_value_from_sources(
+        (raw, data, payload, attributes),
+        ("attempt", "attempt_number", "retry_attempt", "retries", "retry_count"),
+    )
+    if value in (None, "", [], {}):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _orchestration_recoverable(
+    raw: Mapping[str, Any],
+    data: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    attributes: Mapping[str, Any],
+) -> Optional[bool]:
+    value = _framework_value_from_sources((raw, data, payload, attributes), ("recoverable", "error.recoverable"))
+    if value in (None, "", [], {}):
+        error_payload = _coerce_plain_dict(raw.get("error") or data.get("error") or payload.get("error"))
+        value = error_payload.get("recoverable")
+    if value in (None, "", [], {}):
+        return None
+    return bool(value) if isinstance(value, bool) else str(value).lower() in {"true", "1", "yes", "recoverable"}
+
+
+def _orchestration_recovered(
+    raw: Mapping[str, Any],
+    data: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    attributes: Mapping[str, Any],
+) -> Optional[bool]:
+    value = _framework_value_from_sources((raw, data, payload, attributes), ("recovered", "recovery", "resumed"))
+    if value in (None, "", [], {}):
+        return None
+    return bool(value) if isinstance(value, bool) else str(value).lower() in {"true", "1", "yes", "recovered", "resumed"}
+
+
+def _orchestration_state_payload(
+    raw: Mapping[str, Any],
+    data: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    params_data: Mapping[str, Any],
+) -> Any:
+    for source in (raw, data, payload, params_data):
+        if source.get("state") not in (None, "", [], {}):
+            return copy.deepcopy(source.get("state"))
+    method = str(raw.get("method") or data.get("method") or payload.get("method") or "").lower()
+    event_type = str(raw.get("type") or data.get("type") or payload.get("type") or "").lower()
+    if method in {"updates", "values", "checkpoints", "tasks"}:
+        return copy.deepcopy(params_data or data or payload)
+    if event_type in {"updates", "values", "checkpoints", "tasks"}:
+        return copy.deepcopy(data or payload)
+    return None
+
+
+def _orchestration_step_signals(
+    raw: Mapping[str, Any],
+    attributes: Mapping[str, Any],
+    name: str,
+    *,
+    operation: Any,
+    node: str,
+    route_from: str,
+    route_to: str,
+    status: str,
+    error: Any,
+    attempt: Optional[int],
+    recoverable: Optional[bool],
+    recovered: Optional[bool],
+    latency_ms: Optional[int],
+    cost: Any,
+) -> set[str]:
+    text = " ".join(
+        [
+            name,
+            str(operation or ""),
+            str(node or ""),
+            str(raw.get("type", "")),
+            str(raw.get("event", "")),
+            str(raw.get("method", "")),
+            " ".join(str(key) for key in raw.keys()),
+            " ".join(str(key) for key in attributes.keys()),
+            " ".join(str(value) for value in raw.values() if isinstance(value, (str, int, float, bool))),
+            " ".join(str(value) for value in attributes.values() if isinstance(value, (str, int, float, bool))),
+        ]
+    ).lower()
+    signals = {"step"}
+    signals.update(_orchestration_text_signals(text))
+    if node:
+        signals.add("node")
+    if route_from or route_to:
+        signals.add("route")
+    if error or str(status).lower() in {"error", "failed", "failure"}:
+        signals.add("error")
+    if attempt and attempt > 1:
+        signals.add("retry")
+    if recovered:
+        signals.add("recovered")
+    if latency_ms is not None:
+        signals.add("latency")
+    if cost not in (None, "", [], {}):
+        signals.add("cost")
+    for signal in _as_iterable(raw.get("signals")):
+        normalized = _normalize_orchestration_trace_key(signal)
+        if normalized:
+            signals.add(normalized)
+    return {_normalize_orchestration_trace_key(signal) for signal in signals if signal}
+
+
+def _orchestration_text_signals(text: str) -> set[str]:
+    lowered = str(text).lower()
+    token_map = {
+        "workflow": "workflow",
+        "invoke_workflow": "workflow",
+        "graph": "workflow",
+        "chain": "workflow",
+        "agent": "agent",
+        "node": "node",
+        "task": "task",
+        "tool": "tool",
+        "function": "tool",
+        "execute_tool": "tool",
+        "model": "model",
+        "llm": "model",
+        "generation": "model",
+        "route": "route",
+        "edge": "route",
+        "handoff": "handoff",
+        "transfer": "handoff",
+        "retry": "retry",
+        "recover": "recovered",
+        "error": "error",
+        "exception": "error",
+        "fail": "error",
+        "state": "state",
+        "updates": "state",
+        "values": "state",
+        "checkpoint": "checkpoint",
+        "memory": "memory",
+        "retriev": "retrieval",
+        "latency": "latency",
+        "duration": "latency",
+        "cost": "cost",
+        "token": "cost",
+        "usage": "cost",
+        "livekit": "voice",
+        "pipecat": "voice",
+        "voice": "voice",
+        "audio": "voice",
+        "frame": "frame",
+        "interrupt": "interrupt",
+        "barge": "interrupt",
+    }
+    return {signal for token, signal in token_map.items() if token in lowered}
+
+
+def _orchestration_graph_from_steps(
+    steps: Sequence[Mapping[str, Any]],
+    *,
+    framework: str,
+) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    nodes: List[Dict[str, Any]] = []
+    edges: List[Dict[str, Any]] = []
+    previous_node = ""
+    for step in steps:
+        node = str(step.get("node") or "")
+        route_from = str(step.get("route_from") or "")
+        route_to = str(step.get("route_to") or "")
+        for candidate in (route_from, node, route_to):
+            if candidate:
+                nodes.append(
+                    _normalize_orchestration_node(
+                        {
+                            "id": _normalize_orchestration_name(candidate),
+                            "name": candidate,
+                            "framework": framework,
+                            "signals": ["node", *list(step.get("signals", []))],
+                            "status": step.get("status"),
+                        },
+                        framework=framework,
+                    )
+                )
+        if route_from and route_to:
+            edges.append(
+                _normalize_orchestration_edge(
+                    {
+                        "from": route_from,
+                        "to": route_to,
+                        "type": "handoff" if "handoff" in set(step.get("signals", [])) else "route",
+                        "framework": framework,
+                        "signals": ["route", *list(step.get("signals", []))],
+                    },
+                    framework=framework,
+                )
+            )
+        if previous_node and node and previous_node != node:
+            edges.append(
+                _normalize_orchestration_edge(
+                    {
+                        "from": previous_node,
+                        "to": node,
+                        "type": "sequence",
+                        "framework": framework,
+                        "signals": ["route", "sequence"],
+                    },
+                    framework=framework,
+                )
+            )
+        if node:
+            previous_node = node
+        elif route_to:
+            previous_node = route_to
+    return nodes, edges
+
+
+def _orchestration_trace_signals(
+    nodes: Sequence[Mapping[str, Any]],
+    edges: Sequence[Mapping[str, Any]],
+    steps: Sequence[Mapping[str, Any]],
+    state: Optional[Mapping[str, Any]],
+) -> set[str]:
+    signals: set[str] = set()
+    if nodes:
+        signals.add("node")
+    if edges:
+        signals.add("route")
+    if steps:
+        signals.add("step")
+    if state:
+        signals.add("state")
+    for record in [*nodes, *edges, *steps]:
+        for signal in _as_iterable(record.get("signals")):
+            normalized = _normalize_orchestration_trace_key(signal)
+            if normalized:
+                signals.add(normalized)
+    return signals
+
+
+def _orchestration_trace_summary(
+    steps: Sequence[Mapping[str, Any]],
+    edges: Sequence[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    failures = [step for step in steps if "error" in set(step.get("signals", [])) or step.get("error")]
+    retry_steps = [
+        step
+        for step in steps
+        if "retry" in set(step.get("signals", [])) or (_orchestration_int(step.get("attempt")) or 0) > 1
+    ]
+    recovered = [step for step in steps if "recovered" in set(step.get("signals", [])) or step.get("recovered") is True]
+    recovered.extend(_orchestration_inferred_recovered_steps(steps))
+    latency_values = [
+        _orchestration_int(step.get("latency_ms"))
+        for step in steps
+        if step.get("latency_ms") not in (None, "", [], {})
+    ]
+    cost_values = [
+        _orchestration_numeric_cost(step.get("cost"))
+        for step in steps
+        if step.get("cost") not in (None, "", [], {})
+    ]
+    summary = {
+        "node_count": len({_normalize_orchestration_name(step.get("node")) for step in steps if step.get("node")}),
+        "edge_count": len(edges),
+        "step_count": len(steps),
+        "failure_count": len(failures),
+        "retry_count": len(retry_steps),
+        "recovered_failures": len(_dedupe_orchestration_records(recovered)),
+        "terminal_status": str(steps[-1].get("status")) if steps else "unknown",
+    }
+    if latency_values:
+        summary["total_latency_ms"] = sum(value or 0 for value in latency_values)
+    if cost_values:
+        summary["total_cost"] = sum(cost_values)
+    return summary
+
+
+def _orchestration_inferred_recovered_steps(steps: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+    failed_nodes: set[str] = set()
+    recovered: List[Dict[str, Any]] = []
+    for step in steps:
+        node = _normalize_orchestration_name(step.get("node"))
+        if not node:
+            continue
+        if "error" in set(step.get("signals", [])) or step.get("error"):
+            failed_nodes.add(node)
+        elif node in failed_nodes and str(step.get("status", "")).lower() in {"success", "succeeded", "complete", "completed"}:
+            recovered.append(dict(step))
+            failed_nodes.remove(node)
+    return recovered
+
+
+def _orchestration_numeric_cost(value: Any) -> float:
+    if value in (None, "", [], {}):
+        return 0.0
+    if isinstance(value, bool):
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return 0.0
+    if isinstance(value, Mapping):
+        total = 0.0
+        for key, item in value.items():
+            if any(token in str(key).lower() for token in ("cost", "token", "duration", "usage", "total")):
+                total += _orchestration_numeric_cost(item)
+        return total
+    if isinstance(value, Iterable):
+        return sum(_orchestration_numeric_cost(item) for item in value)
+    return 0.0
+
+
+def _orchestration_int(value: Any) -> Optional[int]:
+    if value in (None, "", [], {}):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _dedupe_orchestration_records(records: Iterable[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+    deduped: Dict[str, Dict[str, Any]] = {}
+    for record in records:
+        record_dict = copy.deepcopy(dict(record))
+        key = str(
+            record_dict.get("id")
+            or f"{record_dict.get('from', '')}->{record_dict.get('to', '')}:{record_dict.get('type', '')}"
+            or record_dict.get("name")
+        )
+        if key in deduped:
+            existing = deduped[key]
+            existing_signals = set(_as_iterable(existing.get("signals")))
+            existing_signals.update(_as_iterable(record_dict.get("signals")))
+            existing["signals"] = sorted(str(signal) for signal in existing_signals if signal)
+            for item_key, item_value in record_dict.items():
+                if item_value not in (None, "", [], {}) and existing.get(item_key) in (None, "", [], {}):
+                    existing[item_key] = item_value
+        else:
+            deduped[key] = record_dict
+    return list(deduped.values())
+
+
+def _find_orchestration_record(
+    records: Iterable[Mapping[str, Any]],
+    record_id: str,
+) -> Optional[Mapping[str, Any]]:
+    normalized = _normalize_orchestration_name(record_id)
+    if not normalized:
+        return None
+    for record in records:
+        if normalized in {
+            _normalize_orchestration_name(record.get("id")),
+            _normalize_orchestration_name(record.get("name")),
+            _normalize_orchestration_name(record.get("node")),
+        }:
+            return record
+    return None
+
+
+def _find_orchestration_edge(
+    edges: Iterable[Mapping[str, Any]],
+    *,
+    edge_id: str = "",
+    from_node: Any = None,
+    to_node: Any = None,
+) -> Optional[Mapping[str, Any]]:
+    normalized_id = _normalize_orchestration_name(edge_id)
+    normalized_from = _normalize_orchestration_name(from_node)
+    normalized_to = _normalize_orchestration_name(to_node)
+    for edge in edges:
+        if normalized_id and normalized_id in {
+            _normalize_orchestration_name(edge.get("id")),
+            _normalize_orchestration_name(f"{edge.get('from')}->{edge.get('to')}"),
+        }:
+            return edge
+        if normalized_from and normalized_to:
+            if (
+                _normalize_orchestration_name(edge.get("from")) == normalized_from
+                and _normalize_orchestration_name(edge.get("to")) == normalized_to
+            ):
+                return edge
+    return None
+
+
+def _normalize_orchestration_name(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    text = text.replace("->", "_to_")
+    text = "".join(ch if ch.isalnum() else "_" for ch in text)
+    while "__" in text:
+        text = text.replace("__", "_")
+    return text.strip("_")
+
+
+def _orchestration_step_event(step: Mapping[str, Any], framework: str) -> SimulationEvent:
+    return SimulationEvent(
+        type="orchestration_step",
+        name=str(step.get("name") or step.get("node") or "orchestration_step"),
+        payload=copy.deepcopy(dict(step)),
+        timestamp_ms=step.get("timestamp_ms"),
+        metadata={
+            "framework": str(step.get("framework") or framework),
+            "signals": list(step.get("signals", [])),
+        },
+    )
 
 
 DEFAULT_AUTONOMY_STAGES = ["observe", "orient", "plan", "act", "verify", "reflect", "memory"]

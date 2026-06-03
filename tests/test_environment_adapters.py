@@ -16,6 +16,7 @@ from fi.simulate import (
     FrameworkTraceEnvironment,
     ImageEnvironment,
     MultiAgentRoomEnvironment,
+    OrchestrationTraceEnvironment,
     RetrievalMemoryEnvironment,
     StructuredArtifactEnvironment,
     ToolFaultInjectionEnvironment,
@@ -30,6 +31,7 @@ from fi.simulate import (
     load_openai_agents_trace,
     load_langchain_event_stream,
     load_langgraph_event_stream,
+    normalize_orchestration_trace_export,
     normalize_framework_trace_events,
     normalize_framework_trace_export,
     normalize_browser_trace_export,
@@ -1474,6 +1476,168 @@ def test_normalize_framework_trace_events_accepts_traceai_and_native_records():
     assert normalized[0]["input"] == "order 123"
     assert normalized[0]["output"] == "planned tool call"
     assert normalized[2]["id"] == "lc_tool"
+
+
+@pytest.mark.asyncio
+async def test_orchestration_trace_environment_replays_graph_runtime_evidence():
+    seen_tools = []
+
+    async def agent(input):
+        seen_tools.extend(tool["name"] for tool in input.tools)
+        return AgentResponse(
+            content="I inspected the orchestration graph, retry, recovery, and route evidence.",
+            tool_calls=[
+                {"id": "status", "name": "orchestration_trace_status", "arguments": {}},
+                {"id": "retries", "name": "list_orchestration_steps", "arguments": {"signal": "retry"}},
+                {
+                    "id": "node",
+                    "name": "inspect_orchestration_node",
+                    "arguments": {"id": "policy_agent"},
+                },
+                {
+                    "id": "edge",
+                    "name": "inspect_orchestration_edge",
+                    "arguments": {"from": "triage_agent", "to": "policy_agent"},
+                },
+            ],
+        )
+
+    records = [
+        {
+            "id": "workflow",
+            "name": "invoke_workflow refund_graph",
+            "attributes": {
+                "gen_ai.operation.name": "invoke_workflow",
+                "gen_ai.workflow.name": "refund_graph",
+            },
+            "duration_ms": 8,
+        },
+        {
+            "id": "route_policy",
+            "name": "handoff triage to policy",
+            "node": "triage_agent",
+            "route_from": "triage_agent",
+            "route_to": "policy_agent",
+            "type": "handoff",
+            "latency_ms": 12,
+        },
+        {
+            "id": "policy_error",
+            "name": "policy_agent tool timeout",
+            "node": "policy_agent",
+            "event": "error",
+            "error": {"message": "rate limit", "recoverable": True},
+            "attempt": 1,
+            "latency_ms": 40,
+        },
+        {
+            "id": "policy_retry",
+            "name": "policy_agent retry succeeded",
+            "node": "policy_agent",
+            "event": "retry",
+            "status": "success",
+            "attempt": 2,
+            "recovered": True,
+            "latency_ms": 35,
+            "usage": {"total_tokens": 80},
+        },
+        {
+            "id": "refund_tool",
+            "name": "execute_tool issue_refund",
+            "node": "refund_tool",
+            "route_from": "policy_agent",
+            "route_to": "refund_tool",
+            "attributes": {
+                "gen_ai.operation.name": "execute_tool",
+                "gen_ai.tool.name": "issue_refund",
+            },
+            "latency_ms": 30,
+        },
+        {
+            "id": "final_state",
+            "method": "updates",
+            "params": {
+                "namespace": ["refund_graph:run_1", "final_node:task_1"],
+                "data": {"case": {"status": "resolved"}},
+            },
+        },
+    ]
+
+    report = await LocalTextEngine().run(
+        scenario=_scenario(),
+        agent_callback=agent,
+        environment=OrchestrationTraceEnvironment(
+            framework="langgraph",
+            records=records,
+            state={"case": {"status": "resolved"}},
+        ),
+        max_turns=1,
+        min_turns=1,
+    )
+
+    result = report.results[0]
+    trace_state = result.metadata["environment_state"]["orchestration_trace"]
+    trace_artifacts = [
+        artifact.data
+        for artifact in result.artifacts
+        if artifact.type == "trace" and artifact.metadata.get("kind") == "orchestration_trace"
+    ]
+
+    assert {
+        "orchestration_trace_status",
+        "list_orchestration_steps",
+        "inspect_orchestration_node",
+        "inspect_orchestration_edge",
+    } <= set(seen_tools)
+    assert trace_state["framework"] == "langgraph"
+    assert {"workflow", "route", "handoff", "retry", "recovered", "latency", "cost", "tool", "state"} <= set(trace_state["signals"])
+    assert trace_state["summary"]["retry_count"] == 1
+    assert trace_state["summary"]["recovered_failures"] == 1
+    assert trace_state["summary"]["total_latency_ms"] == 125
+    assert any(edge["from"] == "triage_agent" and edge["to"] == "policy_agent" for edge in trace_state["edges"])
+    assert trace_artifacts and trace_artifacts[-1]["steps"]
+    assert any(event.type == "orchestration_step" and event.name == "policy_agent retry succeeded" for event in result.events)
+
+
+def test_normalize_orchestration_trace_export_projects_otlp_workflow_graph():
+    trace = normalize_orchestration_trace_export(
+        [
+            {
+                "name": "invoke_workflow refund_graph",
+                "spanId": "workflow",
+                "attributes": {
+                    "gen_ai.operation.name": "invoke_workflow",
+                    "gen_ai.workflow.name": "refund_graph",
+                },
+                "startTimeUnixNano": 1_000_000,
+                "endTimeUnixNano": 21_000_000,
+            },
+            {
+                "name": "execute_tool lookup_order",
+                "spanId": "tool",
+                "parentSpanId": "workflow",
+                "node": "lookup_node",
+                "attributes": {
+                    "gen_ai.operation.name": "execute_tool",
+                    "gen_ai.tool.name": "lookup_order",
+                    "gen_ai.usage.total_tokens": 12,
+                },
+            },
+            {
+                "event": "agent_state_changed",
+                "framework": "livekit",
+                "payload": {"old_state": "thinking", "new_state": "speaking"},
+            },
+        ],
+        framework="traceai",
+        state={"case": {"status": "resolved"}},
+    )
+
+    assert trace["kind"] == "orchestration_trace"
+    assert trace["framework"] == "traceai"
+    assert {"workflow", "tool", "voice", "route", "latency", "cost", "state"} <= set(trace["signals"])
+    assert trace["summary"]["total_latency_ms"] == 20
+    assert trace["summary"]["total_cost"] == 12
 
 
 def test_langgraph_event_stream_loader_preserves_transcript_fields():
