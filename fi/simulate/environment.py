@@ -3528,6 +3528,125 @@ def load_world_attack_replay(
     )
 
 
+def normalize_world_orchestration_replay(
+    *,
+    orchestration_trace: Optional[Mapping[str, Any]] = None,
+    world_attack_replay: Optional[Mapping[str, Any]] = None,
+    world_contract: Optional[Mapping[str, Any]] = None,
+    attack_pack: Optional[Mapping[str, Any]] = None,
+    state: Optional[Mapping[str, Any]] = None,
+    metadata: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Normalize workflow orchestration, world contract, and attack evidence into one replay."""
+
+    orchestration = _coerce_plain_dict(orchestration_trace)
+    if orchestration and str(orchestration.get("kind") or "") != "orchestration_trace":
+        orchestration = normalize_orchestration_trace_events(
+            str(orchestration.get("framework") or "traceai"),
+            _as_iterable(orchestration.get("records") or orchestration.get("events")),
+            nodes=_as_iterable(orchestration.get("nodes")),
+            edges=_as_iterable(orchestration.get("edges")),
+            steps=_as_iterable(orchestration.get("steps")),
+            state=_as_mapping(orchestration.get("state")),
+            metadata=_as_mapping(orchestration.get("metadata")),
+        )
+
+    replay = _coerce_plain_dict(world_attack_replay)
+    if replay and str(replay.get("kind") or "") != "world_attack_replay":
+        replay = normalize_world_attack_replay(
+            world_contract=replay.get("world_contract") or replay.get("world") or replay.get("contract"),
+            attack_pack=replay.get("attack_pack") or replay.get("adversarial") or replay.get("attacks"),
+            state=_as_mapping(replay.get("state")),
+            metadata=_as_mapping(replay.get("metadata")),
+        )
+    elif not replay:
+        replay = normalize_world_attack_replay(
+            world_contract=world_contract,
+            attack_pack=attack_pack,
+        )
+
+    world = _coerce_plain_dict(world_contract) or _coerce_plain_dict(replay.get("world_contract"))
+    attack = _coerce_plain_dict(attack_pack) or _coerce_plain_dict(replay.get("attack_pack"))
+    orchestration_summary = _as_mapping(orchestration.get("summary")) if orchestration else {}
+    replay_summary = _as_mapping(replay.get("summary")) if replay else {}
+    world_summary = _as_mapping(world.get("summary")) if world else {}
+    attack_summary = _as_mapping(attack.get("summary")) if attack else {}
+    signals = {
+        "world_orchestration_replay",
+        "world_attack_replay",
+        "world_contract",
+        "adversarial_attack_pack",
+        "orchestration_trace",
+        *(_as_iterable(orchestration.get("signals")) if orchestration else []),
+        *(_as_iterable(replay.get("signals")) if replay else []),
+        *(_as_iterable(world.get("signals")) if world else []),
+        *(_as_iterable(attack.get("signals")) if attack else []),
+    }
+    return {
+        "kind": "world_orchestration_replay",
+        "orchestration_trace": orchestration,
+        "world_attack_replay": replay,
+        "world_contract": world,
+        "attack_pack": attack,
+        "state": _coerce_plain_dict(state),
+        "signals": sorted(
+            {
+                _normalize_orchestration_trace_key(signal) or _normalize_world_contract_key(signal)
+                for signal in signals
+                if signal
+            }
+        ),
+        "summary": {
+            "framework": orchestration.get("framework") if orchestration else None,
+            "orchestration_step_count": orchestration_summary.get("step_count", 0),
+            "orchestration_retry_count": orchestration_summary.get("retry_count", 0),
+            "orchestration_recovered_failures": orchestration_summary.get("recovered_failures", 0),
+            "orchestration_terminal_status": orchestration_summary.get("terminal_status"),
+            "world_name": world.get("name") if world else replay_summary.get("world_name"),
+            "world_terminal_status": world_summary.get("terminal_status")
+            or replay_summary.get("world_terminal_status"),
+            "completed_required_transition_count": world_summary.get("completed_required_transition_count")
+            or replay_summary.get("completed_required_transition_count"),
+            "required_transition_count": world_summary.get("required_transition_count")
+            or replay_summary.get("required_transition_count"),
+            "invariant_violation_count": world_summary.get("invariant_violation_count")
+            or replay_summary.get("invariant_violation_count", 0),
+            "attack_count": attack_summary.get("attack_count", replay_summary.get("attack_count", 0)),
+            "surface_count": attack_summary.get("surface_count", replay_summary.get("surface_count", 0)),
+            "canary_count": attack_summary.get("canary_count", replay_summary.get("canary_count", 0)),
+            "blocked_tool_count": attack_summary.get(
+                "blocked_tool_count",
+                replay_summary.get("blocked_tool_count", 0),
+            ),
+        },
+        "metadata": copy.deepcopy(dict(metadata or {})),
+    }
+
+
+def load_world_orchestration_replay(
+    source: str | Mapping[str, Any],
+    *,
+    headers: Optional[Mapping[str, str]] = None,
+    timeout: float = 30.0,
+) -> "WorldOrchestrationReplayEnvironment":
+    """Load a portable workflow/world/security replay export into a local environment."""
+
+    data = (
+        copy.deepcopy(dict(source))
+        if isinstance(source, Mapping)
+        else _load_framework_trace_export_source(source, headers=headers, timeout=timeout)
+    )
+    if not isinstance(data, Mapping):
+        raise TypeError("World orchestration replay export must be a mapping")
+    return WorldOrchestrationReplayEnvironment(
+        orchestration_trace=data.get("orchestration_trace") or data.get("workflow") or data.get("trace"),
+        world_attack_replay=data.get("world_attack_replay"),
+        world_contract=data.get("world_contract") or data.get("contract") or data.get("world"),
+        attack_pack=data.get("attack_pack") or data.get("adversarial") or data.get("attacks"),
+        metadata=_as_mapping(data.get("metadata")),
+    )
+
+
 class WorldAttackReplayEnvironment(EnvironmentAdapter):
     """
     Combined world-contract and adversarial attack-pack replay environment.
@@ -3673,6 +3792,188 @@ class WorldAttackReplayEnvironment(EnvironmentAdapter):
             state={
                 "world_contract": world_payload,
                 "adversarial": adversarial_payload,
+            },
+            metadata=self.metadata,
+        )
+
+
+class WorldOrchestrationReplayEnvironment(EnvironmentAdapter):
+    """
+    Combined workflow graph, world-contract, and adversarial replay environment.
+
+    Use this when one portable trace artifact should prove orchestration
+    routing/recovery, world progress, invariants, and hostile-surface handling.
+    """
+
+    name = "world_orchestration_replay"
+
+    def __init__(
+        self,
+        *,
+        orchestration_trace: Optional[Mapping[str, Any] | "OrchestrationTraceEnvironment"] = None,
+        world_attack_replay: Optional[Mapping[str, Any] | WorldAttackReplayEnvironment] = None,
+        world_contract: Optional[Mapping[str, Any] | WorldContractEnvironment] = None,
+        attack_pack: Optional[Mapping[str, Any]] = None,
+        framework: str = "traceai",
+        records: Optional[Iterable[str | Mapping[str, Any]]] = None,
+        nodes: Optional[Iterable[Mapping[str, Any]]] = None,
+        edges: Optional[Iterable[Mapping[str, Any]]] = None,
+        steps: Optional[Iterable[Mapping[str, Any]]] = None,
+        orchestration_state: Optional[Mapping[str, Any]] = None,
+        include_blocked_tools: bool = True,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        if isinstance(orchestration_trace, OrchestrationTraceEnvironment):
+            self.orchestration = orchestration_trace
+        else:
+            orchestration_payload = _coerce_plain_dict(orchestration_trace)
+            self.orchestration = OrchestrationTraceEnvironment(
+                framework=str(orchestration_payload.get("framework") or framework),
+                records=[
+                    *(_as_iterable(orchestration_payload.get("records") or orchestration_payload.get("events"))),
+                    *list(records or []),
+                ],
+                nodes=list(nodes or _as_iterable(orchestration_payload.get("nodes"))),
+                edges=list(edges or _as_iterable(orchestration_payload.get("edges"))),
+                steps=list(steps or _as_iterable(orchestration_payload.get("steps"))),
+                state=orchestration_state or _as_mapping(orchestration_payload.get("state")),
+                metadata=_as_mapping(orchestration_payload.get("metadata")),
+            )
+
+        if isinstance(world_attack_replay, WorldAttackReplayEnvironment):
+            self.world_attack = world_attack_replay
+        else:
+            replay_payload = _coerce_plain_dict(world_attack_replay)
+            self.world_attack = WorldAttackReplayEnvironment(
+                world_contract=world_contract
+                or replay_payload.get("world_contract")
+                or replay_payload.get("world")
+                or replay_payload.get("contract"),
+                attack_pack=attack_pack
+                or replay_payload.get("attack_pack")
+                or replay_payload.get("adversarial")
+                or replay_payload.get("attacks"),
+                include_blocked_tools=include_blocked_tools,
+                metadata=_as_mapping(replay_payload.get("metadata")),
+            )
+        self.metadata = copy.deepcopy(dict(metadata or {}))
+        self.state: Dict[str, Any] = {}
+
+    def reset(self, **context: Any) -> EnvironmentSnapshot:
+        self.state = {}
+        orchestration_snapshot = self.orchestration.reset(**context)
+        world_snapshot = self.world_attack.reset(**context)
+        snapshot = _merge_environment_snapshots(orchestration_snapshot, world_snapshot)
+        _deep_merge(self.state, snapshot.state)
+        return _merge_environment_snapshots(snapshot, self._snapshot("world_orchestration_replay_ready"))
+
+    def observe(self, **context: Any) -> EnvironmentSnapshot:
+        snapshot = _merge_environment_snapshots(
+            self.orchestration.observe(**context),
+            self.world_attack.observe(**context),
+        )
+        _deep_merge(self.state, snapshot.state)
+        return _merge_environment_snapshots(
+            snapshot,
+            self._snapshot("world_orchestration_replay_observed", include_event=False),
+        )
+
+    def handle_tool_call(
+        self,
+        tool_call: Mapping[str, Any],
+        **context: Any,
+    ) -> Optional[ToolExecutionResult]:
+        name = _tool_name(tool_call)
+        if name == "world_orchestration_replay_status":
+            payload = self._payload()
+            return ToolExecutionResult(
+                tool_call_id=_tool_call_id(tool_call),
+                tool_name="world_orchestration_replay_status",
+                content="World orchestration replay status recorded.",
+                result=payload,
+                success=True,
+                state_updates={"world_orchestration_replay": payload},
+                artifacts=[self._artifact()],
+                events=[
+                    SimulationEvent(
+                        type="world_orchestration_replay",
+                        name="world_orchestration_replay_status",
+                        payload=payload,
+                    )
+                ],
+            )
+
+        result = self.orchestration.handle_tool_call(tool_call, **context)
+        if result is None:
+            result = self.world_attack.handle_tool_call(tool_call, **context)
+        if result is None:
+            return None
+
+        _deep_merge(self.state, result.state_updates)
+        payload = self._payload()
+        merged_updates = copy.deepcopy(result.state_updates)
+        merged_updates["world_orchestration_replay"] = payload
+        result.state_updates = merged_updates
+        result.artifacts.append(self._artifact())
+        result.events.append(
+            SimulationEvent(
+                type="world_orchestration_replay",
+                name=f"{result.tool_name}_world_orchestration_replay_update",
+                payload=payload,
+            )
+        )
+        return result
+
+    def _snapshot(self, name: str, *, include_event: bool = True) -> EnvironmentSnapshot:
+        payload = self._payload()
+        tools = [
+            {
+                "name": "world_orchestration_replay_status",
+                "description": (
+                    "Return combined orchestration trace, world contract, attack pack, "
+                    "current state, and replay summary."
+                ),
+                "parameters": {"type": "object", "properties": {}},
+            }
+        ]
+        events = []
+        if include_event:
+            events.append(
+                SimulationEvent(
+                    type="world_orchestration_replay",
+                    name=name,
+                    payload=payload,
+                )
+            )
+        return EnvironmentSnapshot(
+            tools=tools,
+            artifacts=[self._artifact()],
+            events=events,
+            state={"world_orchestration_replay": payload},
+            metadata={"world_orchestration_replay": payload},
+        )
+
+    def _artifact(self) -> SimulationArtifact:
+        return SimulationArtifact(
+            type="trace",
+            role="environment",
+            data=self._payload(),
+            metadata={"kind": "world_orchestration_replay"},
+        )
+
+    def _payload(self) -> Dict[str, Any]:
+        orchestration_payload = _coerce_plain_dict(self.state.get("orchestration_trace"))
+        if not orchestration_payload:
+            orchestration_payload = _coerce_plain_dict(getattr(self.orchestration, "_state_payload")())
+        replay_payload = _coerce_plain_dict(self.state.get("world_attack_replay"))
+        if not replay_payload:
+            replay_payload = _coerce_plain_dict(getattr(self.world_attack, "_payload")())
+        return normalize_world_orchestration_replay(
+            orchestration_trace=orchestration_payload,
+            world_attack_replay=replay_payload,
+            state={
+                "orchestration_trace": orchestration_payload,
+                "world_attack_replay": replay_payload,
             },
             metadata=self.metadata,
         )

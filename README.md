@@ -342,7 +342,9 @@ from fi.simulate import (
     ToolMockEnvironment,
     TestRunner,
     VoiceEnvironment,
+    WorldAttackReplayEnvironment,
     WorldContractEnvironment,
+    WorldOrchestrationReplayEnvironment,
     load_adversarial_attack_pack,
     load_browser_mutation_pack,
     load_browser_trace_export,
@@ -352,7 +354,9 @@ from fi.simulate import (
     load_pipecat_frame_log,
     load_streaming_trace_export,
     load_voice_export,
+    load_world_attack_replay,
     load_world_contract,
+    load_world_orchestration_replay,
     load_autogen_groupchat_transcript,
     load_crewai_event_log,
     load_openai_agents_trace,
@@ -364,7 +368,9 @@ from fi.simulate import (
     normalize_browser_mutation_pack,
     normalize_pipecat_frame_log,
     normalize_voice_timing_distribution,
+    normalize_world_attack_replay,
     normalize_world_contract,
+    normalize_world_orchestration_replay,
     normalize_framework_trace_events,
     normalize_mcp_tool_session_export,
     normalize_browser_trace_export,
@@ -577,6 +583,7 @@ See [`examples/local_orchestration_graph_trace.py`](examples/local_orchestration
 See [`examples/local_streaming_trace_replay.py`](examples/local_streaming_trace_replay.py) for a framework-neutral streaming/session trace cookbook with chunks, tool deltas, interruption recovery, drops, latency, gaps, usage, finalization, and state checks.
 See [`examples/local_world_contract_replay.py`](examples/local_world_contract_replay.py) for a framework-neutral world contract cookbook with actors, resources, transitions, invariants, policy gates, adversarial surfaces, success conditions, and state checks.
 See [`examples/local_world_attack_replay.py`](examples/local_world_attack_replay.py) for a combined world-contract plus adversarial attack-pack replay that emits one `world_attack_replay` trace artifact/state payload for ai-evaluation scoring.
+See [`examples/local_world_orchestration_replay.py`](examples/local_world_orchestration_replay.py) for a combined orchestration graph, world-contract, and adversarial attack-pack replay that emits one `world_orchestration_replay` trace artifact/state payload for ai-evaluation scoring.
 See [`examples/local_cross_trial_memory_skill.py`](examples/local_cross_trial_memory_skill.py) for a LangGraph/LangChain-style memory and skill replay cookbook with cross-trial memory precision/recall, recall-after-write, persistence, and skill-regression scoring.
 See [`examples/local_multi_agent_framework_transcript.py`](examples/local_multi_agent_framework_transcript.py) for an AutoGen/CrewAI/OpenAI Agents-style multi-agent transcript replay cookbook with speaker, handoff, tool-owner, turn, and termination scoring.
 See [`examples/local_retrieval_memory_attribution.py`](examples/local_retrieval_memory_attribution.py) for a retrieval/memory attribution cookbook with queries, ranked documents, retrieval scores, citations, memory reads/writes, and freshness evidence.
