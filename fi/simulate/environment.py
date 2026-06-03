@@ -2931,6 +2931,159 @@ def load_adversarial_attack_pack(
     )
 
 
+def normalize_red_team_campaign_manifest(
+    payload: Any = None,
+    *,
+    name: str = "red-team-campaign",
+    target: Optional[Mapping[str, Any]] = None,
+    taxonomies: Optional[Iterable[Any]] = None,
+    attack_packs: Optional[Iterable[Any]] = None,
+    scenarios: Optional[Iterable[Any]] = None,
+    runs: Optional[Iterable[Any]] = None,
+    findings: Optional[Iterable[Any]] = None,
+    artifacts: Optional[Iterable[Any]] = None,
+    observability: Optional[Mapping[str, Any]] = None,
+    mitigations: Optional[Iterable[Any]] = None,
+    required_taxonomies: Optional[Iterable[str]] = None,
+    required_attack_types: Optional[Iterable[str]] = None,
+    required_surfaces: Optional[Iterable[str]] = None,
+    required_channels: Optional[Iterable[str]] = None,
+    required_providers: Optional[Iterable[str]] = None,
+    metadata: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Normalize campaign-level red-team evidence across tools and providers."""
+
+    payload_dict = dict(payload) if isinstance(payload, Mapping) else {}
+    campaign_name = str(payload_dict.get("name") or name)
+    target_record = _red_team_mapping(target if target is not None else payload_dict.get("target"))
+    taxonomy_records = _normalize_red_team_taxonomies(
+        taxonomies if taxonomies is not None else payload_dict.get("taxonomies")
+    )
+    attack_pack_records = _normalize_red_team_attack_packs(
+        attack_packs
+        if attack_packs is not None
+        else payload_dict.get("attack_packs", payload_dict.get("packs"))
+    )
+    scenario_records = _normalize_red_team_scenarios(
+        scenarios
+        if scenarios is not None
+        else payload_dict.get("scenarios", payload_dict.get("cases"))
+    )
+    run_records = _normalize_red_team_runs(
+        runs if runs is not None else payload_dict.get("runs", payload_dict.get("red_team_runs"))
+    )
+    finding_records = _normalize_red_team_findings(
+        findings if findings is not None else payload_dict.get("findings"),
+        runs=run_records,
+    )
+    artifact_records = _normalize_red_team_artifacts(
+        artifacts if artifacts is not None else payload_dict.get("artifacts"),
+        runs=run_records,
+    )
+    observability_record = _red_team_mapping(
+        observability if observability is not None else payload_dict.get("observability")
+    )
+    mitigation_records = _normalize_red_team_mitigations(
+        mitigations if mitigations is not None else payload_dict.get("mitigations")
+    )
+    required_taxonomy_keys = _red_team_key_list(
+        required_taxonomies
+        if required_taxonomies is not None
+        else payload_dict.get("required_taxonomies")
+    )
+    required_attack_keys = _red_team_key_list(
+        required_attack_types
+        if required_attack_types is not None
+        else payload_dict.get("required_attack_types")
+    )
+    required_surface_keys = _red_team_key_list(
+        required_surfaces
+        if required_surfaces is not None
+        else payload_dict.get("required_surfaces")
+    )
+    required_channel_keys = _red_team_key_list(
+        required_channels
+        if required_channels is not None
+        else payload_dict.get("required_channels")
+    )
+    required_provider_keys = _red_team_key_list(
+        required_providers
+        if required_providers is not None
+        else payload_dict.get("required_providers")
+    )
+    summary = _red_team_campaign_summary(
+        target=target_record,
+        taxonomies=taxonomy_records,
+        attack_packs=attack_pack_records,
+        scenarios=scenario_records,
+        runs=run_records,
+        findings=finding_records,
+        artifacts=artifact_records,
+        observability=observability_record,
+        mitigations=mitigation_records,
+        required_taxonomies=required_taxonomy_keys,
+        required_attack_types=required_attack_keys,
+        required_surfaces=required_surface_keys,
+        required_channels=required_channel_keys,
+        required_providers=required_provider_keys,
+    )
+    signals = _red_team_campaign_signals(
+        target=target_record,
+        taxonomies=taxonomy_records,
+        attack_packs=attack_pack_records,
+        scenarios=scenario_records,
+        runs=run_records,
+        findings=finding_records,
+        artifacts=artifact_records,
+        observability=observability_record,
+        mitigations=mitigation_records,
+        summary=summary,
+    )
+    return {
+        "kind": "red_team_campaign",
+        "name": campaign_name,
+        "target": target_record,
+        "taxonomies": taxonomy_records,
+        "attack_packs": attack_pack_records,
+        "scenarios": scenario_records,
+        "runs": run_records,
+        "findings": finding_records,
+        "artifacts": artifact_records,
+        "observability": observability_record,
+        "mitigations": mitigation_records,
+        "required_taxonomies": sorted(set(required_taxonomy_keys)),
+        "required_attack_types": sorted(set(required_attack_keys)),
+        "required_surfaces": sorted(set(required_surface_keys)),
+        "required_channels": sorted(set(required_channel_keys)),
+        "required_providers": sorted(set(required_provider_keys)),
+        "summary": summary,
+        "signals": signals,
+        "metadata": {
+            **copy.deepcopy(dict(payload_dict.get("metadata", {}))),
+            **copy.deepcopy(dict(metadata or {})),
+        },
+    }
+
+
+def load_red_team_campaign_manifest(
+    source: str | os.PathLike[str] | Mapping[str, Any],
+    *,
+    headers: Optional[Mapping[str, str]] = None,
+    timeout: float = 30.0,
+    **kwargs: Any,
+) -> "RedTeamCampaignEnvironment":
+    """Load a local/HTTP red-team campaign manifest and return an environment."""
+
+    data = (
+        copy.deepcopy(dict(source))
+        if isinstance(source, Mapping)
+        else _load_framework_trace_export_source(source, headers=headers, timeout=timeout)
+    )
+    if not isinstance(data, Mapping):
+        raise TypeError("Red-team campaign export must be a mapping")
+    return RedTeamCampaignEnvironment(normalize_red_team_campaign_manifest(data, **kwargs))
+
+
 def normalize_browser_mutation_pack(
     mutation_pack: Optional[Any] = None,
     *,
@@ -3114,6 +3267,384 @@ def _dedupe_strings(values: Iterable[str]) -> List[str]:
         seen.add(text)
         deduped.append(text)
     return deduped
+
+
+def _normalize_red_team_taxonomies(value: Any) -> List[Dict[str, Any]]:
+    records: List[Dict[str, Any]] = []
+    for index, raw in enumerate(_as_iterable(value), start=1):
+        item = copy.deepcopy(dict(raw)) if isinstance(raw, Mapping) else {"name": str(raw)}
+        key = _red_team_key(item.get("key") or item.get("id") or item.get("name") or f"taxonomy_{index}")
+        item.update({"id": str(item.get("id") or key), "key": key, "name": str(item.get("name") or key)})
+        records.append(item)
+    return records
+
+
+def _normalize_red_team_attack_packs(value: Any) -> List[Dict[str, Any]]:
+    records: List[Dict[str, Any]] = []
+    for index, raw in enumerate(_as_iterable(value), start=1):
+        if isinstance(raw, Mapping) and str(raw.get("kind") or "") == "adversarial_attack_pack":
+            pack = copy.deepcopy(dict(raw))
+        elif isinstance(raw, Mapping) and ("attacks" in raw or "attack_cases" in raw):
+            pack = normalize_adversarial_attack_pack(
+                attacks=_as_iterable(raw.get("attacks") or raw.get("attack_cases")),
+                surfaces=[str(surface) for surface in _as_iterable(raw.get("surfaces"))],
+                payload=raw.get("payload"),
+                canaries=raw.get("canaries") or raw.get("canary_secrets"),
+                blocked_tools=[str(tool) for tool in _as_iterable(raw.get("blocked_tools"))],
+                metadata=_as_mapping(raw.get("metadata")),
+            )
+        elif isinstance(raw, Mapping):
+            pack = copy.deepcopy(dict(raw))
+        else:
+            pack = {"name": str(raw), "attacks": []}
+        attacks = [_as_mapping(item) for item in _as_iterable(pack.get("attacks", []))]
+        taxonomies = sorted(
+            {
+                _red_team_key(item)
+                for attack in attacks
+                for item in [
+                    *_as_iterable(attack.get("owasp")),
+                    *_as_iterable(attack.get("taxonomies")),
+                    *_as_iterable(attack.get("taxonomy")),
+                ]
+                if _red_team_key(item)
+            }
+        )
+        attack_types = sorted({_red_team_key(attack.get("category") or attack.get("type")) for attack in attacks if attack})
+        surfaces = sorted(
+            {
+                _red_team_key(surface)
+                for surface in [*_as_iterable(pack.get("surfaces")), *(attack.get("surface") for attack in attacks)]
+                if _red_team_key(surface)
+            }
+        )
+        pack.update(
+            {
+                "id": str(pack.get("id") or pack.get("name") or f"attack_pack_{index}"),
+                "name": str(pack.get("name") or pack.get("id") or f"attack_pack_{index}"),
+                "attack_count": len(attacks),
+                "taxonomies": taxonomies,
+                "attack_types": attack_types,
+                "surfaces": surfaces,
+                "signals": sorted(
+                    {
+                        "attack_pack",
+                        *taxonomies,
+                        *attack_types,
+                        *surfaces,
+                        *(_red_team_key(signal) for signal in _as_iterable(pack.get("signals")) if _red_team_key(signal)),
+                    }
+                ),
+            }
+        )
+        records.append(pack)
+    return records
+
+
+def _normalize_red_team_scenarios(value: Any) -> List[Dict[str, Any]]:
+    records: List[Dict[str, Any]] = []
+    for index, raw in enumerate(_as_iterable(value), start=1):
+        item = copy.deepcopy(dict(raw)) if isinstance(raw, Mapping) else {"name": str(raw)}
+        attack_type = _red_team_key(item.get("attack_type") or item.get("category") or item.get("type"))
+        surface = _red_team_key(item.get("surface") or item.get("channel") or item.get("modality"))
+        signals = {
+            "scenario",
+            attack_type,
+            surface,
+            *(_red_team_key(signal) for signal in _as_iterable(item.get("signals")) if _red_team_key(signal)),
+        }
+        if _as_iterable(item.get("turns")) or _workspace_int(item.get("turn_count")) and (_workspace_int(item.get("turn_count")) or 0) > 1:
+            signals.add("multi_turn")
+        item.update(
+            {
+                "id": str(item.get("id") or item.get("name") or f"scenario_{index}"),
+                "name": str(item.get("name") or item.get("id") or f"scenario_{index}"),
+                "attack_type": attack_type,
+                "surface": surface,
+                "provider": _red_team_key(item.get("provider")),
+                "channel": _red_team_key(item.get("channel") or item.get("modality")),
+                "turn_count": _workspace_int(item.get("turn_count")) or len(_as_iterable(item.get("turns"))) or 1,
+                "signals": sorted(signal for signal in signals if signal),
+            }
+        )
+        records.append(item)
+    return records
+
+
+def _normalize_red_team_runs(value: Any) -> List[Dict[str, Any]]:
+    records: List[Dict[str, Any]] = []
+    for index, raw in enumerate(_as_iterable(value), start=1):
+        item = copy.deepcopy(dict(raw)) if isinstance(raw, Mapping) else {"name": str(raw)}
+        status = _normalize_workspace_run_status(item.get("status") or item.get("conclusion"))
+        findings = [_normalize_red_team_campaign_finding(finding) for finding in _as_iterable(item.get("findings"))]
+        open_high = [
+            finding
+            for finding in findings
+            if finding.get("status") not in {"closed", "fixed", "accepted", "mitigated"}
+            and finding.get("severity") in {"critical", "high"}
+        ]
+        if not status:
+            status = "failed" if open_high else "passed"
+        taxonomies = _red_team_key_list(item.get("taxonomies") or item.get("taxonomy"))
+        attack_types = _red_team_key_list(item.get("attack_types") or item.get("attacks") or item.get("probes"))
+        surfaces = _red_team_key_list(item.get("surfaces") or item.get("surface"))
+        framework = _red_team_key(item.get("framework") or item.get("tool") or item.get("runner"))
+        provider = _red_team_key(item.get("provider"))
+        channel = _red_team_key(item.get("channel") or item.get("modality"))
+        signals = {
+            "run",
+            "red_team",
+            framework,
+            provider,
+            channel,
+            *taxonomies,
+            *attack_types,
+            *surfaces,
+            *(_red_team_key(signal) for signal in _as_iterable(item.get("signals")) if _red_team_key(signal)),
+        }
+        if _workspace_int(item.get("turn_count")) and (_workspace_int(item.get("turn_count")) or 0) > 1:
+            signals.add("multi_turn")
+        item.update(
+            {
+                "id": str(item.get("id") or item.get("run_id") or f"run_{index}"),
+                "name": str(item.get("name") or item.get("id") or f"run_{index}"),
+                "framework": framework,
+                "provider": provider,
+                "channel": channel,
+                "status": status,
+                "passed": status == "passed",
+                "taxonomies": taxonomies,
+                "attack_types": attack_types,
+                "surfaces": surfaces,
+                "findings": findings,
+                "open_high_finding_count": len(open_high),
+                "signals": sorted(signal for signal in signals if signal),
+            }
+        )
+        records.append(item)
+    return records
+
+
+def _normalize_red_team_findings(value: Any, *, runs: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+    records = [_normalize_red_team_campaign_finding(item) for item in _as_iterable(value)]
+    for run in runs:
+        for finding in _as_iterable(run.get("findings")):
+            finding_dict = _normalize_red_team_campaign_finding(finding)
+            finding_dict.setdefault("run_id", run.get("id"))
+            records.append(finding_dict)
+    deduped: Dict[str, Dict[str, Any]] = {}
+    for index, finding in enumerate(records, start=1):
+        finding.setdefault("id", f"finding_{index}")
+        deduped[str(finding.get("id"))] = finding
+    return list(deduped.values())
+
+
+def _normalize_red_team_campaign_finding(value: Any) -> Dict[str, Any]:
+    item = copy.deepcopy(dict(value)) if isinstance(value, Mapping) else {"description": str(value)}
+    item["id"] = str(item.get("id") or item.get("name") or item.get("description") or "finding")
+    item["severity"] = _red_team_key(item.get("severity") or item.get("level") or "medium")
+    item["status"] = _red_team_key(item.get("status") or item.get("state") or "open")
+    item["attack_type"] = _red_team_key(item.get("attack_type") or item.get("category"))
+    item["taxonomy"] = _red_team_key(item.get("taxonomy"))
+    return item
+
+
+def _normalize_red_team_artifacts(value: Any, *, runs: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+    records: List[Dict[str, Any]] = []
+    for index, raw in enumerate(_as_iterable(value), start=1):
+        item = copy.deepcopy(dict(raw)) if isinstance(raw, Mapping) else {"path": str(raw)}
+        artifact_type = _red_team_key(item.get("type") or item.get("kind") or item.get("format") or "artifact")
+        item.update(
+            {
+                "id": str(item.get("id") or item.get("name") or f"artifact_{index}"),
+                "type": artifact_type,
+                "path": str(item.get("path") or item.get("uri") or item.get("url") or ""),
+                "signals": sorted(
+                    {
+                        "artifact",
+                        artifact_type,
+                        *(_red_team_key(signal) for signal in _as_iterable(item.get("signals")) if _red_team_key(signal)),
+                    }
+                ),
+            }
+        )
+        records.append(item)
+    for run in runs:
+        for artifact in _as_iterable(run.get("artifacts")):
+            item = copy.deepcopy(dict(artifact)) if isinstance(artifact, Mapping) else {"path": str(artifact)}
+            item.setdefault("id", f"{run.get('id')}_artifact_{len(records) + 1}")
+            item.setdefault("type", "artifact")
+            item["signals"] = sorted({"artifact", *_as_iterable(item.get("signals"))})
+            records.append(item)
+    return records
+
+
+def _normalize_red_team_mitigations(value: Any) -> List[Dict[str, Any]]:
+    records: List[Dict[str, Any]] = []
+    for index, raw in enumerate(_as_iterable(value), start=1):
+        item = copy.deepcopy(dict(raw)) if isinstance(raw, Mapping) else {"name": str(raw)}
+        item.update(
+            {
+                "id": str(item.get("id") or item.get("name") or f"mitigation_{index}"),
+                "status": _red_team_key(item.get("status") or item.get("state") or "implemented"),
+                "controls": _red_team_key_list(item.get("controls") or item.get("control")),
+            }
+        )
+        records.append(item)
+    return records
+
+
+def _red_team_campaign_summary(
+    *,
+    target: Mapping[str, Any],
+    taxonomies: Sequence[Mapping[str, Any]],
+    attack_packs: Sequence[Mapping[str, Any]],
+    scenarios: Sequence[Mapping[str, Any]],
+    runs: Sequence[Mapping[str, Any]],
+    findings: Sequence[Mapping[str, Any]],
+    artifacts: Sequence[Mapping[str, Any]],
+    observability: Mapping[str, Any],
+    mitigations: Sequence[Mapping[str, Any]],
+    required_taxonomies: Sequence[str],
+    required_attack_types: Sequence[str],
+    required_surfaces: Sequence[str],
+    required_channels: Sequence[str],
+    required_providers: Sequence[str],
+) -> Dict[str, Any]:
+    observed_taxonomies = {
+        _red_team_key(item.get("key") or item.get("id") or item.get("name")) for item in taxonomies
+    }
+    observed_attack_types: set[str] = set()
+    observed_surfaces: set[str] = set()
+    observed_channels: set[str] = set()
+    observed_providers: set[str] = set()
+    frameworks: set[str] = set()
+    for pack in attack_packs:
+        observed_taxonomies.update(_red_team_key_list(pack.get("taxonomies")))
+        observed_attack_types.update(_red_team_key_list(pack.get("attack_types")))
+        observed_surfaces.update(_red_team_key_list(pack.get("surfaces")))
+    for scenario in scenarios:
+        observed_attack_types.add(_red_team_key(scenario.get("attack_type")))
+        observed_surfaces.add(_red_team_key(scenario.get("surface")))
+        observed_channels.add(_red_team_key(scenario.get("channel")))
+        observed_providers.add(_red_team_key(scenario.get("provider")))
+    for run in runs:
+        observed_taxonomies.update(_red_team_key_list(run.get("taxonomies")))
+        observed_attack_types.update(_red_team_key_list(run.get("attack_types")))
+        observed_surfaces.update(_red_team_key_list(run.get("surfaces")))
+        observed_channels.add(_red_team_key(run.get("channel")))
+        observed_providers.add(_red_team_key(run.get("provider")))
+        frameworks.add(_red_team_key(run.get("framework")))
+    for finding in findings:
+        observed_taxonomies.add(_red_team_key(finding.get("taxonomy")))
+        observed_attack_types.add(_red_team_key(finding.get("attack_type")))
+    observed_taxonomies = {item for item in observed_taxonomies if item}
+    observed_attack_types = {item for item in observed_attack_types if item}
+    observed_surfaces = {item for item in observed_surfaces if item}
+    observed_channels = {item for item in observed_channels if item}
+    observed_providers = {item for item in observed_providers if item}
+    frameworks = {item for item in frameworks if item}
+    open_high = [
+        finding
+        for finding in findings
+        if finding.get("status") not in {"closed", "fixed", "accepted", "mitigated"}
+        and finding.get("severity") in {"critical", "high"}
+    ]
+    failed_runs = [run.get("id") for run in runs if run.get("status") == "failed"]
+    observability_hook_count = sum(
+        len(_as_iterable(observability.get(key)))
+        for key in ("traces", "logs", "metrics", "dashboards", "webhooks", "events")
+    )
+    if observability and not observability_hook_count:
+        observability_hook_count = 1
+    return {
+        "has_target": bool(target),
+        "attack_pack_count": len(attack_packs),
+        "attack_count": sum(_workspace_int(pack.get("attack_count")) or len(_as_iterable(pack.get("attacks"))) for pack in attack_packs),
+        "scenario_count": len(scenarios),
+        "multi_turn_scenario_count": sum(1 for item in scenarios if (_workspace_int(item.get("turn_count")) or 0) > 1 or "multi_turn" in set(item.get("signals", []))),
+        "run_count": len(runs),
+        "passed_run_count": sum(1 for run in runs if run.get("passed")),
+        "failed_run_count": len(failed_runs),
+        "failed_runs": [str(run_id) for run_id in failed_runs if run_id],
+        "finding_count": len(findings),
+        "open_high_finding_count": len(open_high),
+        "open_high_findings": [str(item.get("id")) for item in open_high if item.get("id")],
+        "artifact_count": len(artifacts),
+        "mitigation_count": len(mitigations),
+        "implemented_mitigation_count": sum(1 for item in mitigations if item.get("status") in {"implemented", "passed", "mitigated"}),
+        "observability_hook_count": observability_hook_count,
+        "observed_taxonomies": sorted(observed_taxonomies),
+        "observed_attack_types": sorted(observed_attack_types),
+        "observed_surfaces": sorted(observed_surfaces),
+        "observed_channels": sorted(observed_channels),
+        "observed_providers": sorted(observed_providers),
+        "frameworks": sorted(frameworks),
+        "artifact_types": sorted({_red_team_key(item.get("type")) for item in artifacts if _red_team_key(item.get("type"))}),
+        "missing_required_taxonomies": sorted(set(required_taxonomies) - observed_taxonomies),
+        "missing_required_attack_types": sorted(set(required_attack_types) - observed_attack_types),
+        "missing_required_surfaces": sorted(set(required_surfaces) - observed_surfaces),
+        "missing_required_channels": sorted(set(required_channels) - observed_channels),
+        "missing_required_providers": sorted(set(required_providers) - observed_providers),
+    }
+
+
+def _red_team_campaign_signals(
+    *,
+    target: Mapping[str, Any],
+    taxonomies: Sequence[Mapping[str, Any]],
+    attack_packs: Sequence[Mapping[str, Any]],
+    scenarios: Sequence[Mapping[str, Any]],
+    runs: Sequence[Mapping[str, Any]],
+    findings: Sequence[Mapping[str, Any]],
+    artifacts: Sequence[Mapping[str, Any]],
+    observability: Mapping[str, Any],
+    mitigations: Sequence[Mapping[str, Any]],
+    summary: Mapping[str, Any],
+) -> List[str]:
+    signals = {"red_team_campaign", "red_team", "adversarial"}
+    if target:
+        signals.add("target")
+    if attack_packs:
+        signals.add("attack_pack")
+    if scenarios:
+        signals.add("scenario")
+    if runs:
+        signals.add("run")
+    if findings:
+        signals.add("finding")
+    if artifacts:
+        signals.add("artifact")
+    if observability:
+        signals.add("observability")
+    if mitigations:
+        signals.add("mitigation")
+    for collection in (taxonomies, attack_packs, scenarios, runs, findings, artifacts):
+        for item in collection:
+            signals.update(_red_team_key(signal) for signal in _as_iterable(item.get("signals")) if _red_team_key(signal))
+    for key in ("observed_taxonomies", "observed_attack_types", "observed_surfaces", "observed_channels", "observed_providers", "frameworks", "artifact_types"):
+        signals.update(str(item) for item in _as_iterable(summary.get(key)) if str(item))
+    if summary.get("multi_turn_scenario_count"):
+        signals.add("multi_turn")
+    if summary.get("open_high_finding_count"):
+        signals.add("open_high_finding")
+    return sorted(_red_team_key(signal) for signal in signals if _red_team_key(signal))
+
+
+def _red_team_mapping(value: Any) -> Dict[str, Any]:
+    if value in (None, "", [], {}):
+        return {}
+    if isinstance(value, Mapping):
+        return copy.deepcopy(dict(value))
+    return {"name": str(value)}
+
+
+def _red_team_key_list(value: Any) -> List[str]:
+    return sorted({_red_team_key(item) for item in _as_iterable(value) if _red_team_key(item)})
+
+
+def _red_team_key(value: Any) -> str:
+    return _normalize_world_contract_key(value)
 
 
 class AdversarialEnvironmentPack(EnvironmentAdapter):
@@ -3441,6 +3972,179 @@ class AdversarialEnvironmentPack(EnvironmentAdapter):
         if not attacks:
             return self.payload
         return "\n\n".join(str(attack.get("payload") or self.payload) for attack in attacks)
+
+
+class RedTeamCampaignEnvironment(EnvironmentAdapter):
+    """
+    Campaign-level AI red-team evidence for simulation and optimization loops.
+
+    Use this above raw attack packs when the run needs taxonomy coverage,
+    multi-turn scenarios, tool/channel/provider coverage, findings, artifacts,
+    observability, and mitigation gates as one auditable artifact.
+    """
+
+    name = "red_team_campaign"
+
+    def __init__(
+        self,
+        campaign: Any = None,
+        **kwargs: Any,
+    ) -> None:
+        self.initial_campaign = (
+            normalize_red_team_campaign_manifest(campaign, **kwargs)
+            if not (isinstance(campaign, Mapping) and campaign.get("kind") == "red_team_campaign" and not kwargs)
+            else copy.deepcopy(dict(campaign))
+        )
+        self.campaign: Dict[str, Any] = {}
+
+    def reset(self, **context: Any) -> EnvironmentSnapshot:
+        self.campaign = copy.deepcopy(self.initial_campaign)
+        return EnvironmentSnapshot(
+            tools=self._tool_specs(),
+            artifacts=[self._trace_artifact()],
+            events=[
+                SimulationEvent(
+                    type="red_team_campaign",
+                    name="red_team_campaign_ready",
+                    payload={
+                        "name": self.campaign.get("name"),
+                        "summary": copy.deepcopy(self.campaign.get("summary", {})),
+                        "signals": copy.deepcopy(self.campaign.get("signals", [])),
+                    },
+                )
+            ],
+            state={"red_team_campaign": self._trace_payload()},
+            metadata={"red_team_campaign": copy.deepcopy(self.campaign.get("summary", {}))},
+        )
+
+    def handle_tool_call(
+        self,
+        tool_call: Mapping[str, Any],
+        **context: Any,
+    ) -> Optional[ToolExecutionResult]:
+        name = _tool_name(tool_call)
+        if name not in {
+            "red_team_campaign_status",
+            "list_red_team_attack_packs",
+            "list_red_team_scenarios",
+            "list_red_team_runs",
+            "list_red_team_findings",
+            "list_red_team_campaign_gaps",
+        }:
+            return None
+        arguments = _tool_arguments(tool_call)
+        call_id = _tool_call_id(tool_call)
+
+        if name == "red_team_campaign_status":
+            result = self._trace_payload()
+            event_name = "red_team_campaign_status"
+            content = f"Red-team campaign {self.campaign.get('name')} status recorded."
+        elif name == "list_red_team_attack_packs":
+            packs = copy.deepcopy(self.campaign.get("attack_packs", []))
+            taxonomy = _red_team_key(arguments.get("taxonomy"))
+            if taxonomy:
+                packs = [pack for pack in packs if taxonomy in set(pack.get("taxonomies", [])) or taxonomy in set(pack.get("signals", []))]
+            result = {"attack_packs": packs, "count": len(packs)}
+            event_name = "red_team_attack_packs_listed"
+            content = f"Listed {len(packs)} red-team attack pack(s)."
+        elif name == "list_red_team_scenarios":
+            scenarios = copy.deepcopy(self.campaign.get("scenarios", []))
+            attack_type = _red_team_key(arguments.get("attack_type") or arguments.get("type"))
+            surface = _red_team_key(arguments.get("surface") or arguments.get("channel"))
+            if attack_type:
+                scenarios = [item for item in scenarios if item.get("attack_type") == attack_type or attack_type in set(item.get("signals", []))]
+            if surface:
+                scenarios = [item for item in scenarios if item.get("surface") == surface or item.get("channel") == surface or surface in set(item.get("signals", []))]
+            result = {"scenarios": scenarios, "count": len(scenarios)}
+            event_name = "red_team_scenarios_listed"
+            content = f"Listed {len(scenarios)} red-team scenario(s)."
+        elif name == "list_red_team_runs":
+            runs = copy.deepcopy(self.campaign.get("runs", []))
+            framework = _red_team_key(arguments.get("framework") or arguments.get("tool"))
+            if framework:
+                runs = [run for run in runs if run.get("framework") == framework or framework in set(run.get("signals", []))]
+            result = {"runs": runs, "count": len(runs)}
+            event_name = "red_team_runs_listed"
+            content = f"Listed {len(runs)} red-team run(s)."
+        elif name == "list_red_team_findings":
+            findings = copy.deepcopy(self.campaign.get("findings", []))
+            severity = _red_team_key(arguments.get("severity"))
+            status = _red_team_key(arguments.get("status"))
+            if severity:
+                findings = [finding for finding in findings if finding.get("severity") == severity]
+            if status:
+                findings = [finding for finding in findings if finding.get("status") == status]
+            result = {"findings": findings, "count": len(findings)}
+            event_name = "red_team_findings_listed"
+            content = f"Listed {len(findings)} red-team finding(s)."
+        else:
+            summary = copy.deepcopy(self.campaign.get("summary", {}))
+            result = {
+                "missing_required_taxonomies": summary.get("missing_required_taxonomies", []),
+                "missing_required_attack_types": summary.get("missing_required_attack_types", []),
+                "missing_required_surfaces": summary.get("missing_required_surfaces", []),
+                "missing_required_channels": summary.get("missing_required_channels", []),
+                "missing_required_providers": summary.get("missing_required_providers", []),
+                "failed_runs": summary.get("failed_runs", []),
+                "open_high_findings": summary.get("open_high_findings", []),
+            }
+            event_name = "red_team_campaign_gaps_listed"
+            content = "Listed red-team campaign gaps."
+
+        return ToolExecutionResult(
+            tool_call_id=call_id,
+            tool_name=name,
+            content=content,
+            result=result,
+            state_updates={"red_team_campaign": self._trace_payload()},
+            artifacts=[self._trace_artifact()],
+            events=[SimulationEvent(type="red_team_campaign", name=event_name, payload=result)],
+        )
+
+    def _tool_specs(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                "name": "red_team_campaign_status",
+                "description": "Return the full red-team campaign manifest and summary.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            {
+                "name": "list_red_team_attack_packs",
+                "description": "List attack packs, optionally filtered by taxonomy.",
+                "parameters": {"type": "object", "properties": {"taxonomy": {"type": "string"}}},
+            },
+            {
+                "name": "list_red_team_scenarios",
+                "description": "List red-team scenarios filtered by attack type or surface.",
+                "parameters": {"type": "object", "properties": {"attack_type": {"type": "string"}, "surface": {"type": "string"}}},
+            },
+            {
+                "name": "list_red_team_runs",
+                "description": "List campaign tool runs, optionally filtered by framework/tool.",
+                "parameters": {"type": "object", "properties": {"framework": {"type": "string"}}},
+            },
+            {
+                "name": "list_red_team_findings",
+                "description": "List red-team findings filtered by severity or status.",
+                "parameters": {"type": "object", "properties": {"severity": {"type": "string"}, "status": {"type": "string"}}},
+            },
+            {
+                "name": "list_red_team_campaign_gaps",
+                "description": "List missing taxonomy/attack/surface/provider/channel evidence, failed runs, and open high findings.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        ]
+
+    def _trace_artifact(self) -> SimulationArtifact:
+        return SimulationArtifact(
+            type="trace",
+            role="environment",
+            data=self._trace_payload(),
+            metadata={"kind": "red_team_campaign"},
+        )
+
+    def _trace_payload(self) -> Dict[str, Any]:
+        return copy.deepcopy(self.campaign)
 
 
 def normalize_world_attack_replay(
