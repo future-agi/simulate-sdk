@@ -225,7 +225,7 @@ Scores and transcripts land in the platform dashboard. The local `TestReport` is
 
 ## Agent wrappers
 
-Built-in adapters for common SDKs plus a framework-neutral adapter layer. The generic adapter carries normalized messages, tools, memory, events, and multimodal artifacts, so the same report shape works for text, voice, image, browser/CUA, and framework-specific runtimes.
+Built-in adapters for common SDKs plus a framework-neutral adapter layer. The generic adapter carries normalized messages, tools, memory, events, multimodal artifacts, and sync/async stream chunks, so the same report shape works for text, voice, image, browser/CUA, and framework-specific runtimes.
 
 | Wrapper | Wraps | Import |
 |---|---|---|
@@ -233,7 +233,7 @@ Built-in adapters for common SDKs plus a framework-neutral adapter layer. The ge
 | `AnthropicAgentWrapper` | `anthropic.Anthropic` / `AsyncAnthropic` | `from fi.simulate import AnthropicAgentWrapper` |
 | `GeminiAgentWrapper` | `google.generativeai.GenerativeModel` | `from fi.simulate import GeminiAgentWrapper` |
 | `LangChainAgentWrapper` | Any LangChain `Runnable` / chain | `from fi.simulate import LangChainAgentWrapper` |
-| `GenericAgentWrapper` / `wrap_agent` | Any callable/object with `call`, `ainvoke`, `invoke`, `run`, `send`, `respond`, or `chat` | `from fi.simulate import wrap_agent` |
+| `GenericAgentWrapper` / `wrap_agent` | Any callable/object with `call`, `ainvoke`, `invoke`, `run`, `send`, `respond`, or `chat`; sync/async generator outputs are collected as streaming events | `from fi.simulate import wrap_agent` |
 | `wrap_framework` | Import-free presets for LangChain, LangGraph, CrewAI, AutoGen, LlamaIndex, OpenAI Agents, LiveKit, Pipecat, browser/CUA, vision agents, and more | `from fi.simulate import wrap_framework` |
 | Mock wrappers | Scripted, echo, and rule-based agents for deterministic regression tests | `from fi.simulate import ScriptedAgentWrapper` |
 | Custom | Anything — subclass `AgentWrapper` | `from fi.simulate import AgentWrapper` |

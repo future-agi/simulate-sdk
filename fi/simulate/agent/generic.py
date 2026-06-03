@@ -56,6 +56,11 @@ class GenericAgentWrapper(AgentWrapper):
         if inspect.isawaitable(raw):
             raw = await raw
 
+        if _is_async_stream(raw):
+            raw = await self._coerce_async_stream(raw)
+        elif _is_sync_stream(raw):
+            raw = self._coerce_sync_stream(raw)
+
         return self._coerce_response(raw)
 
     def _resolve_method(self) -> Callable[..., Any]:
@@ -161,6 +166,48 @@ class GenericAgentWrapper(AgentWrapper):
             metadata=metadata or None,
         )
 
+    async def _coerce_async_stream(self, raw: Any) -> AgentResponse:
+        chunks: List[Any] = []
+        async for chunk in raw:
+            chunks.append(chunk)
+        return self._coerce_stream_chunks(chunks)
+
+    def _coerce_sync_stream(self, raw: Any) -> AgentResponse:
+        return self._coerce_stream_chunks(list(raw))
+
+    def _coerce_stream_chunks(self, chunks: List[Any]) -> AgentResponse:
+        content_parts: List[str] = []
+        tool_calls: List[Dict[str, Any]] = []
+        tool_responses: List[Dict[str, Any]] = []
+        artifacts: List[SimulationArtifact] = []
+        events: List[SimulationEvent] = []
+
+        for index, chunk in enumerate(chunks, start=1):
+            text = _stream_chunk_text(chunk)
+            if text:
+                content_parts.append(text)
+            tool_calls.extend(self._extract_tool_calls(chunk) or [])
+            tool_responses.extend(self._extract_tool_responses(chunk) or [])
+            artifacts.extend(self._extract_artifacts(chunk))
+            events.extend(self._extract_events(chunk))
+            events.append(_stream_chunk_event(chunk, index=index, text=text))
+
+        metadata = {
+            "streaming": {
+                "chunk_count": len(chunks),
+                "content_part_count": len(content_parts),
+            },
+            **self.metadata,
+        }
+        return AgentResponse(
+            content="".join(content_parts),
+            tool_calls=tool_calls or None,
+            tool_responses=tool_responses or None,
+            artifacts=artifacts,
+            events=events,
+            metadata=metadata,
+        )
+
     def _extract_content(self, raw: Any) -> str:
         if raw is None:
             return ""
@@ -206,7 +253,10 @@ class GenericAgentWrapper(AgentWrapper):
         return str(raw)
 
     def _extract_tool_calls(self, raw: Any) -> Optional[List[Dict[str, Any]]]:
-        return _extract_list_field(raw, ("tool_calls", "toolCalls"))
+        return _extract_list_field(
+            raw,
+            ("tool_calls", "toolCalls", "tool_call_chunks", "toolCallChunks"),
+        )
 
     def _extract_tool_responses(self, raw: Any) -> Optional[List[Dict[str, Any]]]:
         return _extract_list_field(raw, ("tool_responses", "toolResponses", "tool_outputs", "toolOutputs"))
@@ -284,6 +334,135 @@ def _extract_list_field(raw: Any, names: Iterable[str]) -> Optional[List[Dict[st
     if not isinstance(value, list):
         return None
     return [dict(item) for item in value if isinstance(item, dict)] or None
+
+
+def _is_async_stream(value: Any) -> bool:
+    if isinstance(value, (AgentResponse, str, bytes, dict, list, tuple)):
+        return False
+    return inspect.isasyncgen(value) or hasattr(value, "__anext__") or hasattr(value, "__aiter__")
+
+
+def _is_sync_stream(value: Any) -> bool:
+    if isinstance(value, (AgentResponse, str, bytes, dict, list, tuple)):
+        return False
+    return inspect.isgenerator(value) or hasattr(value, "__next__")
+
+
+def _stream_chunk_text(chunk: Any) -> str:
+    if chunk is None:
+        return ""
+    if isinstance(chunk, str):
+        return chunk
+    if isinstance(chunk, bytes):
+        return chunk.decode("utf-8", errors="replace")
+    if isinstance(chunk, dict):
+        for key in (
+            "content",
+            "delta",
+            "text",
+            "transcript",
+            "output",
+            "response",
+            "final_output",
+        ):
+            value = chunk.get(key)
+            if value is not None:
+                return _stringify(value)
+        for key in ("message", "chunk"):
+            if key in chunk:
+                return _message_content(chunk[key])
+        if "choices" in chunk:
+            return _choices_content(chunk["choices"])
+        for key in ("data", "payload"):
+            value = chunk.get(key)
+            if isinstance(value, dict):
+                text = _stream_chunk_text(value)
+                if text:
+                    return text
+    for attr in ("content", "delta", "text", "transcript", "output", "response"):
+        if hasattr(chunk, attr):
+            value = getattr(chunk, attr)
+            if value is not None:
+                return _stringify(value)
+    if hasattr(chunk, "message"):
+        return _message_content(getattr(chunk, "message"))
+    if hasattr(chunk, "choices"):
+        return _choices_content(getattr(chunk, "choices"))
+    return ""
+
+
+def _stream_chunk_event(chunk: Any, *, index: int, text: str) -> SimulationEvent:
+    payload = _stream_chunk_payload(chunk)
+    if text:
+        payload.setdefault("delta", text)
+    return SimulationEvent(
+        type=_stream_chunk_event_type(chunk),
+        name=_stream_chunk_event_name(chunk, index=index),
+        payload=payload,
+        timestamp_ms=_stream_chunk_timestamp_ms(chunk),
+        metadata={"stream_index": index},
+    )
+
+
+def _stream_chunk_event_type(chunk: Any) -> str:
+    value = _stream_chunk_field(chunk, ("type", "event", "frame_type", "method"))
+    if value:
+        return str(value)
+    return "stream_chunk"
+
+
+def _stream_chunk_event_name(chunk: Any, *, index: int) -> str:
+    value = _stream_chunk_field(chunk, ("name", "id", "event_id"))
+    if value:
+        return str(value)
+    return f"stream_chunk_{index}"
+
+
+def _stream_chunk_timestamp_ms(chunk: Any) -> Optional[int]:
+    value = _stream_chunk_field(chunk, ("timestamp_ms", "time_ms"))
+    if isinstance(value, (int, float)):
+        return int(value)
+    return None
+
+
+def _stream_chunk_payload(chunk: Any) -> Dict[str, Any]:
+    if isinstance(chunk, dict):
+        return dict(chunk)
+    if isinstance(chunk, (str, bytes)):
+        return {"delta": _stream_chunk_text(chunk)}
+    if hasattr(chunk, "model_dump"):
+        value = chunk.model_dump()
+        return dict(value) if isinstance(value, dict) else {"value": value}
+    if hasattr(chunk, "dict"):
+        value = chunk.dict()
+        return dict(value) if isinstance(value, dict) else {"value": value}
+    payload: Dict[str, Any] = {}
+    for key in ("id", "type", "event", "name", "content", "delta", "text", "transcript"):
+        if hasattr(chunk, key):
+            value = getattr(chunk, key)
+            if value is not None:
+                payload[key] = value
+    return payload or {"value": str(chunk)}
+
+
+def _stream_chunk_field(chunk: Any, names: Iterable[str]) -> Any:
+    if isinstance(chunk, dict):
+        for name in names:
+            value = chunk.get(name)
+            if value is not None:
+                return value
+        for key in ("data", "payload"):
+            value = chunk.get(key)
+            if isinstance(value, dict):
+                nested = _stream_chunk_field(value, names)
+                if nested is not None:
+                    return nested
+    for name in names:
+        if hasattr(chunk, name):
+            value = getattr(chunk, name)
+            if value is not None:
+                return value
+    return None
 
 
 def _choices_content(choices: Any) -> str:
