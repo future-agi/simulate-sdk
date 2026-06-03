@@ -5194,6 +5194,225 @@ class FrameworkTraceEnvironment(EnvironmentAdapter):
         return sessions
 
 
+class ObservabilityReplayEnvironment(EnvironmentAdapter):
+    """
+    Replay production observability/regression cases as local simulation evidence.
+
+    Use this for failed Future AGI regression rows, exported observability
+    windows, or JSONL replay packs. The environment exposes status/list/inspect
+    tools and emits one `observability_replay_pack` trace artifact.
+    """
+
+    name = "observability_replay"
+
+    def __init__(
+        self,
+        cases: Any = None,
+        *,
+        name: str = "observability-replay-pack",
+        source: str = "futureagi",
+        framework: str = "mixed",
+        required_metrics: Optional[Mapping[str, float]] = None,
+        required_trace_signals: Optional[Iterable[str]] = None,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        self.pack_name = str(name)
+        self.source = str(source)
+        self.framework = str(framework)
+        self.required_metrics = {
+            str(metric): float(threshold)
+            for metric, threshold in dict(required_metrics or {}).items()
+        }
+        self.required_trace_signals = [
+            _normalize_replay_signal(signal)
+            for signal in _as_iterable(required_trace_signals)
+            if _normalize_replay_signal(signal)
+        ]
+        self.initial_cases = normalize_observability_replay_pack(
+            cases or [],
+            name=self.pack_name,
+            source=self.source,
+            framework=self.framework,
+            required_metrics=self.required_metrics,
+            required_trace_signals=self.required_trace_signals,
+            metadata=metadata,
+        )["cases"]
+        self.metadata = copy.deepcopy(dict(metadata or {}))
+        self.cases: List[Dict[str, Any]] = []
+
+    def reset(self, **context: Any) -> EnvironmentSnapshot:
+        self.cases = copy.deepcopy(self.initial_cases)
+        return EnvironmentSnapshot(
+            tools=self._tool_specs(),
+            artifacts=[self._trace_artifact()],
+            events=[
+                SimulationEvent(
+                    type="observability_replay",
+                    name="observability_replay_pack_ready",
+                    payload={
+                        "name": self.pack_name,
+                        "source": self.source,
+                        "framework": self.framework,
+                        "summary": self._summary(),
+                    },
+                )
+            ],
+            state={"observability_replay_pack": self._trace_payload()},
+            metadata={"observability_replay_pack": self._summary()},
+        )
+
+    def handle_tool_call(
+        self,
+        tool_call: Mapping[str, Any],
+        **context: Any,
+    ) -> Optional[ToolExecutionResult]:
+        name = _tool_name(tool_call)
+        if name not in {
+            "observability_replay_status",
+            "list_observability_replay_cases",
+            "inspect_observability_replay_case",
+        }:
+            return None
+        arguments = _tool_arguments(tool_call)
+        call_id = _tool_call_id(tool_call)
+
+        if name == "observability_replay_status":
+            result = self._trace_payload()
+            event_name = "observability_replay_status"
+            content = f"Observability replay pack {self.pack_name} status recorded."
+        elif name == "list_observability_replay_cases":
+            cases = copy.deepcopy(self.cases)
+            if _truthy(arguments.get("failed_only")):
+                cases = [case for case in cases if not case.get("passed")]
+            metric = str(arguments.get("metric") or "").strip()
+            if metric:
+                cases = [case for case in cases if metric in set(case.get("failed_metrics", [])) or metric in case.get("metrics", {})]
+            missing_signal = _normalize_replay_signal(arguments.get("missing_signal") or "")
+            if missing_signal:
+                cases = [
+                    case
+                    for case in cases
+                    if missing_signal in set(case.get("missing_trace_signals", []))
+                ]
+            result = {"name": self.pack_name, "cases": cases, "count": len(cases)}
+            event_name = "observability_replay_cases_listed"
+            content = f"Listed {len(cases)} observability replay case(s)."
+        else:
+            case_id = str(arguments.get("id") or arguments.get("case_id") or arguments.get("run_id") or "")
+            case = next(
+                (
+                    item
+                    for item in self.cases
+                    if case_id
+                    and case_id in {str(item.get("id")), str(item.get("run_id"))}
+                ),
+                None,
+            )
+            success = case is not None
+            result = {"name": self.pack_name, "case": copy.deepcopy(case), "query": case_id}
+            event_name = "observability_replay_case_inspected" if success else "observability_replay_case_missing"
+            content = f"Inspected observability replay case {case_id}." if success else f"Replay case not found: {case_id}"
+            return ToolExecutionResult(
+                tool_call_id=call_id,
+                tool_name=name,
+                content=content,
+                result=result,
+                success=success,
+                error=None if success else "case_not_found",
+                state_updates={"observability_replay_pack": self._trace_payload()},
+                artifacts=[self._trace_artifact()],
+                events=[
+                    SimulationEvent(
+                        type="observability_replay",
+                        name=event_name,
+                        payload=result,
+                    )
+                ],
+            )
+
+        return ToolExecutionResult(
+            tool_call_id=call_id,
+            tool_name=name,
+            content=content,
+            result=result,
+            state_updates={"observability_replay_pack": self._trace_payload()},
+            artifacts=[self._trace_artifact()],
+            events=[
+                SimulationEvent(
+                    type="observability_replay",
+                    name=event_name,
+                    payload=result,
+                )
+            ],
+        )
+
+    def _tool_specs(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                "name": "observability_replay_status",
+                "description": "Return the normalized observability replay pack and summary.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            {
+                "name": "list_observability_replay_cases",
+                "description": "List replay cases, optionally filtering failed cases, metrics, or missing trace signals.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "failed_only": {"type": "boolean"},
+                        "metric": {"type": "string"},
+                        "missing_signal": {"type": "string"},
+                    },
+                },
+            },
+            {
+                "name": "inspect_observability_replay_case",
+                "description": "Inspect one replay case by case id or run id.",
+                "parameters": {"type": "object", "properties": {"id": {"type": "string"}}},
+            },
+        ]
+
+    def _trace_artifact(self) -> SimulationArtifact:
+        return SimulationArtifact(
+            type="trace",
+            role="environment",
+            data=self._trace_payload(),
+            metadata={"kind": "observability_replay_pack", "framework": self.framework},
+        )
+
+    def _trace_payload(self) -> Dict[str, Any]:
+        return {
+            "kind": "observability_replay_pack",
+            "name": self.pack_name,
+            "source": self.source,
+            "framework": self.framework,
+            "cases": copy.deepcopy(self.cases),
+            "summary": self._summary(),
+            "signals": self._signals(),
+            "metadata": copy.deepcopy(self.metadata),
+        }
+
+    def _summary(self) -> Dict[str, Any]:
+        return _observability_replay_summary(
+            self.cases,
+            required_metrics=self.required_metrics,
+            required_trace_signals=self.required_trace_signals,
+        )
+
+    def _signals(self) -> List[str]:
+        signals = {"observability", "replay_pack", "case"}
+        summary = self._summary()
+        if summary["failed_case_count"]:
+            signals.add("failure")
+        if summary["observed_metrics"]:
+            signals.add("metric")
+        if summary["trace_signals"]:
+            signals.add("trace_signal")
+        if any(case.get("raw") not in (None, "", [], {}) for case in self.cases):
+            signals.add("raw")
+        return sorted(signals)
+
+
 def normalize_framework_trace_events(
     framework: str,
     records: Iterable[Any],
@@ -5356,6 +5575,312 @@ def _framework_adapter_record_has_path(record: Mapping[str, Any], path: str) -> 
         if value not in (None, "", [], {}):
             return True
     return False
+
+
+def normalize_observability_replay_pack(
+    payload: Any,
+    *,
+    name: str = "observability-replay-pack",
+    source: str = "futureagi",
+    framework: str = "mixed",
+    required_metrics: Optional[Mapping[str, float]] = None,
+    required_trace_signals: Optional[Iterable[str]] = None,
+    metadata: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Normalize observability/regression rows into a replay-pack artifact."""
+
+    thresholds = {
+        str(metric): float(threshold)
+        for metric, threshold in dict(required_metrics or {}).items()
+    }
+    required_signals = [
+        _normalize_replay_signal(signal)
+        for signal in _as_iterable(required_trace_signals)
+        if _normalize_replay_signal(signal)
+    ]
+    cases = [
+        _normalize_observability_replay_case(
+            item,
+            index=index,
+            source=source,
+            framework=framework,
+            required_metrics=thresholds,
+            required_trace_signals=required_signals,
+        )
+        for index, item in enumerate(_observability_replay_records(payload), start=1)
+    ]
+    summary = _observability_replay_summary(
+        cases,
+        required_metrics=thresholds,
+        required_trace_signals=required_signals,
+    )
+    signals = {"observability", "replay_pack", "case"}
+    if summary["failed_case_count"]:
+        signals.add("failure")
+    if summary["observed_metrics"]:
+        signals.add("metric")
+    if summary["trace_signals"]:
+        signals.add("trace_signal")
+    if any(case.get("raw") not in (None, "", [], {}) for case in cases):
+        signals.add("raw")
+    return {
+        "kind": "observability_replay_pack",
+        "name": str(name),
+        "source": str(source),
+        "framework": str(framework),
+        "cases": cases,
+        "summary": summary,
+        "signals": sorted(signals),
+        "metadata": copy.deepcopy(dict(metadata or {})),
+    }
+
+
+def load_observability_replay_pack(
+    source: str | os.PathLike[str] | Mapping[str, Any] | Iterable[Any],
+    *,
+    name: str = "observability-replay-pack",
+    provider: str = "futureagi",
+    framework: str = "mixed",
+    required_metrics: Optional[Mapping[str, float]] = None,
+    required_trace_signals: Optional[Iterable[str]] = None,
+    headers: Optional[Mapping[str, str]] = None,
+    auth: Optional[Mapping[str, Any]] = None,
+    pagination: Optional[Mapping[str, Any]] = None,
+    max_pages: int = 20,
+    timeout: float = 30.0,
+    metadata: Optional[Mapping[str, Any]] = None,
+) -> ObservabilityReplayEnvironment:
+    """Load a local/HTTP observability replay pack and return an environment."""
+
+    source_metadata: Dict[str, Any] = {}
+    if isinstance(source, (str, os.PathLike)) or _is_export_source_spec(source):
+        loaded, source_metadata = _load_framework_trace_export_source_with_metadata(
+            source,
+            headers=headers,
+            auth=auth,
+            pagination=pagination,
+            max_pages=max_pages,
+            timeout=timeout,
+        )
+    else:
+        loaded = source
+    merged_metadata = {**source_metadata, **dict(metadata or {})}
+    return ObservabilityReplayEnvironment(
+        loaded,
+        name=name,
+        source=provider,
+        framework=framework,
+        required_metrics=required_metrics,
+        required_trace_signals=required_trace_signals,
+        metadata=merged_metadata,
+    )
+
+
+def _observability_replay_records(payload: Any) -> List[Any]:
+    if payload in (None, "", [], {}):
+        return []
+    if isinstance(payload, Mapping):
+        for key in ("cases", "rows", "records", "runs", "data", "items"):
+            value = payload.get(key)
+            if isinstance(value, (list, tuple)):
+                return list(value)
+        return [payload]
+    if isinstance(payload, (list, tuple)):
+        return list(payload)
+    return [payload]
+
+
+def _normalize_observability_replay_case(
+    raw_case: Any,
+    *,
+    index: int,
+    source: str,
+    framework: str,
+    required_metrics: Mapping[str, float],
+    required_trace_signals: Sequence[str],
+) -> Dict[str, Any]:
+    case = _coerce_plain_dict(raw_case)
+    input_payload = _coerce_plain_dict(case.get("input"))
+    expected = _coerce_plain_dict(case.get("expected") or case.get("expected_response"))
+    observability = _coerce_plain_dict(
+        case.get("observability")
+        or input_payload.get("observability")
+        or case.get("agent_observability_feedback")
+    )
+    if not observability:
+        observability = copy.deepcopy(case)
+    raw = _coerce_plain_dict(observability.get("raw"))
+    metrics = _observability_replay_metrics(case, observability, raw)
+    thresholds = {
+        **dict(required_metrics),
+        **{
+            str(metric): float(threshold)
+            for metric, threshold in _coerce_plain_dict(
+                expected.get("required_metrics")
+                or case.get("required_metrics")
+                or observability.get("required_metrics")
+            ).items()
+        },
+    }
+    trace_signals = sorted(
+        {
+            _normalize_replay_signal(signal)
+            for signal in [
+                *_as_iterable(observability.get("trace_signals")),
+                *_as_iterable(observability.get("signals")),
+                *_as_iterable(case.get("trace_signals")),
+            ]
+            if _normalize_replay_signal(signal)
+        }
+    )
+    expected_signals = sorted(
+        {
+            *required_trace_signals,
+            *[
+                _normalize_replay_signal(signal)
+                for signal in _as_iterable(
+                    expected.get("required_trace_signals")
+                    or case.get("required_trace_signals")
+                    or observability.get("required_trace_signals")
+                )
+                if _normalize_replay_signal(signal)
+            ],
+        }
+    )
+    missing_trace_signals = sorted(set(expected_signals) - set(trace_signals))
+    failed_metrics = sorted(
+        metric
+        for metric, threshold in thresholds.items()
+        if _observability_float(metrics.get(metric), default=-1.0) < threshold
+    )
+    failures = [
+        str(item)
+        for item in [
+            *_as_iterable(observability.get("failures")),
+            *_as_iterable(case.get("failures")),
+            *[f"metric '{metric}' below {thresholds[metric]}" for metric in failed_metrics],
+            *[f"missing trace signal '{signal}'" for signal in missing_trace_signals],
+        ]
+        if str(item)
+    ]
+    score = _observability_float(observability.get("score"))
+    if score is None:
+        score = min(metrics.values()) if metrics else (0.0 if failures else 1.0)
+    passed_value = observability.get("passed")
+    passed = bool(passed_value) if isinstance(passed_value, bool) else not failures
+    case_id = str(
+        case.get("id")
+        or case.get("case_id")
+        or observability.get("case_id")
+        or observability.get("run_id")
+        or case.get("run_id")
+        or f"observability_case_{index}"
+    )
+    tags = sorted(
+        {
+            str(tag)
+            for tag in [
+                *_as_iterable(case.get("tags")),
+                *_as_iterable(observability.get("tags")),
+                *[f"metric:{metric}" for metric in failed_metrics],
+                *[f"missing_signal:{signal}" for signal in missing_trace_signals],
+            ]
+            if str(tag)
+        }
+    )
+    return {
+        "id": case_id,
+        "run_id": str(observability.get("run_id") or case.get("run_id") or case_id),
+        "source": str(observability.get("source") or case.get("source") or source),
+        "framework": str(observability.get("framework") or case.get("framework") or framework),
+        "score": round(float(score), 4),
+        "passed": bool(passed) and not failed_metrics and not missing_trace_signals,
+        "metrics": metrics,
+        "required_metrics": thresholds,
+        "failed_metrics": failed_metrics,
+        "trace_signals": trace_signals,
+        "required_trace_signals": expected_signals,
+        "missing_trace_signals": missing_trace_signals,
+        "failures": list(dict.fromkeys(failures)),
+        "tags": tags,
+        "raw": copy.deepcopy(raw),
+        "metadata": copy.deepcopy(_coerce_plain_dict(case.get("metadata"))),
+    }
+
+
+def _observability_replay_metrics(
+    case: Mapping[str, Any],
+    observability: Mapping[str, Any],
+    raw: Mapping[str, Any],
+) -> Dict[str, float]:
+    metrics: Dict[str, float] = {}
+    for source in (
+        _coerce_plain_dict(observability.get("metrics")),
+        _coerce_plain_dict(case.get("metrics")),
+    ):
+        for metric, value in source.items():
+            score = _observability_float(value)
+            if score is not None:
+                metrics[str(metric)] = score
+    for item in _as_iterable(observability.get("feedback") or case.get("feedback")):
+        item_dict = _coerce_plain_dict(item)
+        name = item_dict.get("key") or item_dict.get("name") or item_dict.get("metric")
+        score = _observability_float(item_dict.get("score") or item_dict.get("value") or item_dict.get("output"))
+        if name and score is not None:
+            metrics[str(name)] = score
+    evaluation = _coerce_plain_dict(
+        raw.get("agent_report_evaluation")
+        or raw.get("evaluation")
+        or observability.get("agent_report_evaluation")
+        or case.get("agent_report_evaluation")
+    )
+    summary_metrics = _coerce_plain_dict(_coerce_plain_dict(evaluation.get("summary")).get("metric_averages"))
+    for metric, value in summary_metrics.items():
+        score = _observability_float(value)
+        if score is not None:
+            metrics[str(metric)] = score
+    return metrics
+
+
+def _observability_replay_summary(
+    cases: Sequence[Mapping[str, Any]],
+    *,
+    required_metrics: Mapping[str, float],
+    required_trace_signals: Sequence[str],
+) -> Dict[str, Any]:
+    observed_metrics = sorted({metric for case in cases for metric in _coerce_plain_dict(case.get("metrics")).keys()})
+    failed_metrics = sorted({metric for case in cases for metric in _as_iterable(case.get("failed_metrics"))})
+    trace_signals = sorted({signal for case in cases for signal in _as_iterable(case.get("trace_signals"))})
+    missing_trace_signals = sorted({signal for case in cases for signal in _as_iterable(case.get("missing_trace_signals"))})
+    tags = sorted({tag for case in cases for tag in _as_iterable(case.get("tags"))})
+    failed_case_count = sum(1 for case in cases if not case.get("passed"))
+    return {
+        "case_count": len(cases),
+        "failed_case_count": failed_case_count,
+        "passed_case_count": len(cases) - failed_case_count,
+        "required_metrics": dict(required_metrics),
+        "observed_metrics": observed_metrics,
+        "failed_metrics": failed_metrics,
+        "required_trace_signals": sorted(set(required_trace_signals)),
+        "trace_signals": trace_signals,
+        "missing_trace_signals": missing_trace_signals,
+        "tags": tags,
+    }
+
+
+def _observability_float(value: Any, default: Optional[float] = None) -> Optional[float]:
+    if isinstance(value, bool):
+        return 1.0 if value else 0.0
+    try:
+        if value in (None, "", [], {}):
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _normalize_replay_signal(value: Any) -> str:
+    return str(value).strip().lower().replace("-", "_").replace(" ", "_")
 
 
 def normalize_framework_trace_export(

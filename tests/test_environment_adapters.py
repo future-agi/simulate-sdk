@@ -17,6 +17,7 @@ from fi.simulate import (
     FrameworkTraceEnvironment,
     ImageEnvironment,
     MultiAgentRoomEnvironment,
+    ObservabilityReplayEnvironment,
     OrchestrationTraceEnvironment,
     RetrievalMemoryEnvironment,
     StreamingTraceEnvironment,
@@ -45,11 +46,13 @@ from fi.simulate import (
     load_langchain_event_stream,
     load_langgraph_event_stream,
     load_mcp_tool_session_export,
+    load_observability_replay_pack,
     normalize_orchestration_trace_export,
     normalize_streaming_trace_export,
     normalize_adversarial_attack_pack,
     normalize_framework_trace_events,
     normalize_framework_adapter_conformance,
+    normalize_observability_replay_pack,
     normalize_framework_trace_export,
     normalize_mcp_tool_session_export,
     normalize_openai_responses_trace,
@@ -1862,6 +1865,129 @@ async def test_framework_trace_environment_scores_adapter_conformance():
     metrics = evaluation.summary["metric_averages"]
     assert metrics["framework_trace_coverage"] == 1.0
     assert metrics["framework_adapter_conformance"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_observability_replay_environment_replays_regression_pack():
+    async def agent(input):
+        return AgentResponse(
+            content="I inspected failed replay cases and restored the policy and trace collector.",
+            tool_calls=[
+                {"id": "status", "name": "observability_replay_status", "arguments": {}},
+                {
+                    "id": "failed",
+                    "name": "list_observability_replay_cases",
+                    "arguments": {"failed_only": True},
+                },
+                {
+                    "id": "case",
+                    "name": "inspect_observability_replay_case",
+                    "arguments": {"id": "run_policy_failed"},
+                },
+            ],
+        )
+
+    replay_cases = [
+        {
+            "id": "run_policy_failed",
+            "input": {
+                "observability": {
+                    "run_id": "run_policy_failed",
+                    "source": "futureagi",
+                    "framework": "langgraph",
+                    "score": 0.2,
+                    "passed": False,
+                    "metrics": {"policy_adherence": 0.2},
+                    "trace_signals": ["agent", "model"],
+                    "failures": ["policy_adherence below threshold"],
+                    "raw": {"trace_id": "trace_policy_failed"},
+                }
+            },
+            "expected": {
+                "required_metrics": {"policy_adherence": 0.85},
+                "required_trace_signals": ["agent", "model", "tool"],
+            },
+            "tags": ["refund", "metric:policy_adherence"],
+        },
+        {
+            "id": "run_trace_missing_tool",
+            "observability": {
+                "run_id": "run_trace_missing_tool",
+                "source": "futureagi",
+                "framework": "langgraph",
+                "score": 0.4,
+                "passed": False,
+                "metrics": {"framework_trace_coverage": 0.67},
+                "trace_signals": ["agent", "model"],
+                "raw": {"trace_id": "trace_missing_tool"},
+            },
+            "expected_response": {
+                "required_metrics": {"framework_trace_coverage": 1.0},
+                "required_trace_signals": ["agent", "model", "tool"],
+            },
+            "tags": ["framework"],
+        },
+    ]
+    normalized = normalize_observability_replay_pack(
+        replay_cases,
+        name="refund-regressions",
+        source="futureagi",
+        framework="langgraph",
+        required_trace_signals=["agent", "model", "tool"],
+    )
+    assert normalized["summary"]["case_count"] == 2
+    assert normalized["summary"]["failed_case_count"] == 2
+    assert "tool" in normalized["summary"]["missing_trace_signals"]
+
+    report = await LocalTextEngine().run(
+        scenario=_scenario(),
+        agent_callback=agent,
+        environment=ObservabilityReplayEnvironment(
+            replay_cases,
+            name="refund-regressions",
+            source="futureagi",
+            framework="langgraph",
+            required_trace_signals=["agent", "model", "tool"],
+        ),
+        max_turns=1,
+        min_turns=1,
+    )
+    result = report.results[0]
+    replay_state = result.metadata["environment_state"]["observability_replay_pack"]
+    assert replay_state["summary"]["case_count"] == 2
+    assert replay_state["summary"]["failed_case_count"] == 2
+    assert {"observability_replay_status", "list_observability_replay_cases", "inspect_observability_replay_case"} <= {
+        tool["name"] for tool in result.tool_calls
+    }
+
+    evaluation = evaluate_agent_report(
+        report,
+        config={
+            "required_observability_replay": ["replay_pack", "case", "failure", "metric", "trace_signal", "raw"],
+            "observability_replay_quality": {
+                "min_case_count": 2,
+                "min_failed_case_count": 2,
+                "required_metrics": ["policy_adherence", "framework_trace_coverage"],
+                "required_failed_metrics": ["policy_adherence", "framework_trace_coverage"],
+                "required_trace_signals": ["agent", "model"],
+                "required_tags": ["metric:policy_adherence", "missing_signal:tool"],
+                "expected_case_ids": ["run_policy_failed", "run_trace_missing_tool"],
+                "require_raw_evidence": True,
+            },
+        },
+    )
+    metrics = evaluation.summary["metric_averages"]
+    assert metrics["observability_replay_coverage"] == 1.0
+    assert metrics["observability_replay_quality"] == 1.0
+
+    loaded = load_observability_replay_pack(
+        {"cases": replay_cases},
+        name="refund-regressions",
+        provider="futureagi",
+        framework="langgraph",
+        required_trace_signals=["agent", "model", "tool"],
+    )
+    assert isinstance(loaded, ObservabilityReplayEnvironment)
 
 
 @pytest.mark.asyncio
