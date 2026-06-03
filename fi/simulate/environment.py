@@ -1911,6 +1911,27 @@ def normalize_voice_export(
     )
 
 
+def normalize_voice_timing_distribution(
+    timing_distribution: Any,
+    *,
+    latency_profile: Optional[Mapping[str, Any]] = None,
+    stt_latency_ms: int = 180,
+    tts_latency_ms: int = 320,
+) -> Dict[str, Any]:
+    """Normalize VAD/EOU/STT/LLM/TTS/turn timing samples into stage summaries."""
+
+    return _normalize_voice_timing_distribution(
+        timing_distribution,
+        latency_profile=_normalize_latency_profile(
+            latency_profile,
+            stt_latency_ms=stt_latency_ms,
+            tts_latency_ms=tts_latency_ms,
+        )
+        if latency_profile
+        else None,
+    )
+
+
 def load_voice_export(
     source: str | os.PathLike[str] | Mapping[str, Any] | Iterable[Any],
     *,
@@ -1922,6 +1943,7 @@ def load_voice_export(
     tts_latency_ms: int = 320,
     state: Optional[Dict[str, Any]] = None,
     latency_profile: Optional[Mapping[str, Any]] = None,
+    timing_distribution: Optional[Mapping[str, Any]] = None,
     noise_profile: Optional[Mapping[str, Any]] = None,
     allow_interruptions: bool = True,
     interruption_policy: Optional[Mapping[str, Any]] = None,
@@ -1937,6 +1959,7 @@ def load_voice_export(
             tts_latency_ms=tts_latency_ms,
             state=state,
             latency_profile=latency_profile,
+            timing_distribution=timing_distribution,
             noise_profile=noise_profile,
             allow_interruptions=allow_interruptions,
             interruption_policy=interruption_policy,
@@ -1953,6 +1976,7 @@ def load_voice_export(
         tts_latency_ms=tts_latency_ms,
         state=state,
         latency_profile=latency_profile,
+        timing_distribution=timing_distribution,
         noise_profile=noise_profile,
         allow_interruptions=allow_interruptions,
         interruption_policy=interruption_policy,
@@ -1980,6 +2004,7 @@ class VoiceEnvironment(EnvironmentAdapter):
         event_replay: Optional[Iterable[Mapping[str, Any]]] = None,
         frame_replay: Optional[Iterable[Mapping[str, Any]]] = None,
         latency_profile: Optional[Mapping[str, Any]] = None,
+        timing_distribution: Optional[Mapping[str, Any]] = None,
         noise_profile: Optional[Mapping[str, Any]] = None,
         allow_interruptions: bool = True,
         interruption_policy: Optional[Mapping[str, Any]] = None,
@@ -2007,6 +2032,7 @@ class VoiceEnvironment(EnvironmentAdapter):
             "waveforms": [],
             "diarization": [],
             "perceptual_metrics": {},
+            "timing_distribution": {},
             "metadata": {},
         }
         if voice_export_source is not None:
@@ -2070,6 +2096,13 @@ class VoiceEnvironment(EnvironmentAdapter):
             stt_latency_ms=stt_latency_ms,
             tts_latency_ms=tts_latency_ms,
         )
+        self.timing_distribution = _normalize_voice_timing_distribution(
+            _merge_voice_timing_distribution_inputs(
+                export_payload.get("timing_distribution"),
+                timing_distribution,
+            ),
+            latency_profile=self.latency_profile,
+        )
         self.noise_profile = copy.deepcopy(dict(noise_profile or {}))
         self.latency_cursors = {"stt": 0, "tts": 0}
         self.allow_interruptions = allow_interruptions
@@ -2120,6 +2153,7 @@ class VoiceEnvironment(EnvironmentAdapter):
                     "waveform_count": len(self.waveforms),
                     "diarization_segments": len(self.diarization),
                     "perceptual_metrics": copy.deepcopy(self.perceptual_metrics.get("overall", {})),
+                    "timing_stage_count": len(self.timing_distribution.get("stages", {})),
                 },
             )
         ]
@@ -2147,6 +2181,26 @@ class VoiceEnvironment(EnvironmentAdapter):
                     type="voice",
                     name="voice_audio_quality",
                     payload=copy.deepcopy(self.perceptual_metrics),
+                )
+            )
+        if self.timing_distribution.get("stages"):
+            for stage_name, stage in self.timing_distribution.get("stages", {}).items():
+                self.timeline.append(
+                    {
+                        "kind": "timing_stage",
+                        "id": stage_name,
+                        "name": stage_name,
+                        "duration_ms": stage.get("p50_ms"),
+                        "sample_count": stage.get("count", 0),
+                        "p95_ms": stage.get("p95_ms"),
+                        "max_ms": stage.get("max_ms"),
+                    }
+                )
+            events.append(
+                SimulationEvent(
+                    type="voice_timing",
+                    name="voice_timing_distribution_ready",
+                    payload=copy.deepcopy(self.timing_distribution),
                 )
             )
         for utterance in self.utterances:
@@ -2247,6 +2301,10 @@ class VoiceEnvironment(EnvironmentAdapter):
                     "name": "voice_status",
                     "description": "Return current simulated voice session state and replay trace.",
                 },
+                {
+                    "name": "voice_timing",
+                    "description": "Return normalized voice timing distribution summaries for replayed stages.",
+                },
             ],
             artifacts=artifacts,
             state={"voice": self._state_payload()},
@@ -2260,6 +2318,7 @@ class VoiceEnvironment(EnvironmentAdapter):
                     "export_framework": self.voice_export_framework,
                     "waveforms": len(self.waveforms),
                     "diarization_segments": len(self.diarization),
+                    "timing_stages": len(self.timing_distribution.get("stages", {})),
                 }
             },
         )
@@ -2270,7 +2329,7 @@ class VoiceEnvironment(EnvironmentAdapter):
         **context: Any,
     ) -> Optional[ToolExecutionResult]:
         name = _tool_name(tool_call)
-        if name not in {"speak", "stop_speaking", "transcribe_audio", "route_call", "voice_status"}:
+        if name not in {"speak", "stop_speaking", "transcribe_audio", "route_call", "voice_status", "voice_timing"}:
             return None
         arguments = _tool_arguments(tool_call)
         call_id = _tool_call_id(tool_call)
@@ -2401,6 +2460,23 @@ class VoiceEnvironment(EnvironmentAdapter):
                 ],
             )
 
+        if name == "voice_timing":
+            payload = copy.deepcopy(self.timing_distribution)
+            return ToolExecutionResult(
+                tool_call_id=call_id,
+                tool_name=name,
+                content=json.dumps(payload, default=str),
+                result=payload,
+                artifacts=[self._trace_artifact()],
+                events=[
+                    SimulationEvent(
+                        type="voice_timing",
+                        name="voice_timing_distribution",
+                        payload=payload,
+                    )
+                ],
+            )
+
         text = str(arguments.get("text", arguments.get("content", "")))
         latency_ms = int(arguments.get("latency_ms", self._next_latency("tts")))
         duration_ms = arguments.get("duration_ms")
@@ -2471,6 +2547,7 @@ class VoiceEnvironment(EnvironmentAdapter):
             "timeline": copy.deepcopy(self.timeline),
             "overlap_events": copy.deepcopy(self.overlap_events),
             "latency_profile": copy.deepcopy(self.latency_profile),
+            "timing_distribution": copy.deepcopy(self.timing_distribution),
             "noise_profile": copy.deepcopy(self.noise_profile),
             "interruption_policy": copy.deepcopy(self.interruption_policy),
             "routes": copy.deepcopy(self.routes),
@@ -2496,6 +2573,7 @@ class VoiceEnvironment(EnvironmentAdapter):
             "timeline": copy.deepcopy(self.timeline),
             "overlap_events": copy.deepcopy(self.overlap_events),
             "latency_profile": copy.deepcopy(self.latency_profile),
+            "timing_distribution": copy.deepcopy(self.timing_distribution),
             "noise_profile": copy.deepcopy(self.noise_profile),
             "interruption_policy": copy.deepcopy(self.interruption_policy),
         }
@@ -12199,6 +12277,7 @@ def _normalize_voice_export(
         "waveforms": [],
         "diarization": [],
         "perceptual_metrics": {},
+        "timing_distribution": {},
         "metadata": {"framework": framework_name},
     }
     if source_label:
@@ -12221,6 +12300,15 @@ def _normalize_voice_export(
             export.get("audio_quality"),
             export.get("quality_profile"),
             export.get("metrics") if _looks_like_voice_quality_mapping(_as_mapping(export.get("metrics"))) else None,
+        )
+        payload["timing_distribution"] = _merge_voice_timing_distributions(
+            payload["timing_distribution"],
+            export.get("timing_distribution"),
+            export.get("timing_profile"),
+            export.get("timing"),
+            export.get("latency_distribution"),
+            export.get("latency_metrics"),
+            export.get("metrics") if _looks_like_voice_timing_mapping(_as_mapping(export.get("metrics"))) else None,
         )
 
     for index, record in enumerate(_voice_export_records(voice_export)):
@@ -12247,6 +12335,10 @@ def _normalize_voice_export(
             payload["perceptual_metrics"],
             _voice_perceptual_metrics_from_record(item),
         )
+        payload["timing_distribution"] = _merge_voice_timing_distributions(
+            payload["timing_distribution"],
+            _voice_timing_distribution_from_record(item, name),
+        )
 
     payload["utterances"] = _dedupe_voice_dicts(payload["utterances"], "id")
     payload["event_replay"] = _dedupe_voice_dicts(payload["event_replay"], "name", include_timestamp=True)
@@ -12257,6 +12349,7 @@ def _normalize_voice_export(
         payload["perceptual_metrics"],
         waveforms=payload["waveforms"],
     )
+    payload["timing_distribution"] = _normalize_voice_timing_distribution(payload["timing_distribution"])
     return payload
 
 
@@ -12269,6 +12362,7 @@ def _merge_voice_export_payloads(*payloads: Mapping[str, Any]) -> Dict[str, Any]
         "waveforms": [],
         "diarization": [],
         "perceptual_metrics": {},
+        "timing_distribution": {},
         "metadata": {},
     }
     for payload in payloads:
@@ -12281,6 +12375,10 @@ def _merge_voice_export_payloads(*payloads: Mapping[str, Any]) -> Dict[str, Any]
         merged["perceptual_metrics"] = _merge_voice_perceptual_metrics(
             merged["perceptual_metrics"],
             payload.get("perceptual_metrics"),
+        )
+        merged["timing_distribution"] = _merge_voice_timing_distributions(
+            merged["timing_distribution"],
+            payload.get("timing_distribution"),
         )
     return merged
 
@@ -12363,6 +12461,11 @@ def _looks_like_voice_export_record(record: Mapping[str, Any]) -> bool:
             "speaker",
             "diarization",
             "frame",
+            "latency",
+            "timing",
+            "metrics",
+            "eou",
+            "endpointing",
             "user_input_transcribed",
             "conversation_item_added",
             "agent_state_changed",
@@ -12419,6 +12522,19 @@ def _voice_event_from_export_record(record: Mapping[str, Any], name: str) -> Opt
         "packet_loss_pct",
         "snr_db",
         "mos",
+        "stage",
+        "stage_name",
+        "vad_ms",
+        "vad_latency_ms",
+        "vad_inference_duration_ms",
+        "eou_delay_ms",
+        "end_of_utterance_delay_ms",
+        "stt_latency_ms",
+        "llm_latency_ms",
+        "tts_latency_ms",
+        "turn_latency_ms",
+        "ttft_ms",
+        "time_to_first_audio_ms",
     ):
         if key in record and key not in payload:
             payload[key] = record[key]
@@ -13170,6 +13286,17 @@ def _normalize_voice_frame(item: Mapping[str, Any]) -> Dict[str, Any]:
         "end_ms",
         "overlap_ms",
         "noise_db",
+        "vad_ms",
+        "vad_latency_ms",
+        "vad_inference_duration_ms",
+        "eou_delay_ms",
+        "end_of_utterance_delay_ms",
+        "stt_latency_ms",
+        "llm_latency_ms",
+        "tts_latency_ms",
+        "turn_latency_ms",
+        "ttft_ms",
+        "time_to_first_audio_ms",
         "sample_rate",
         "sample_rate_hz",
         "num_channels",
@@ -13336,6 +13463,410 @@ def _latency_series(value: Any, default: int) -> List[int]:
         values = [int(item) for item in value]
         return values or [int(default)]
     return [int(default)]
+
+
+def _merge_voice_timing_distribution_inputs(*values: Any) -> Dict[str, Any]:
+    return _merge_voice_timing_distributions(*values)
+
+
+def _merge_voice_timing_distributions(*values: Any) -> Dict[str, Any]:
+    raw: Dict[str, Any] = {"kind": "voice_timing_distribution", "stages": {}, "stage_order": []}
+    declared_turn_count: Optional[int] = None
+    for value in values:
+        normalized = _normalize_voice_timing_distribution(value)
+        if not normalized.get("stages"):
+            continue
+        if normalized.get("turn_count") is not None:
+            declared_turn_count = max(int(declared_turn_count or 0), int(normalized["turn_count"]))
+        for stage in normalized.get("stage_order", []):
+            if stage not in raw["stage_order"]:
+                raw["stage_order"].append(stage)
+        for stage, stage_payload in normalized.get("stages", {}).items():
+            current = raw["stages"].setdefault(stage, {"samples_ms": [], "count": 0})
+            current["samples_ms"].extend(copy.deepcopy(list(stage_payload.get("samples_ms", []))))
+            current["count"] = int(current.get("count", 0)) + int(
+                stage_payload.get("count") or len(stage_payload.get("samples_ms", []))
+            )
+            for key, value_for_key in stage_payload.items():
+                if key not in {"stage", "samples_ms", "count", "min_ms", "max_ms", "mean_ms", "p50_ms", "p75_ms", "p95_ms", "p99_ms", "stddev_ms"}:
+                    current[key] = copy.deepcopy(value_for_key)
+    if declared_turn_count is not None:
+        raw["turn_count"] = declared_turn_count
+    return _normalize_voice_timing_distribution(raw)
+
+
+def _normalize_voice_timing_distribution(
+    value: Any,
+    *,
+    latency_profile: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    stages: Dict[str, Dict[str, Any]] = {}
+    stage_order: List[str] = []
+    metadata: Dict[str, Any] = {}
+    turn_count: Optional[int] = None
+
+    def add_stage(raw_stage: Any, raw_value: Any) -> None:
+        stage = _normalize_voice_timing_stage_name(raw_stage)
+        if not stage:
+            return
+        normalized_stage = _normalize_voice_timing_stage(raw_value, stage=stage)
+        if not normalized_stage:
+            return
+        existing = stages.get(stage)
+        if existing:
+            samples = [
+                *copy.deepcopy(list(existing.get("samples_ms", []))),
+                *copy.deepcopy(list(normalized_stage.get("samples_ms", []))),
+            ]
+            declared_count = int(existing.get("count", 0)) + int(
+                normalized_stage.get("count") or len(normalized_stage.get("samples_ms", []))
+            )
+            merged = {**existing, **normalized_stage, "samples_ms": samples, "count": declared_count}
+            stages[stage] = _normalize_voice_timing_stage(merged, stage=stage)
+        else:
+            stages[stage] = normalized_stage
+        if stage not in stage_order:
+            stage_order.append(stage)
+
+    if isinstance(value, Mapping):
+        item = copy.deepcopy(dict(value))
+        metadata = copy.deepcopy(_as_mapping(item.get("metadata", {})))
+        turn_count = _voice_int(item.get("turn_count", item.get("turns")))
+        raw_order = item.get("stage_order") or item.get("order") or item.get("expected_order")
+        for raw_stage in _as_iterable(raw_order):
+            stage = _normalize_voice_timing_stage_name(raw_stage)
+            if stage and stage not in stage_order:
+                stage_order.append(stage)
+
+        raw_stages = item.get("stages") or item.get("stage_summaries")
+        if isinstance(raw_stages, Mapping):
+            for raw_stage, raw_value in raw_stages.items():
+                add_stage(raw_stage, raw_value)
+        elif raw_stages is not None:
+            for index, raw_stage_item in enumerate(_as_iterable(raw_stages)):
+                stage_item = _as_mapping(raw_stage_item)
+                stage_name = (
+                    stage_item.get("stage")
+                    or stage_item.get("name")
+                    or stage_item.get("metric")
+                    or stage_item.get("type")
+                    or f"stage_{index + 1}"
+                )
+                add_stage(stage_name, stage_item)
+
+        for raw_key, raw_value in item.items():
+            if raw_key in {"kind", "metadata", "stages", "stage_summaries", "stage_order", "order", "expected_order", "turn_count", "turns"}:
+                continue
+            stage = _normalize_voice_timing_stage_name(raw_key)
+            if stage:
+                add_stage(stage, raw_value)
+    elif value not in (None, ""):
+        for index, raw_stage_item in enumerate(_as_iterable(value)):
+            stage_item = _as_mapping(raw_stage_item)
+            if stage_item:
+                add_stage(
+                    stage_item.get("stage")
+                    or stage_item.get("name")
+                    or stage_item.get("metric")
+                    or f"stage_{index + 1}",
+                    stage_item,
+                )
+
+    for stage, samples in (latency_profile or {}).items():
+        if stage not in stages:
+            add_stage(stage, samples)
+
+    ordered = [stage for stage in stage_order if stage in stages]
+    ordered.extend(stage for stage in stages if stage not in ordered)
+    sample_count = sum(int(stage.get("count", 0)) for stage in stages.values())
+    return {
+        "kind": "voice_timing_distribution",
+        "stages": {stage: stages[stage] for stage in ordered},
+        "stage_order": ordered,
+        "turn_count": turn_count,
+        "sample_count": sample_count,
+        "metadata": metadata,
+    }
+
+
+def _normalize_voice_timing_stage(value: Any, *, stage: str) -> Dict[str, Any]:
+    metadata = copy.deepcopy(_as_mapping(value)) if isinstance(value, Mapping) else {}
+    samples = _voice_timing_samples(value)
+    declared_count = _voice_int(metadata.get("count", metadata.get("sample_count", metadata.get("n"))))
+    if declared_count is None:
+        declared_count = len(samples)
+    summary = _voice_timing_summary(samples, declared_count=declared_count, fallback=metadata)
+    result = {
+        "stage": stage,
+        "samples_ms": samples,
+        **summary,
+    }
+    for key in ("source", "metric", "unit", "description", "turn_indices", "speech_ids"):
+        if key in metadata:
+            result[key] = copy.deepcopy(metadata[key])
+    return result if result.get("count", 0) > 0 else {}
+
+
+def _voice_timing_samples(value: Any) -> List[int]:
+    if value in (None, "") or isinstance(value, bool):
+        return []
+    if isinstance(value, (int, float)):
+        return [max(0, int(round(float(value))))]
+    if isinstance(value, Mapping):
+        item = dict(value)
+        for key in (
+            "samples_ms",
+            "samples",
+            "series",
+            "values",
+            "latencies_ms",
+            "latencies",
+            "durations_ms",
+            "durations",
+        ):
+            if key in item:
+                return _voice_timing_samples(item[key])
+        direct_values = []
+        for key in (
+            "latency_ms",
+            "duration_ms",
+            "delay_ms",
+            "vad_ms",
+            "vad_latency_ms",
+            "vad_inference_duration_ms",
+            "eou_delay_ms",
+            "end_of_utterance_delay_ms",
+            "stt_latency_ms",
+            "llm_latency_ms",
+            "tts_latency_ms",
+            "turn_latency_ms",
+            "ttft_ms",
+            "time_to_first_audio_ms",
+        ):
+            if key in item:
+                direct_values.append(item[key])
+        if direct_values:
+            return _voice_timing_samples(direct_values)
+        return _voice_synthetic_timing_samples(item)
+    if hasattr(value, "__iter__") and not isinstance(value, (str, bytes)):
+        samples: List[int] = []
+        for item in value:
+            samples.extend(_voice_timing_samples(item))
+        return samples
+    parsed = _voice_float(value)
+    return [max(0, int(round(parsed)))] if parsed is not None else []
+
+
+def _voice_synthetic_timing_samples(item: Mapping[str, Any]) -> List[int]:
+    count = _voice_int(item.get("count", item.get("sample_count", item.get("n")))) or 5
+    count = max(1, min(count, 100))
+    center = _voice_float(
+        item.get(
+            "mean_ms",
+            item.get("avg_ms", item.get("p50_ms", item.get("median_ms", item.get("latency_ms")))),
+        )
+    )
+    stddev = _voice_float(item.get("stddev_ms", item.get("std_ms", item.get("jitter_ms"))))
+    minimum = _voice_float(item.get("min_ms"))
+    maximum = _voice_float(item.get("max_ms"))
+    p75 = _voice_float(item.get("p75_ms"))
+    p95 = _voice_float(item.get("p95_ms"))
+    p99 = _voice_float(item.get("p99_ms"))
+    if center is None and any(value is not None for value in (minimum, maximum, p75, p95, p99)):
+        candidates = [value for value in (minimum, p75, p95, p99, maximum) if value is not None]
+        center = sum(candidates) / len(candidates)
+    if center is None:
+        return []
+    if stddev is not None and stddev > 0:
+        offsets = [-1.0, -0.5, 0.0, 0.5, 1.0]
+        values = [center + offsets[index % len(offsets)] * stddev for index in range(count)]
+    else:
+        seed_values = [value for value in (minimum, center, p75, p95, p99, maximum) if value is not None]
+        values = [seed_values[index % len(seed_values)] for index in range(count)] if seed_values else [center] * count
+    if minimum is not None:
+        values = [max(minimum, value) for value in values]
+    if maximum is not None:
+        values = [min(maximum, value) for value in values]
+    return [max(0, int(round(value))) for value in values]
+
+
+def _voice_timing_summary(
+    samples: Sequence[int],
+    *,
+    declared_count: int,
+    fallback: Mapping[str, Any],
+) -> Dict[str, Any]:
+    values = sorted(int(value) for value in samples if not isinstance(value, bool))
+    count = max(int(declared_count), len(values))
+    summary: Dict[str, Any] = {"count": count}
+    if values:
+        mean = sum(values) / len(values)
+        variance = sum((value - mean) ** 2 for value in values) / len(values)
+        summary.update(
+            {
+                "min_ms": min(values),
+                "max_ms": max(values),
+                "mean_ms": round(mean, 4),
+                "p50_ms": _voice_percentile(values, 50),
+                "p75_ms": _voice_percentile(values, 75),
+                "p95_ms": _voice_percentile(values, 95),
+                "p99_ms": _voice_percentile(values, 99),
+                "stddev_ms": round(math.sqrt(variance), 4),
+            }
+        )
+        return summary
+    for key in ("min_ms", "max_ms", "mean_ms", "p50_ms", "p75_ms", "p95_ms", "p99_ms", "stddev_ms"):
+        value = _voice_float(fallback.get(key))
+        if value is not None:
+            summary[key] = round(value, 4)
+    return summary
+
+
+def _voice_percentile(values: Sequence[int], percentile: float) -> float:
+    if not values:
+        return 0.0
+    if len(values) == 1:
+        return float(values[0])
+    ordered = sorted(values)
+    index = (len(ordered) - 1) * percentile / 100
+    low = int(math.floor(index))
+    high = int(math.ceil(index))
+    if low == high:
+        return float(ordered[low])
+    lower = ordered[low] * (high - index)
+    upper = ordered[high] * (index - low)
+    return round(lower + upper, 4)
+
+
+def _normalize_voice_timing_stage_name(value: Any) -> str:
+    normalized = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    normalized = normalized.replace(".", "_")
+    aliases = {
+        "vad": "vad",
+        "voice_activity_detection": "vad",
+        "vad_latency": "vad",
+        "vad_inference": "vad",
+        "vad_inference_duration": "vad",
+        "eou": "eou",
+        "end_of_utterance": "eou",
+        "end_of_utterance_delay": "eou",
+        "endpointing": "eou",
+        "endpointing_delay": "eou",
+        "stt": "stt",
+        "speech_to_text": "stt",
+        "transcription": "stt",
+        "transcription_latency": "stt",
+        "llm": "llm",
+        "model": "llm",
+        "generation": "llm",
+        "inference": "llm",
+        "tts": "tts",
+        "text_to_speech": "tts",
+        "synthesis": "tts",
+        "ttft": "tts",
+        "time_to_first_audio": "tts",
+        "turn": "turn",
+        "turn_latency": "turn",
+        "round_trip": "turn",
+        "response_latency": "turn",
+        "interruption": "interruption",
+        "interrupt": "interruption",
+        "barge_in": "interruption",
+    }
+    if normalized in aliases:
+        return aliases[normalized]
+    if normalized.endswith("_ms"):
+        return _normalize_voice_timing_stage_name(normalized[:-3])
+    if normalized.endswith("_latency"):
+        return _normalize_voice_timing_stage_name(normalized[: -len("_latency")])
+    return ""
+
+
+def _looks_like_voice_timing_mapping(value: Mapping[str, Any]) -> bool:
+    if not value:
+        return False
+    text = _stringify_dict(value).lower()
+    return any(
+        token in text
+        for token in (
+            "latency_ms",
+            "timing",
+            "duration_ms",
+            "eou",
+            "endpointing",
+            "vad",
+            "stt",
+            "tts",
+            "ttft",
+        )
+    )
+
+
+def _voice_timing_distribution_from_record(record: Mapping[str, Any], name: str) -> Dict[str, Any]:
+    payload = _as_mapping(record.get("payload") or record.get("data"))
+    sources = [record, payload]
+    for nested_key in ("metrics", "timing", "timing_distribution", "timing_profile", "latency_metrics"):
+        nested = _as_mapping(record.get(nested_key) or payload.get(nested_key))
+        if nested:
+            sources.append(nested)
+
+    distributions: List[Any] = []
+    for source in sources:
+        for key in ("timing_distribution", "timing_profile", "timing", "latency_distribution", "latency_metrics"):
+            if source.get(key):
+                distributions.append(source.get(key))
+
+        explicit_stage = _normalize_voice_timing_stage_name(
+            source.get("stage") or source.get("stage_name") or source.get("metric") or source.get("type") or name
+        )
+        inferred_stage = explicit_stage or _voice_timing_stage_from_text(f"{name} {_stringify_dict(source)}")
+        stage_values: Dict[str, List[Any]] = {}
+
+        for key, stage in (
+            ("vad_ms", "vad"),
+            ("vad_latency_ms", "vad"),
+            ("vad_inference_duration_ms", "vad"),
+            ("eou_delay_ms", "eou"),
+            ("end_of_utterance_delay_ms", "eou"),
+            ("endpointing_delay_ms", "eou"),
+            ("stt_latency_ms", "stt"),
+            ("llm_latency_ms", "llm"),
+            ("model_latency_ms", "llm"),
+            ("tts_latency_ms", "tts"),
+            ("ttft_ms", "tts"),
+            ("time_to_first_audio_ms", "tts"),
+            ("turn_latency_ms", "turn"),
+            ("round_trip_ms", "turn"),
+            ("interruption_latency_ms", "interruption"),
+        ):
+            if key in source:
+                stage_values.setdefault(stage, []).append(source[key])
+        for key in ("latency_ms", "duration_ms", "delay_ms"):
+            if key in source and inferred_stage:
+                stage_values.setdefault(inferred_stage, []).append(source[key])
+        if stage_values:
+            distributions.append({"stages": stage_values})
+
+    return _merge_voice_timing_distributions(*distributions)
+
+
+def _voice_timing_stage_from_text(text: str) -> str:
+    lowered = text.lower()
+    if "end_of_utterance" in lowered or "endpoint" in lowered or "eou" in lowered:
+        return "eou"
+    if "vad" in lowered or "userstartedspeaking" in lowered or "userstoppedspeaking" in lowered:
+        return "vad"
+    if "transcription" in lowered or "transcript" in lowered or "stt" in lowered:
+        return "stt"
+    if "time_to_first_audio" in lowered or "ttft" in lowered or "tts" in lowered or "audio_out" in lowered:
+        return "tts"
+    if "llm" in lowered or "model" in lowered or "generation" in lowered:
+        return "llm"
+    if "interrupt" in lowered or "barge" in lowered:
+        return "interruption"
+    if "turn" in lowered or "round_trip" in lowered or "response_latency" in lowered:
+        return "turn"
+    return ""
 
 
 def _normalize_voice_routes(routes: Optional[Mapping[str, Any] | Iterable[str]]) -> Dict[str, Any]:

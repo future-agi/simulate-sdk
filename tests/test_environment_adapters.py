@@ -44,6 +44,7 @@ from fi.simulate import (
     normalize_browser_mutation_pack,
     normalize_browser_trace_export,
     normalize_voice_export,
+    normalize_voice_timing_distribution,
     normalize_world_contract,
     normalize_playwright_trace_export,
 )
@@ -2867,6 +2868,85 @@ async def test_voice_environment_loads_voice_exports_waveforms_diarization_and_q
     assert any(artifact.type == "audio" and artifact.metadata.get("id") == "caller_wave" for artifact in result.artifacts)
     assert voice_traces[-1]["export_framework"] == "livekit"
     assert voice_traces[-1]["perceptual_metrics"]["overall"]["packet_loss_pct"] == 0.4
+
+
+@pytest.mark.asyncio
+async def test_voice_environment_replays_timing_distribution_metrics():
+    timing_distribution = normalize_voice_timing_distribution(
+        {
+            "stage_order": ["vad", "eou", "stt", "llm", "tts", "turn"],
+            "stages": {
+                "vad": {"mean_ms": 24, "stddev_ms": 2, "count": 5, "source": "vad_metrics"},
+                "stt": [170, 190, 210],
+                "tts": {"samples_ms": [280, 300, 320], "source": "tts_metrics"},
+            },
+        }
+    )
+    assert timing_distribution["stages"]["vad"]["count"] == 5
+    assert timing_distribution["stages"]["tts"]["p95_ms"] >= 318
+
+    voice_export = {
+        "framework": "pipecat",
+        "timing_distribution": timing_distribution,
+        "events": [
+            {"event": "eou_metrics", "eou_delay_ms": 110, "speech_id": "caller_1"},
+            {"event": "llm_metrics", "llm_latency_ms": 260},
+            {
+                "event": "user_input_transcribed",
+                "id": "caller_1",
+                "transcript": "Billing issue for order 123.",
+                "speaker_id": "caller",
+                "latency_ms": 190,
+            },
+        ],
+    }
+    normalized_export = normalize_voice_export(voice_export, framework="pipecat")
+    assert normalized_export["timing_distribution"]["stages"]["eou"]["p50_ms"] == 110.0
+    assert normalized_export["timing_distribution"]["stages"]["llm"]["p50_ms"] == 260.0
+
+    seen_tools = []
+
+    async def agent(input):
+        seen_tools.extend(tool["name"] for tool in input.tools)
+        return AgentResponse(
+            content="I inspect timing, transcribe the caller, and answer.",
+            tool_calls=[
+                {"id": "timing", "name": "voice_timing", "arguments": {}},
+                {"id": "stt", "name": "transcribe_audio", "arguments": {"id": "caller_1"}},
+                {"id": "tts", "name": "speak", "arguments": {"text": "I can help with order 123."}},
+            ],
+        )
+
+    report = await LocalTextEngine().run(
+        scenario=_scenario(),
+        agent_callback=agent,
+        environment=load_voice_export(
+            voice_export,
+            framework="pipecat",
+            latency_profile={"stt": [180, 200], "tts": [300, 340]},
+            timing_distribution={
+                "turn": {"samples_ms": [780, 820, 860, 840], "source": "session_metrics"}
+            },
+        ),
+        max_turns=1,
+        min_turns=1,
+        modality="voice",
+    )
+
+    result = report.results[0]
+    voice_state = result.metadata["environment_state"]["voice"]
+    voice_traces = [
+        artifact.data
+        for artifact in result.artifacts
+        if artifact.type == "trace" and artifact.metadata.get("kind") == "voice_trace"
+    ]
+
+    assert "voice_timing" in seen_tools
+    assert {"vad", "eou", "stt", "llm", "tts", "turn"} <= set(voice_state["timing_distribution"]["stages"])
+    assert voice_state["timing_distribution"]["stages"]["turn"]["p95_ms"] >= 857
+    assert voice_traces[-1]["timing_distribution"]["stages"]["eou"]["max_ms"] == 110
+    assert any(event.type == "voice_timing" for event in result.events)
+    assert any(item["kind"] == "timing_stage" for item in voice_traces[-1]["timeline"])
 
 
 @pytest.mark.asyncio

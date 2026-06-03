@@ -342,6 +342,7 @@ from fi.simulate import (
     load_framework_trace_export,
     load_orchestration_trace_export,
     load_streaming_trace_export,
+    load_voice_export,
     load_world_contract,
     load_autogen_groupchat_transcript,
     load_crewai_event_log,
@@ -352,6 +353,7 @@ from fi.simulate import (
     normalize_streaming_trace_events,
     normalize_adversarial_attack_pack,
     normalize_browser_mutation_pack,
+    normalize_voice_timing_distribution,
     normalize_world_contract,
     normalize_framework_trace_events,
     normalize_browser_trace_export,
@@ -544,6 +546,7 @@ See [`examples/local_browser_mutation_pack.py`](examples/local_browser_mutation_
 See [`examples/local_voice_replay_routing.py`](examples/local_voice_replay_routing.py) for a voice replay cookbook with VAD/STT/TTS events, Pipecat-style frame replay, noise/overlap evidence, interruption handling, and call routing.
 See [`examples/local_voice_export_replay.py`](examples/local_voice_export_replay.py) for a voice export replay cookbook with LiveKit-style events, Pipecat-style frames, waveform fixtures, diarization, MOS/SNR/clipping/jitter/packet-loss checks, and `load_voice_export`.
 See [`examples/local_voice_media_decode.py`](examples/local_voice_media_decode.py) for a self-contained WAV media replay cookbook with decoded sample rate, duration, RMS/peak, and clipping checks.
+See [`examples/local_voice_timing_distribution.py`](examples/local_voice_timing_distribution.py) for a voice timing-distribution cookbook with VAD, end-of-utterance, STT, LLM, TTS, and full-turn p95 stage evidence.
 See [`examples/local_framework_trace_replay.py`](examples/local_framework_trace_replay.py) for a framework trace replay cookbook with native spans/events and TraceAI/OpenTelemetry export payloads from orchestration frameworks.
 See [`examples/local_langgraph_event_stream_replay.py`](examples/local_langgraph_event_stream_replay.py) for a LangGraph/LangChain event-stream replay cookbook with message/tool/state projections and transcript-quality scoring.
 See [`examples/local_orchestration_graph_trace.py`](examples/local_orchestration_graph_trace.py) for a framework-neutral workflow graph cookbook with nodes, routes, retries, recovery, latency/cost budgets, terminal status, and state checks.
@@ -722,10 +725,15 @@ evaluation = evaluate_agent_report(
         "forbidden_browser_prompt_injection_targets": ["coupon_iframe"],
         "expected_browser_state": {"url": "https://shop.example.com/done"},
         "expected_browser_dom_contains": ["Done"],
-        "required_voice_trace": ["audio", "vad", "stt", "tts", "interruption", "route", "frame", "noise", "overlap", "timeline", "media", "sample_rate", "duration", "rms", "peak"],
+        "required_voice_trace": ["audio", "vad", "stt", "tts", "interruption", "route", "frame", "noise", "overlap", "timeline", "media", "sample_rate", "duration", "rms", "peak", "timing_distribution", "timing_stage", "eou", "llm", "turn"],
         "expected_voice_route": "billing",
         "expected_voice_transcript_contains": ["order 123"],
         "required_voice_frame_types": ["InputAudioRawFrame", "TranscriptionFrame", "TTSStartedFrame", "TTSAudioRawFrame"],
+        "voice_timing_distribution": {
+            "required_stages": ["vad", "eou", "stt", "llm", "tts", "turn"],
+            "min_samples_per_stage": 3,
+            "max_stage_p95_ms": {"eou": 120, "stt": 250, "tts": 350, "turn": 900},
+        },
         "max_voice_overlap_ms": 250,
         "max_voice_noise_db": 35,
         "required_voice_speakers": ["caller", "agent"],
