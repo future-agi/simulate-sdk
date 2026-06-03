@@ -4269,6 +4269,8 @@ FRAMEWORK_TRACE_ALIASES = {
     "vector_search": "retrieval",
     "memory_update": "memory",
     "memory_retrieval": "memory",
+    "skill_update": "skill",
+    "skill_library": "skill",
     "computer": "browser",
     "cua": "browser",
     "computer_use": "browser",
@@ -4342,6 +4344,10 @@ def _normalize_framework_span(
     )
     signals = _framework_signals(raw, attributes, name, span_data=span_data, data=data, payload=payload)
     protocol_event = _framework_protocol_event(raw, data=data, payload=payload, attributes=attributes)
+    if protocol_event.get("memory"):
+        signals.add("memory")
+    if protocol_event.get("skill"):
+        signals.add("skill")
     latency_ms = _first_number(
         raw,
         attributes,
@@ -4415,6 +4421,8 @@ def _normalize_framework_span(
             ("message_text", "message_text"),
             ("state", "state"),
             ("final_output", "final_output"),
+            ("memory", "memory"),
+            ("skill", "skill"),
             ("sequence", "sequence"),
         ):
             value = protocol_event.get(source_key)
@@ -4565,6 +4573,22 @@ def _framework_protocol_event(
         attributes,
         text=message_text,
     )
+    memory = _framework_memory_payload_from_sources(
+        raw,
+        params_data,
+        data,
+        payload,
+        span_data,
+        attributes,
+    )
+    skill = _framework_skill_payload_from_sources(
+        raw,
+        params_data,
+        data,
+        payload,
+        span_data,
+        attributes,
+    )
     final_output = _first_present(
         (params_data, data, payload, raw),
         ("final_output", "output", "result"),
@@ -4593,6 +4617,8 @@ def _framework_protocol_event(
         "message_text": message_text,
         "state": state,
         "final_output": final_output,
+        "memory": memory,
+        "skill": skill,
         "data": params_data,
     }
     return {key: copy.deepcopy(value) for key, value in event.items() if value not in (None, "", [], {})}
@@ -4751,6 +4777,111 @@ def _framework_termination_from_sources(
     return ""
 
 
+def _framework_memory_payload_from_sources(*sources: Mapping[str, Any]) -> Dict[str, Any]:
+    text = _framework_sources_text(*sources)
+    if not any(token in text for token in ("memory", "checkpoint", "session")):
+        return {}
+    operation = _framework_value_from_sources(
+        sources,
+        ("memory_operation", "operation", "op", "memory.operation", "checkpoint.operation", "session.operation"),
+    )
+    key = _framework_value_from_sources(
+        sources,
+        ("memory_key", "key", "memory.key", "checkpoint_key", "checkpoint.key", "session_key", "session.key"),
+    )
+    value = _framework_value_from_sources(
+        sources,
+        ("memory_value", "value", "memory.value", "checkpoint_value", "checkpoint.value", "session_value", "session.value"),
+    )
+    nested = _framework_mapping_from_sources(sources, ("memory", "checkpoint", "session"))
+    payload: Dict[str, Any] = {}
+    if operation not in (None, "", [], {}):
+        payload["operation"] = operation
+    if key not in (None, "", [], {}):
+        payload["key"] = key
+    if value not in (None, "", [], {}):
+        payload["value"] = value
+    if nested:
+        semantic_keys = {"operation", "op", "key", "value"}
+        if not payload and not semantic_keys.intersection(nested.keys()):
+            payload["values"] = copy.deepcopy(nested)
+        elif not payload.get("value") and not payload.get("key"):
+            payload["values"] = copy.deepcopy(nested)
+    return {key: copy.deepcopy(value) for key, value in payload.items() if value not in (None, "", [], {})}
+
+
+def _framework_skill_payload_from_sources(*sources: Mapping[str, Any]) -> Dict[str, Any]:
+    text = _framework_sources_text(*sources)
+    if "skill" not in text:
+        return {}
+    name = _framework_value_from_sources(
+        sources,
+        ("skill_name", "skill.name", "name"),
+    )
+    steps = _framework_value_from_sources(
+        sources,
+        ("skill_steps", "steps", "skill.steps"),
+    )
+    payload: Dict[str, Any] = {}
+    if name not in (None, "", [], {}):
+        payload["name"] = name
+    if steps not in (None, "", [], {}):
+        payload["steps"] = copy.deepcopy(steps)
+    nested = _framework_mapping_from_sources(sources, ("skill", "skill_library"))
+    if nested:
+        for key, value in nested.items():
+            payload.setdefault(str(key), copy.deepcopy(value))
+    return {key: copy.deepcopy(value) for key, value in payload.items() if value not in (None, "", [], {})}
+
+
+def _framework_value_from_sources(
+    sources: Iterable[Mapping[str, Any]],
+    keys: Iterable[str],
+) -> Any:
+    for source in sources:
+        if not isinstance(source, Mapping):
+            continue
+        for key in keys:
+            value = _framework_value_from_source(source, key)
+            if value not in (None, "", [], {}):
+                return value
+    return None
+
+
+def _framework_mapping_from_sources(
+    sources: Iterable[Mapping[str, Any]],
+    keys: Iterable[str],
+) -> Dict[str, Any]:
+    value = _framework_value_from_sources(sources, keys)
+    return _coerce_plain_dict(value)
+
+
+def _framework_value_from_source(source: Mapping[str, Any], path: str) -> Any:
+    if path in source:
+        return source.get(path)
+    current: Any = source
+    for part in path.split("."):
+        if isinstance(current, Mapping) and part in current:
+            current = current.get(part)
+        else:
+            return None
+    return current
+
+
+def _framework_sources_text(*sources: Mapping[str, Any]) -> str:
+    parts: List[str] = []
+    for source in sources:
+        if not isinstance(source, Mapping):
+            continue
+        parts.extend(str(key) for key in source.keys())
+        parts.extend(
+            str(value)
+            for value in source.values()
+            if isinstance(value, (str, int, float, bool))
+        )
+    return " ".join(parts).lower()
+
+
 def _framework_record_name(
     raw: Mapping[str, Any],
     *,
@@ -4873,6 +5004,8 @@ def _framework_signals(
         "rag": "retrieval",
         "vector": "retrieval",
         "memory": "memory",
+        "skill": "skill",
+        "skill_library": "skill",
         "browser": "browser",
         "computer": "browser",
         "cua": "browser",
@@ -4929,6 +5062,7 @@ def _framework_signals(
         "retrieval": ("retriev", "rag", "vector", "query", "search"),
         "guardrail": ("guardrail", "safety"),
         "memory": ("memory",),
+        "skill": ("skill",),
         "browser": ("browser", "computer", "cua"),
         "voice": ("voice", "audio", "speech", "transcri", "tts", "stt"),
         "image": ("image", "vision"),
@@ -4936,6 +5070,8 @@ def _framework_signals(
     for signal, tokens in explicit_signal_groups.items():
         if any(token in span_kind or token in operation for token in tokens):
             signals.add(signal)
+    if any(token in text for token in ("checkpoint", "session")):
+        signals.add("memory")
     if any(str(key).startswith("mcp.resource") for key in attributes.keys()):
         signals.add("retrieval")
     if _first_number(raw, attributes, ("latency_ms", "duration_ms", "elapsed_ms")) is not None:

@@ -1273,6 +1273,53 @@ def test_langgraph_event_stream_loader_preserves_transcript_fields():
     assert langchain_snapshot.state["framework_trace"]["framework"] == "langchain"
 
 
+def test_framework_trace_loader_preserves_memory_and_skill_events():
+    environment = load_langgraph_event_stream(
+        {
+            "events": [
+                {
+                    "method": "updates",
+                    "params": {
+                        "namespace": ["refund_graph:run_1", "memory_node:task_1"],
+                        "data": {
+                            "memory_operation": "write",
+                            "memory_key": "order_id",
+                            "memory_value": "ord_123",
+                        },
+                    },
+                },
+                {
+                    "method": "updates",
+                    "params": {
+                        "namespace": ["refund_graph:run_1", "skill_node:task_2"],
+                        "data": {
+                            "skill_name": "refund_policy_check",
+                            "skill_steps": ["lookup", "verify", "respond"],
+                        },
+                    },
+                },
+            ]
+        }
+    )
+
+    trace_state = environment.reset().state["framework_trace"]
+    records = trace_state["events"]
+    signals = {signal for record in records for signal in record["signals"]}
+
+    assert {"memory", "skill"} <= signals
+    assert records[0]["memory"] == {
+        "operation": "write",
+        "key": "order_id",
+        "value": "ord_123",
+    }
+    assert records[0]["framework_event"]["memory"]["key"] == "order_id"
+    assert records[1]["skill"] == {
+        "name": "refund_policy_check",
+        "steps": ["lookup", "verify", "respond"],
+    }
+    assert records[1]["framework_event"]["skill"]["steps"] == ["lookup", "verify", "respond"]
+
+
 def test_multi_agent_framework_transcript_loaders_preserve_speakers_handoffs_and_tools():
     autogen_events = [
         {
