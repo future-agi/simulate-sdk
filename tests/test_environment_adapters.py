@@ -16,6 +16,7 @@ from fi.simulate import (
     FileEnvironment,
     FrameworkCapabilityEnvironment,
     FrameworkLifecycleEnvironment,
+    FrameworkPortabilityEnvironment,
     FrameworkProbeEnvironment,
     FrameworkTraceEnvironment,
     ImageEnvironment,
@@ -56,6 +57,7 @@ from fi.simulate import (
     normalize_adversarial_attack_pack,
     normalize_framework_capability_matrix,
     normalize_framework_lifecycle_trace,
+    normalize_framework_portability_matrix,
     normalize_framework_probe_suite,
     normalize_framework_trace_events,
     normalize_framework_adapter_conformance,
@@ -2197,6 +2199,116 @@ async def test_framework_probe_environment_replays_probe_suite():
     metrics = evaluation.summary["metric_averages"]
     assert metrics["framework_probe_coverage"] == 1.0
     assert metrics["framework_probe_quality"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_framework_portability_environment_replays_portability_matrix():
+    matrix = normalize_framework_portability_matrix(
+        name="langgraph-to-openai-agents",
+        source_framework="langgraph",
+        target_framework="openai_agents",
+        version="2026-06",
+        mappings=[
+            {"id": "invoke", "source": "graph.invoke", "target": "Runner.run", "category": "runtime", "status": "mapped", "evidence": ["dry run"]},
+            {"id": "tool_discovery", "source": "tools/list", "target": "Agents SDK tools", "category": "tools", "status": "mapped", "evidence": ["schema map"]},
+            {"id": "tool_call", "source": "ToolNode", "target": "function tool", "category": "tools", "status": "mapped", "evidence": ["call/result replay"]},
+            {"id": "short_term_state", "source": "graph state", "target": "session state", "category": "memory", "status": "mapped", "evidence": ["state projection"]},
+            {"id": "long_term_memory", "source": "store adapter", "target": "external memory", "category": "memory", "status": "partial", "evidence": ["shim plan"]},
+            {"id": "streaming_events", "source": "astream_events", "target": "run stream events", "category": "streaming", "status": "mapped", "evidence": ["chunk replay"]},
+            {"id": "checkpoint_resume", "source": "checkpointer", "target": "session resume", "category": "lifecycle", "status": "mapped", "evidence": ["resume replay"]},
+            {"id": "handoff", "source": "graph route", "target": "agent handoff", "category": "orchestration", "status": "mapped", "evidence": ["route map"]},
+            {"id": "guardrail", "source": "policy node", "target": "guardrail", "category": "security", "status": "mapped", "evidence": ["policy gate"]},
+            {"id": "otel_trace", "source": "otel spans", "target": "tracing processor", "category": "observability", "status": "mapped", "evidence": ["span map"]},
+            {"id": "futureagi_export", "source": "dataset export", "target": "Future AGI row", "category": "exports", "status": "mapped", "evidence": ["export row"]},
+        ],
+        constraints=["preserve tool schemas", "preserve trace ids"],
+    )
+    assert matrix["summary"]["mapping_count"] == 11
+    assert matrix["summary"]["mapped_count"] == 10
+    assert matrix["summary"]["required_mapping_rate"] < 1.0
+    assert matrix["summary"]["has_tools"] is True
+
+    async def agent(input):
+        return AgentResponse(
+            content="Framework portability mappings preserve runtime, tools, memory, streaming, lifecycle, orchestration, security, observability, and exports.",
+            tool_calls=[
+                {"id": "status", "name": "framework_portability_status", "arguments": {}},
+                {"id": "tools", "name": "list_framework_portability_mappings", "arguments": {"category": "tools", "status": "mapped"}},
+                {"id": "inspect", "name": "inspect_framework_portability_mapping", "arguments": {"id": "checkpoint_resume"}},
+                {"id": "gaps", "name": "list_framework_portability_gaps", "arguments": {}},
+            ],
+        )
+
+    report = await LocalTextEngine().run(
+        scenario=_scenario(),
+        agent_callback=agent,
+        environment=FrameworkPortabilityEnvironment(matrix),
+        max_turns=1,
+        min_turns=1,
+    )
+
+    result = report.results[0]
+    state = result.metadata["environment_state"]["framework_portability_matrix"]
+    assert state["summary"]["partial_mappings"] == ["long_term_memory"]
+    assert any(
+        artifact.metadata.get("kind") == "framework_portability_matrix"
+        for artifact in result.artifacts
+    )
+
+    evaluation = evaluate_agent_report(
+        report,
+        config={
+            "required_framework_portability": [
+                "framework_portability",
+                "invoke",
+                "tool_discovery",
+                "tool_call",
+                "short_term_state",
+                "streaming_events",
+                "checkpoint_resume",
+                "handoff",
+                "guardrail",
+                "otel_trace",
+                "futureagi_export",
+            ],
+            "framework_portability_quality": {
+                "source_framework": "langgraph",
+                "target_framework": "openai_agents",
+                "required_mappings": [
+                    "invoke",
+                    "tool_discovery",
+                    "tool_call",
+                    "short_term_state",
+                    "streaming_events",
+                    "checkpoint_resume",
+                    "handoff",
+                    "guardrail",
+                    "otel_trace",
+                    "futureagi_export",
+                ],
+                "required_categories": ["runtime", "tools", "memory", "streaming", "lifecycle", "orchestration", "security", "observability", "exports"],
+                "min_mapped_mappings": 10,
+                "min_mapping_rate": 0.9,
+                "min_required_mapping_rate": 0.9,
+                "max_missing_mappings": 0,
+                "max_blocked_mappings": 0,
+                "require_evidence": True,
+                "require_tools": True,
+                "require_memory": True,
+                "require_streaming": True,
+                "require_lifecycle": True,
+                "require_orchestration": True,
+                "require_security": True,
+                "require_observability": True,
+                "require_exports": True,
+                "require_runtime": True,
+            },
+        },
+        threshold=0.9,
+    )
+    metrics = evaluation.summary["metric_averages"]
+    assert metrics["framework_portability_coverage"] == 1.0
+    assert metrics["framework_portability_quality"] == 1.0
 
 
 @pytest.mark.asyncio

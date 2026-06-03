@@ -5777,6 +5777,215 @@ class FrameworkProbeEnvironment(EnvironmentAdapter):
         )
 
 
+class FrameworkPortabilityEnvironment(EnvironmentAdapter):
+    """
+    Replay framework migration/portability mappings as certification evidence.
+
+    Use this when a candidate agent configuration must move between framework
+    adapters or protocols without losing tool, memory, streaming, lifecycle,
+    orchestration, security, observability, export, browser, voice, or runtime
+    behavior.
+    """
+
+    name = "framework_portability"
+
+    def __init__(
+        self,
+        matrix: Any = None,
+        *,
+        name: str = "framework-portability-matrix",
+        source_framework: str = "source",
+        target_framework: str = "target",
+        version: Optional[str] = None,
+        mappings: Optional[Iterable[Any]] = None,
+        constraints: Optional[Iterable[Any]] = None,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        self.matrix = normalize_framework_portability_matrix(
+            matrix,
+            name=name,
+            source_framework=source_framework,
+            target_framework=target_framework,
+            version=version,
+            mappings=mappings,
+            constraints=constraints,
+            metadata=metadata,
+        )
+
+    def reset(self, **context: Any) -> EnvironmentSnapshot:
+        return EnvironmentSnapshot(
+            tools=self._tool_specs(),
+            artifacts=[self._portability_artifact()],
+            events=[
+                SimulationEvent(
+                    type="framework_portability",
+                    name="framework_portability_matrix_ready",
+                    payload={
+                        "source_framework": self.matrix["source_framework"],
+                        "target_framework": self.matrix["target_framework"],
+                        "mapping_count": self.matrix["summary"]["mapping_count"],
+                        "mapping_rate": self.matrix["summary"]["mapping_rate"],
+                        "required_mapping_rate": self.matrix["summary"]["required_mapping_rate"],
+                        "signals": copy.deepcopy(self.matrix["signals"]),
+                    },
+                ),
+                *[
+                    SimulationEvent(
+                        type="framework_portability",
+                        name="framework_portability_mapping",
+                        payload=copy.deepcopy(mapping),
+                    )
+                    for mapping in self.matrix["mappings"]
+                ],
+            ],
+            state={"framework_portability_matrix": copy.deepcopy(self.matrix)},
+            metadata={"framework_portability_matrix": copy.deepcopy(self.matrix)},
+        )
+
+    def observe(self, **context: Any) -> EnvironmentSnapshot:
+        return EnvironmentSnapshot(
+            artifacts=[self._portability_artifact()],
+            state={"framework_portability_matrix": copy.deepcopy(self.matrix)},
+            metadata={"framework_portability_matrix": copy.deepcopy(self.matrix)},
+        )
+
+    def handle_tool_call(
+        self,
+        tool_call: Mapping[str, Any],
+        **context: Any,
+    ) -> Optional[ToolExecutionResult]:
+        name = _tool_name(tool_call)
+        if name not in {
+            "framework_portability_status",
+            "list_framework_portability_mappings",
+            "inspect_framework_portability_mapping",
+            "list_framework_portability_gaps",
+        }:
+            return None
+        arguments = _tool_arguments(tool_call)
+        call_id = _tool_call_id(tool_call)
+
+        if name == "framework_portability_status":
+            result = copy.deepcopy(self.matrix)
+            event_name = "framework_portability_status"
+            content = (
+                f"{self.matrix['source_framework']} to {self.matrix['target_framework']} "
+                "portability matrix status recorded."
+            )
+            success = True
+            error = None
+        elif name == "list_framework_portability_gaps":
+            gaps = [
+                copy.deepcopy(mapping)
+                for mapping in self.matrix["mappings"]
+                if mapping.get("status") in {"partial", "missing", "blocked"}
+            ]
+            result = {
+                "source_framework": self.matrix["source_framework"],
+                "target_framework": self.matrix["target_framework"],
+                "mappings": gaps,
+            }
+            event_name = "framework_portability_gaps_listed"
+            content = f"Listed {len(gaps)} framework portability gap(s)."
+            success = True
+            error = None
+        elif name == "list_framework_portability_mappings":
+            category = _normalize_framework_portability_category(arguments.get("category") or "")
+            status = _normalize_framework_portability_status(arguments.get("status") or "")
+            required = arguments.get("required")
+            mappings = copy.deepcopy(self.matrix["mappings"])
+            if category:
+                mappings = [mapping for mapping in mappings if mapping.get("category") == category]
+            if status:
+                mappings = [mapping for mapping in mappings if mapping.get("status") == status]
+            if required is not None:
+                mappings = [mapping for mapping in mappings if bool(mapping.get("required")) is bool(required)]
+            result = {
+                "source_framework": self.matrix["source_framework"],
+                "target_framework": self.matrix["target_framework"],
+                "mappings": mappings,
+                "filters": {"category": category, "status": status, "required": required},
+            }
+            event_name = "framework_portability_mappings_listed"
+            content = f"Listed {len(mappings)} framework portability mapping(s)."
+            success = True
+            error = None
+        else:
+            mapping_id = str(arguments.get("id") or arguments.get("name") or arguments.get("mapping") or arguments.get("category") or "")
+            mapping = _find_framework_portability_mapping(self.matrix["mappings"], mapping_id)
+            success = mapping is not None
+            result = {
+                "source_framework": self.matrix["source_framework"],
+                "target_framework": self.matrix["target_framework"],
+                "mapping": copy.deepcopy(mapping),
+                "query": mapping_id,
+            }
+            event_name = "framework_portability_mapping_inspected" if success else "framework_portability_mapping_missing"
+            content = f"Inspected framework portability mapping {mapping_id}." if success else f"Framework portability mapping not found: {mapping_id}"
+            error = None if success else "mapping_not_found"
+
+        return ToolExecutionResult(
+            tool_call_id=call_id,
+            tool_name=name,
+            content=content,
+            result=result,
+            success=success,
+            error=error,
+            state_updates={"framework_portability_matrix": copy.deepcopy(self.matrix)},
+            artifacts=[self._portability_artifact()],
+            events=[
+                SimulationEvent(
+                    type="framework_portability",
+                    name=event_name,
+                    payload=result,
+                )
+            ],
+        )
+
+    def _tool_specs(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                "name": "framework_portability_status",
+                "description": "Return normalized framework portability matrix state and summary.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            {
+                "name": "list_framework_portability_mappings",
+                "description": "List framework portability mappings filtered by category, status, or required flag.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "category": {"type": "string"},
+                        "status": {"type": "string"},
+                        "required": {"type": "boolean"},
+                    },
+                },
+            },
+            {
+                "name": "inspect_framework_portability_mapping",
+                "description": "Inspect one framework portability mapping by id, name, source, target, or category.",
+                "parameters": {"type": "object", "properties": {"id": {"type": "string"}}},
+            },
+            {
+                "name": "list_framework_portability_gaps",
+                "description": "List partial, missing, or blocked framework portability mappings.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        ]
+
+    def _portability_artifact(self) -> SimulationArtifact:
+        return SimulationArtifact(
+            type="trace",
+            role="environment",
+            data=copy.deepcopy(self.matrix),
+            metadata={
+                "kind": "framework_portability_matrix",
+                "source_framework": self.matrix["source_framework"],
+                "target_framework": self.matrix["target_framework"],
+            },
+        )
+
+
 class ObservabilityReplayEnvironment(EnvironmentAdapter):
     """
     Replay production observability/regression cases as local simulation evidence.
@@ -7879,6 +8088,385 @@ def _normalize_framework_probe_operation(value: Any) -> str:
 
 def _normalize_framework_probe_key(value: Any) -> str:
     return str(value or "").strip().lower().replace("-", "_").replace(" ", "_").replace(".", "_").replace("/", "_")
+
+
+def normalize_framework_portability_matrix(
+    matrix: Any = None,
+    *,
+    name: str = "framework-portability-matrix",
+    source_framework: str = "source",
+    target_framework: str = "target",
+    version: Optional[str] = None,
+    mappings: Optional[Iterable[Any]] = None,
+    constraints: Optional[Iterable[Any]] = None,
+    metadata: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Normalize framework migration mappings into replayable portability evidence.
+
+    A portability matrix can describe a LangGraph/OpenAI Agents/AutoGen/MCP,
+    browser, voice, or custom adapter migration. Each mapping records whether a
+    source behavior has a target equivalent, partial shim, missing mapping, or
+    policy/runtime blocker.
+    """
+
+    source = _coerce_plain_dict(matrix)
+    matrix_name = str(source.get("name") or source.get("id") or name)
+    source_name = str(
+        source.get("source_framework")
+        or source.get("source")
+        or source.get("from_framework")
+        or source.get("from")
+        or source_framework
+    )
+    target_name = str(
+        source.get("target_framework")
+        or source.get("target")
+        or source.get("to_framework")
+        or source.get("to")
+        or target_framework
+    )
+    matrix_version = source.get("version") or source.get("framework_version") or version
+    raw_mappings = (
+        mappings
+        if mappings is not None
+        else source.get("mappings")
+        or source.get("migration_mappings")
+        or source.get("portability_mappings")
+        or source.get("portability_matrix")
+        or []
+    )
+    normalized_mappings = [
+        _normalize_framework_portability_mapping(mapping)
+        for mapping in _as_iterable(raw_mappings)
+    ]
+    normalized_mappings = [mapping for mapping in normalized_mappings if mapping.get("id")]
+    raw_constraints = constraints if constraints is not None else source.get("constraints") or source.get("requirements") or []
+    normalized_constraints = _normalize_framework_named_records(raw_constraints)
+    matrix_metadata = {**_coerce_plain_dict(source.get("metadata")), **copy.deepcopy(dict(metadata or {}))}
+    summary = _framework_portability_summary(normalized_mappings, normalized_constraints)
+    signals = _framework_portability_signals(normalized_mappings, normalized_constraints, source.get("signals"))
+    return {
+        "kind": "framework_portability_matrix",
+        "name": matrix_name,
+        "source_framework": source_name,
+        "target_framework": target_name,
+        "version": str(matrix_version or ""),
+        "mappings": normalized_mappings,
+        "constraints": normalized_constraints,
+        "summary": summary,
+        "signals": signals,
+        "metadata": matrix_metadata,
+    }
+
+
+def _normalize_framework_portability_mapping(value: Any) -> Dict[str, Any]:
+    if isinstance(value, str):
+        raw = {"id": value, "source": value, "target": value, "status": "mapped", "required": True}
+    else:
+        raw = _coerce_plain_dict(value)
+    source = str(raw.get("source") or raw.get("source_capability") or raw.get("from") or raw.get("from_path") or "").strip()
+    target = str(raw.get("target") or raw.get("target_capability") or raw.get("to") or raw.get("to_path") or "").strip()
+    mapping_id = _normalize_framework_portability_key(
+        raw.get("id")
+        or raw.get("name")
+        or raw.get("mapping")
+        or raw.get("category")
+        or source
+        or target
+    )
+    category = _framework_portability_category(raw, mapping_id, source, target)
+    status = _framework_portability_status_from_record(raw)
+    evidence = [
+        _normalize_framework_evidence(item)
+        for item in _as_iterable(raw.get("evidence") or raw.get("proof") or raw.get("examples"))
+    ]
+    signals = {
+        "framework_portability",
+        "portability",
+        "migration",
+        "mapping",
+        mapping_id,
+        category,
+        status,
+        _normalize_framework_portability_key(source),
+        _normalize_framework_portability_key(target),
+        *[
+            _normalize_framework_portability_key(signal)
+            for signal in _as_iterable(raw.get("signals"))
+            if _normalize_framework_portability_key(signal)
+        ],
+    }
+    return {
+        "id": str(raw.get("id") or mapping_id),
+        "name": str(raw.get("name") or mapping_id),
+        "source": source,
+        "target": target,
+        "category": category,
+        "status": status,
+        "required": bool(raw.get("required", True)),
+        "evidence": evidence,
+        "signals": sorted(signal for signal in signals if signal),
+        "notes": str(raw.get("notes") or raw.get("reason") or ""),
+        "metadata": _coerce_plain_dict(raw.get("metadata")),
+    }
+
+
+def _framework_portability_summary(
+    mappings: Sequence[Mapping[str, Any]],
+    constraints: Sequence[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    mapping_count = len(mappings)
+    mapped = [mapping for mapping in mappings if mapping.get("status") == "mapped"]
+    partial = [mapping for mapping in mappings if mapping.get("status") == "partial"]
+    missing = [mapping for mapping in mappings if mapping.get("status") == "missing"]
+    blocked = [mapping for mapping in mappings if mapping.get("status") == "blocked"]
+    required = [mapping for mapping in mappings if mapping.get("required")]
+    required_mapped = [mapping for mapping in required if mapping.get("status") == "mapped"]
+    categories = sorted({_normalize_framework_portability_category(mapping.get("category")) for mapping in mappings if mapping.get("category")})
+    mapped_categories = sorted(
+        {
+            _normalize_framework_portability_category(mapping.get("category"))
+            for mapping in [*mapped, *partial]
+            if mapping.get("category")
+        }
+    )
+    missing_categories = sorted(
+        {
+            _normalize_framework_portability_category(mapping.get("category"))
+            for mapping in [*missing, *blocked]
+            if mapping.get("category")
+        }
+    )
+    evidence_count = sum(len(_as_iterable(mapping.get("evidence"))) for mapping in mappings)
+    gap_mappings = sorted(
+        mapping.get("id") or mapping.get("name")
+        for mapping in [*partial, *missing, *blocked]
+        if mapping.get("id") or mapping.get("name")
+    )
+    mapped_category_set = set(mapped_categories)
+    return {
+        "mapping_count": mapping_count,
+        "mapped_count": len(mapped),
+        "partial_count": len(partial),
+        "missing_count": len(missing),
+        "blocked_count": len(blocked),
+        "required_count": len(required),
+        "required_mapped_count": len(required_mapped),
+        "mapping_rate": round(len(mapped) / mapping_count, 4) if mapping_count else 1.0,
+        "effective_mapping_rate": round((len(mapped) + 0.5 * len(partial)) / mapping_count, 4) if mapping_count else 1.0,
+        "required_mapping_rate": round(len(required_mapped) / len(required), 4) if required else 1.0,
+        "evidence_count": evidence_count,
+        "constraint_count": len(constraints),
+        "categories": categories,
+        "mapped_categories": mapped_categories,
+        "missing_categories": missing_categories,
+        "mapped_mappings": sorted(mapping.get("id") or mapping.get("name") for mapping in mapped if mapping.get("id") or mapping.get("name")),
+        "partial_mappings": sorted(mapping.get("id") or mapping.get("name") for mapping in partial if mapping.get("id") or mapping.get("name")),
+        "missing_mappings": sorted(mapping.get("id") or mapping.get("name") for mapping in missing if mapping.get("id") or mapping.get("name")),
+        "blocked_mappings": sorted(mapping.get("id") or mapping.get("name") for mapping in blocked if mapping.get("id") or mapping.get("name")),
+        "gaps": gap_mappings,
+        "has_tools": "tools" in mapped_category_set,
+        "has_memory": "memory" in mapped_category_set,
+        "has_streaming": "streaming" in mapped_category_set,
+        "has_lifecycle": "lifecycle" in mapped_category_set,
+        "has_orchestration": "orchestration" in mapped_category_set,
+        "has_security": "security" in mapped_category_set,
+        "has_observability": "observability" in mapped_category_set,
+        "has_exports": "exports" in mapped_category_set,
+        "has_browser": "browser" in mapped_category_set,
+        "has_voice": "voice" in mapped_category_set,
+        "has_runtime": "runtime" in mapped_category_set,
+    }
+
+
+def _framework_portability_signals(
+    mappings: Sequence[Mapping[str, Any]],
+    constraints: Sequence[Mapping[str, Any]],
+    raw_signals: Any = None,
+) -> List[str]:
+    signals = {"framework_portability", "portability_matrix", "portability", "migration", "mapping"}
+    for signal in _as_iterable(raw_signals):
+        normalized = _normalize_framework_portability_key(signal)
+        if normalized:
+            signals.add(normalized)
+    for mapping in mappings:
+        for signal in _as_iterable(mapping.get("signals")):
+            normalized = _normalize_framework_portability_key(signal)
+            if normalized:
+                signals.add(normalized)
+        for key in ("id", "name", "source", "target", "category", "status"):
+            normalized = _normalize_framework_portability_key(mapping.get(key))
+            if normalized:
+                signals.add(normalized)
+    if constraints:
+        signals.add("constraint")
+    for constraint in constraints:
+        normalized = _normalize_framework_portability_key(constraint.get("name"))
+        if normalized:
+            signals.add(normalized)
+    return sorted(signals)
+
+
+def _framework_portability_category(
+    raw: Mapping[str, Any],
+    mapping_id: str,
+    source: str = "",
+    target: str = "",
+) -> str:
+    category = _normalize_framework_portability_category(
+        raw.get("category")
+        or raw.get("domain")
+        or raw.get("surface")
+        or raw.get("group")
+        or ""
+    )
+    if category:
+        return category
+    probe = " ".join([mapping_id, source, target])
+    inference = (
+        ("tools", ("tool", "function", "mcp", "schema")),
+        ("memory", ("memory", "state", "retrieval", "vector", "checkpoint_state")),
+        ("streaming", ("stream", "chunk", "delta")),
+        ("lifecycle", ("lifecycle", "session", "checkpoint", "retry", "resume", "cleanup")),
+        ("orchestration", ("orchestration", "workflow", "graph", "handoff", "multi_agent", "a2a")),
+        ("security", ("security", "guardrail", "policy", "permission", "auth", "safety")),
+        ("observability", ("trace", "telemetry", "span", "log", "metric", "otel")),
+        ("exports", ("export", "artifact", "dataset", "futureagi")),
+        ("browser", ("browser", "cua", "computer_use", "gui")),
+        ("voice", ("voice", "audio", "webrtc", "tts", "stt", "livekit", "pipecat")),
+        ("runtime", ("runtime", "invoke", "input", "output", "adapter")),
+    )
+    for inferred, tokens in inference:
+        if any(token in probe for token in tokens):
+            return inferred
+    return "general"
+
+
+def _framework_portability_status_from_record(raw: Mapping[str, Any]) -> str:
+    status = raw.get("status")
+    if status in (None, ""):
+        if raw.get("blocked") is True:
+            status = "blocked"
+        elif raw.get("mapped") is False or raw.get("supported") is False:
+            status = "missing"
+        elif raw.get("partial") is True:
+            status = "partial"
+        elif raw.get("mapped") is True or raw.get("supported") is True or raw.get("available") is True:
+            status = "mapped"
+        else:
+            status = "mapped"
+    return _normalize_framework_portability_status(status) or "mapped"
+
+
+def _find_framework_portability_mapping(
+    mappings: Iterable[Mapping[str, Any]],
+    mapping_id: str,
+) -> Optional[Dict[str, Any]]:
+    query = _normalize_framework_portability_key(mapping_id)
+    if not query:
+        return None
+    for mapping in mappings:
+        mapping_dict = copy.deepcopy(dict(mapping))
+        aliases = {
+            _normalize_framework_portability_key(mapping_dict.get("id")),
+            _normalize_framework_portability_key(mapping_dict.get("name")),
+            _normalize_framework_portability_key(mapping_dict.get("source")),
+            _normalize_framework_portability_key(mapping_dict.get("target")),
+            _normalize_framework_portability_key(mapping_dict.get("category")),
+        }
+        if query in aliases:
+            return mapping_dict
+    return None
+
+
+def _normalize_framework_portability_status(value: Any) -> str:
+    normalized = _normalize_framework_portability_key(value)
+    aliases = {
+        "yes": "mapped",
+        "true": "mapped",
+        "supported": "mapped",
+        "available": "mapped",
+        "enabled": "mapped",
+        "pass": "mapped",
+        "passed": "mapped",
+        "success": "mapped",
+        "limited": "partial",
+        "degraded": "partial",
+        "shim": "partial",
+        "adapter_shim": "partial",
+        "no": "missing",
+        "false": "missing",
+        "unsupported": "missing",
+        "not_supported": "missing",
+        "fail": "missing",
+        "failed": "missing",
+        "denied": "blocked",
+        "forbidden": "blocked",
+        "policy_blocked": "blocked",
+    }
+    normalized = aliases.get(normalized, normalized)
+    return normalized if normalized in {"mapped", "partial", "missing", "blocked"} else ""
+
+
+def _normalize_framework_portability_category(value: Any) -> str:
+    normalized = _normalize_framework_portability_key(value)
+    aliases = {
+        "tool": "tools",
+        "function": "tools",
+        "function_calling": "tools",
+        "tool_calling": "tools",
+        "mcp": "tools",
+        "state": "memory",
+        "checkpoint": "lifecycle",
+        "session": "lifecycle",
+        "trace": "observability",
+        "telemetry": "observability",
+        "log": "observability",
+        "artifact": "exports",
+        "export": "exports",
+        "workflow": "orchestration",
+        "graph": "orchestration",
+        "policy": "security",
+        "guardrail": "security",
+        "computer_use": "browser",
+        "cua": "browser",
+        "audio": "voice",
+        "invoke": "runtime",
+    }
+    return aliases.get(normalized, normalized)
+
+
+def _normalize_framework_portability_key(value: Any) -> str:
+    normalized = str(value or "").strip().lower().replace("-", "_").replace(" ", "_").replace(".", "_").replace("/", "_")
+    aliases = {
+        "function_call": "tool_calling",
+        "function_calls": "tool_calling",
+        "function_calling": "tool_calling",
+        "tool_calls": "tool_calling",
+        "tool_use": "tool_calling",
+        "tools_list": "list_tools",
+        "tools_call": "tool_call",
+        "call_tool": "tool_call",
+        "memory_write": "write_memory",
+        "memory_read": "read_memory",
+        "checkpointing": "checkpoint",
+        "checkpoints": "checkpoint",
+        "resume": "checkpoint_resume",
+        "stream": "streaming",
+        "stream_events": "streaming",
+        "trace": "observability",
+        "telemetry": "observability",
+        "otel": "observability",
+        "artifact": "exports",
+        "export": "exports",
+        "futureagi_export": "exports",
+        "workflow": "orchestration",
+        "graph": "orchestration",
+        "policy": "security",
+        "guardrails": "security",
+    }
+    return aliases.get(normalized, normalized)
 
 
 def _as_float_or_none(value: Any) -> Optional[float]:

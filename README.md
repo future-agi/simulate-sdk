@@ -333,6 +333,7 @@ from fi.simulate import (
     FileEnvironment,
     FrameworkCapabilityEnvironment,
     FrameworkLifecycleEnvironment,
+    FrameworkPortabilityEnvironment,
     FrameworkProbeEnvironment,
     FrameworkTraceEnvironment,
     ImageEnvironment,
@@ -580,6 +581,9 @@ environment = FrameworkCapabilityEnvironment(matrix=framework_capability_matrix)
 # Framework adapter smoke-probe replay:
 environment = FrameworkProbeEnvironment(suite=framework_probe_suite)
 
+# Framework migration/portability matrix replay:
+environment = FrameworkPortabilityEnvironment(matrix=framework_portability_matrix)
+
 # Framework-neutral world contract/state-machine replay:
 environment = load_world_contract(
     {
@@ -616,6 +620,7 @@ See [`examples/local_framework_runtime_contract.py`](examples/local_framework_ru
 See [`examples/local_framework_lifecycle_trace.py`](examples/local_framework_lifecycle_trace.py) for a framework lifecycle/session trace cookbook with setup, tool registration, checkpoint, retry, cancellation/resume, cleanup, terminal status, and state-persistence evidence.
 See [`examples/local_framework_capability_matrix.py`](examples/local_framework_capability_matrix.py) for a framework capability certification cookbook with tools, memory, streaming, lifecycle, orchestration, security, observability, exports, task surfaces, integrations, and evidence checks.
 See [`examples/local_framework_probe_suite.py`](examples/local_framework_probe_suite.py) for a framework adapter smoke-probe cookbook with invoke, tool, memory, streaming, lifecycle, orchestration, security, observability, export, pass-rate, failure, and evidence checks.
+See [`examples/local_framework_portability_matrix.py`](examples/local_framework_portability_matrix.py) for a framework migration/portability cookbook with source-target mappings, partial/missing/blocked gaps, required mapping rate, category support, and evidence checks.
 See [`examples/local_observability_replay_pack.py`](examples/local_observability_replay_pack.py) for a Future AGI-style observability replay cookbook with failed regression rows, metrics, trace signals, raw evidence, and replay-pack scoring.
 See [`examples/local_optimizer_society_trace.py`](examples/local_optimizer_society_trace.py) for an optimizer society trace replay cookbook with roles, proposals, diagnostics, search paths, role credit, synthesis, steward, and governance evidence.
 See [`examples/local_langgraph_event_stream_replay.py`](examples/local_langgraph_event_stream_replay.py) for a LangGraph/LangChain event-stream replay cookbook with message/tool/state projections and transcript-quality scoring.
