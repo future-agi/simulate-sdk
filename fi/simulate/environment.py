@@ -2,15 +2,18 @@ from __future__ import annotations
 
 import base64
 import copy
+import io
 import json
+import math
 import os
 import struct
 import urllib.request
+import wave
 import zipfile
 import zlib
 from abc import ABC
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 from pydantic import BaseModel, Field
 
@@ -8180,6 +8183,9 @@ def _normalize_voice_waveform(value: str | Mapping[str, Any], *, index: int, sam
     item.setdefault("channels", 1)
     if "num_frames" in item and "sample_count" not in item:
         item["sample_count"] = item.pop("num_frames")
+    media_metadata = _voice_media_metadata_from_waveform(item)
+    if media_metadata:
+        item.update(media_metadata)
     if item.get("duration_ms") is None and item.get("start_ms") is not None and item.get("end_ms") is not None:
         item["duration_ms"] = max(0, int(item["end_ms"]) - int(item["start_ms"]))
     if item.get("sample_count") is None and item.get("duration_ms") is not None:
@@ -8188,6 +8194,212 @@ def _normalize_voice_waveform(value: str | Mapping[str, Any], *, index: int, sam
     if item.get("uri") is None and item.get("path") is None and item.get("data") is None:
         item["data"] = _voice_synthetic_waveform_data(item)
     return item
+
+
+def _voice_media_metadata_from_waveform(waveform: Mapping[str, Any]) -> Dict[str, Any]:
+    path = _voice_local_audio_path(waveform)
+    if path:
+        metadata = _voice_wav_metadata_from_path(path)
+        if metadata:
+            return metadata
+        data = _voice_bytes_from_path(path)
+        if data:
+            return _voice_pcm_metadata_from_bytes(data, waveform, media_source="pcm_file")
+
+    uri = str(waveform.get("uri") or "")
+    data_uri = _voice_bytes_from_data_uri(uri)
+    if data_uri:
+        metadata = _voice_wav_metadata_from_bytes(data_uri)
+        if metadata:
+            metadata["media_source"] = "wav_data_uri"
+            return metadata
+        return _voice_pcm_metadata_from_bytes(data_uri, waveform, media_source="pcm_data_uri")
+
+    raw_data = _voice_bytes_from_payload(waveform.get("data"), waveform)
+    if raw_data:
+        metadata = _voice_wav_metadata_from_bytes(raw_data)
+        if metadata:
+            metadata["media_source"] = "wav_bytes"
+            return metadata
+        return _voice_pcm_metadata_from_bytes(raw_data, waveform, media_source="pcm_bytes")
+    return {}
+
+
+def _voice_local_audio_path(waveform: Mapping[str, Any]) -> str:
+    raw = waveform.get("path")
+    if raw in (None, ""):
+        uri = str(waveform.get("uri") or "")
+        parsed = urlparse(uri)
+        if parsed.scheme != "file":
+            return ""
+        raw = unquote(parsed.path)
+    path = os.path.expanduser(str(raw))
+    return path if os.path.exists(path) and os.path.isfile(path) else ""
+
+
+def _voice_wav_metadata_from_path(path: str) -> Dict[str, Any]:
+    if not path.lower().endswith((".wav", ".wave")):
+        return {}
+    try:
+        with wave.open(path, "rb") as wav_file:
+            return _voice_wav_metadata(wav_file, media_source="wav_file")
+    except (wave.Error, OSError, EOFError):
+        return {}
+
+
+def _voice_wav_metadata_from_bytes(data: bytes) -> Dict[str, Any]:
+    if not data.startswith(b"RIFF"):
+        return {}
+    try:
+        with wave.open(io.BytesIO(data), "rb") as wav_file:
+            return _voice_wav_metadata(wav_file, media_source="wav_bytes")
+    except (wave.Error, EOFError):
+        return {}
+
+
+def _voice_wav_metadata(wav_file: wave.Wave_read, *, media_source: str) -> Dict[str, Any]:
+    channels = wav_file.getnchannels()
+    sample_rate_hz = wav_file.getframerate()
+    sample_width_bytes = wav_file.getsampwidth()
+    sample_count = wav_file.getnframes()
+    raw = wav_file.readframes(sample_count)
+    metadata = {
+        "decoded_audio": True,
+        "media_source": media_source,
+        "media_format": "wav",
+        "sample_rate_hz": sample_rate_hz,
+        "channels": channels,
+        "sample_width_bytes": sample_width_bytes,
+        "sample_count": sample_count,
+        "duration_ms": round((sample_count / sample_rate_hz) * 1000, 4) if sample_rate_hz else 0,
+    }
+    metadata.update(_voice_pcm_stats(raw, sample_width_bytes=sample_width_bytes, channels=channels))
+    return metadata
+
+
+def _voice_pcm_metadata_from_bytes(
+    data: bytes,
+    waveform: Mapping[str, Any],
+    *,
+    media_source: str,
+) -> Dict[str, Any]:
+    if not _voice_pcm_hint(waveform):
+        return {}
+    sample_rate_hz = _voice_int(waveform.get("sample_rate_hz") or waveform.get("sample_rate") or 16000) or 16000
+    channels = _voice_int(waveform.get("channels") or waveform.get("num_channels") or 1) or 1
+    sample_width_bytes = (
+        _voice_int(waveform.get("sample_width_bytes"))
+        or _voice_int(waveform.get("sample_width"))
+        or _voice_bits_to_bytes(waveform.get("bits_per_sample"))
+        or 2
+    )
+    frame_count = int(len(data) / max(1, sample_width_bytes * channels))
+    metadata = {
+        "decoded_audio": True,
+        "media_source": media_source,
+        "media_format": str(waveform.get("media_format") or waveform.get("format") or waveform.get("encoding") or "pcm").lower(),
+        "sample_rate_hz": sample_rate_hz,
+        "channels": channels,
+        "sample_width_bytes": sample_width_bytes,
+        "sample_count": frame_count,
+        "duration_ms": round((frame_count / sample_rate_hz) * 1000, 4) if sample_rate_hz else 0,
+    }
+    metadata.update(_voice_pcm_stats(data, sample_width_bytes=sample_width_bytes, channels=channels))
+    return metadata
+
+
+def _voice_pcm_hint(waveform: Mapping[str, Any]) -> bool:
+    text = " ".join(
+        str(waveform.get(key, ""))
+        for key in ("media_format", "format", "encoding", "mime_type", "content_type")
+    ).lower()
+    return any(token in text for token in ("pcm", "linear16", "s16le", "raw"))
+
+
+def _voice_bits_to_bytes(value: Any) -> Optional[int]:
+    bits = _voice_int(value)
+    if bits in (8, 16, 24, 32):
+        return bits // 8
+    return None
+
+
+def _voice_bytes_from_path(path: str) -> bytes:
+    try:
+        with open(path, "rb") as handle:
+            return handle.read()
+    except OSError:
+        return b""
+
+
+def _voice_bytes_from_data_uri(value: str) -> bytes:
+    if not value.startswith("data:") or "," not in value:
+        return b""
+    header, payload = value.split(",", 1)
+    try:
+        if ";base64" in header:
+            return base64.b64decode(payload)
+        return unquote(payload).encode("utf-8")
+    except (ValueError, OSError):
+        return b""
+
+
+def _voice_bytes_from_payload(value: Any, waveform: Mapping[str, Any]) -> bytes:
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value)
+    if isinstance(value, str):
+        if value.startswith("data:"):
+            return _voice_bytes_from_data_uri(value)
+        encoding = str(waveform.get("data_encoding") or waveform.get("encoding") or "").lower()
+        if "base64" in encoding:
+            try:
+                return base64.b64decode(value)
+            except (ValueError, OSError):
+                return b""
+    return b""
+
+
+def _voice_pcm_stats(data: bytes, *, sample_width_bytes: int, channels: int) -> Dict[str, float]:
+    if not data or sample_width_bytes not in {1, 2, 3, 4}:
+        return {}
+    max_possible = float(128 if sample_width_bytes == 1 else (2 ** (sample_width_bytes * 8 - 1)))
+    total = 0
+    sum_squares = 0.0
+    peak = 0.0
+    clipped = 0
+    frame_width = sample_width_bytes
+    usable = len(data) - (len(data) % frame_width)
+    for offset in range(0, usable, frame_width):
+        sample = _voice_pcm_sample(data[offset : offset + frame_width], sample_width_bytes)
+        magnitude = abs(float(sample))
+        total += 1
+        sum_squares += magnitude * magnitude
+        peak = max(peak, magnitude)
+        if magnitude >= max_possible * 0.999:
+            clipped += 1
+    if not total:
+        return {}
+    rms = (sum_squares / total) ** 0.5
+    return {
+        "rms_db": _voice_dbfs(rms, max_possible),
+        "peak_db": _voice_dbfs(peak, max_possible),
+        "clipping_ratio": round(clipped / total, 6),
+    }
+
+
+def _voice_pcm_sample(chunk: bytes, sample_width_bytes: int) -> int:
+    if sample_width_bytes == 1:
+        return int(chunk[0]) - 128
+    if sample_width_bytes == 2:
+        return struct.unpack("<h", chunk)[0]
+    if sample_width_bytes == 3:
+        return int.from_bytes(chunk, byteorder="little", signed=True)
+    return struct.unpack("<i", chunk)[0]
+
+
+def _voice_dbfs(value: float, max_possible: float) -> float:
+    if value <= 0 or max_possible <= 0:
+        return -120.0
+    return round(20 * math.log10(value / max_possible), 4)
 
 
 def _voice_waveform_from_utterance(utterance: Mapping[str, Any], *, sample_rate_hz: int) -> Dict[str, Any]:

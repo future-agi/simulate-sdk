@@ -1,5 +1,7 @@
 import json
+import math
 import struct
+import wave
 import zipfile
 import zlib
 
@@ -2012,6 +2014,90 @@ async def test_voice_environment_loads_voice_exports_waveforms_diarization_and_q
     assert any(artifact.type == "audio" and artifact.metadata.get("id") == "caller_wave" for artifact in result.artifacts)
     assert voice_traces[-1]["export_framework"] == "livekit"
     assert voice_traces[-1]["perceptual_metrics"]["overall"]["packet_loss_pct"] == 0.4
+
+
+@pytest.mark.asyncio
+async def test_voice_environment_decodes_local_wav_media_exports(tmp_path):
+    wav_path = tmp_path / "caller.wav"
+    sample_rate_hz = 24000
+    duration_ms = 500
+    sample_count = int(sample_rate_hz * duration_ms / 1000)
+    samples = [
+        int(math.sin(2 * math.pi * 440 * index / sample_rate_hz) * 8000)
+        for index in range(sample_count)
+    ]
+    with wave.open(str(wav_path), "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(sample_rate_hz)
+        wav_file.writeframes(b"".join(struct.pack("<h", sample) for sample in samples))
+
+    voice_export = {
+        "framework": "livekit",
+        "events": [
+            {
+                "id": "caller_1",
+                "event": "user_input_transcribed",
+                "transcript": "Billing issue for order 123.",
+                "speaker_id": "caller",
+            }
+        ],
+        "recordings": [
+            {
+                "id": "caller_wav",
+                "speaker": "caller",
+                "path": str(wav_path),
+                "mos": 4.2,
+                "snr_db": 31,
+                "jitter_ms": 12,
+                "packet_loss_pct": 0.2,
+            }
+        ],
+        "speaker_segments": [{"speaker": "caller", "start_ms": 0, "end_ms": duration_ms}],
+    }
+    normalized = normalize_voice_export(voice_export, framework="livekit")
+    waveform = normalized["waveforms"][0]
+
+    assert waveform["decoded_audio"] is True
+    assert waveform["media_format"] == "wav"
+    assert waveform["sample_rate_hz"] == sample_rate_hz
+    assert waveform["sample_count"] == sample_count
+    assert waveform["duration_ms"] == duration_ms
+    assert waveform["clipping_ratio"] == 0.0
+    assert waveform["peak_db"] < 0
+    assert waveform["rms_db"] < 0
+
+    async def agent(input):
+        return AgentResponse(
+            content="I inspected the decoded voice media.",
+            tool_calls=[
+                {"id": "stt", "name": "transcribe_audio", "arguments": {"id": "caller_1"}},
+                {"id": "status", "name": "voice_status", "arguments": {}},
+            ],
+        )
+
+    report = await LocalTextEngine().run(
+        scenario=_scenario(),
+        agent_callback=agent,
+        environment=load_voice_export(voice_export, framework="livekit"),
+        max_turns=1,
+        min_turns=1,
+        modality="voice",
+    )
+    voice_state = report.results[0].metadata["environment_state"]["voice"]
+    decoded = voice_state["waveforms"][0]
+
+    assert decoded["decoded_audio"] is True
+    assert decoded["path"] == str(wav_path)
+    assert decoded["duration_ms"] == duration_ms
+    assert decoded["sample_count"] == sample_count
+    assert decoded["clipping_ratio"] == 0.0
+    assert any(
+        artifact.type == "audio"
+        and artifact.path == str(wav_path)
+        and artifact.metadata["sample_count"] == sample_count
+        for artifact in report.results[0].artifacts
+    )
 
 
 @pytest.mark.asyncio
