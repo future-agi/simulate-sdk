@@ -41,6 +41,7 @@ from fi.simulate import (
     normalize_adversarial_attack_pack,
     normalize_framework_trace_events,
     normalize_framework_trace_export,
+    normalize_browser_mutation_pack,
     normalize_browser_trace_export,
     normalize_voice_export,
     normalize_world_contract,
@@ -671,6 +672,114 @@ async def test_browser_environment_captures_storage_and_runtime_hooks():
     assert trace["final_state"]["browser"]["storage_state"]["origins"][0]["origin"] == "https://shop.example.com"
     assert any(event.type == "browser_storage" for event in result.events)
     assert any(event.type == "browser_runtime" for event in result.events)
+
+
+@pytest.mark.asyncio
+async def test_browser_environment_replays_browser_mutation_pack():
+    mutation_pack = normalize_browser_mutation_pack(
+        mutations=[
+            {
+                "id": "confirm_selector_drift",
+                "type": "selector_alias",
+                "url": "https://shop.example.com/checkout",
+                "selector": "#confirm",
+                "alternate_selector": "#confirm-now",
+                "old_text": "id='confirm'",
+                "new_text": "id='confirm-now'",
+                "action": "click confirm",
+                "next_url": "https://shop.example.com/done",
+                "success_dom": "<main><h1>Done</h1><p>Order confirmed.</p></main>",
+                "success_state_updates": {"checkout": {"status": "confirmed"}},
+            },
+            {
+                "id": "cart_storage_drift",
+                "type": "storage_drift",
+                "local_storage": {
+                    "https://shop.example.com": {"cart_version": "mutated"}
+                },
+            },
+            {
+                "id": "hydration_runtime_warning",
+                "type": "runtime_error",
+                "message": "Recoverable hydration warning after mutation.",
+            },
+            {
+                "id": "checkout_api_latency",
+                "type": "network_latency",
+                "request_url": "https://shop.example.com/api/checkout",
+                "latency_ms": 240,
+            },
+        ],
+        url="https://shop.example.com/checkout",
+    )
+
+    async def agent(input):
+        return AgentResponse(
+            content="I inspect the mutated browser world and use the fallback selector.",
+            tool_calls=[
+                {"id": "mutations", "name": "browser_mutations", "arguments": {}},
+                {"id": "storage", "name": "browser_storage", "arguments": {}},
+                {"id": "runtime", "name": "browser_runtime", "arguments": {}},
+                {
+                    "id": "stale_click",
+                    "name": "browser_click",
+                    "arguments": {"selector": "#confirm", "action": "click confirm"},
+                },
+                {
+                    "id": "fallback_click",
+                    "name": "browser_click",
+                    "arguments": {"selector": "#confirm-now", "action": "click confirm"},
+                },
+            ],
+        )
+
+    report = await LocalTextEngine().run(
+        scenario=_scenario(),
+        agent_callback=agent,
+        environment=BrowserEnvironment(
+            url="https://shop.example.com/checkout",
+            dom="<main><button id='confirm'>Confirm</button></main>",
+            allowed_domains=["shop.example.com"],
+            mutation_pack=mutation_pack,
+        ),
+        max_turns=1,
+        min_turns=1,
+        modality="cua",
+    )
+
+    result = report.results[0]
+    browser = result.metadata["environment_state"]["browser"]
+    trace = [
+        artifact.data
+        for artifact in result.artifacts
+        if artifact.type == "trace" and artifact.metadata.get("kind") == "browser_trace"
+    ][-1]
+    mutation_artifact = [
+        artifact.data
+        for artifact in result.artifacts
+        if artifact.type == "trace" and artifact.metadata.get("kind") == "browser_mutation_pack"
+    ][-1]
+    origin = browser["storage_state"]["origins"][0]
+    local_storage = {item["name"]: item["value"] for item in origin["localStorage"]}
+    stale_action, fallback_action = browser["action_replay"][-2:]
+
+    assert mutation_pack["summary"]["mutation_count"] == 4
+    assert mutation_artifact["kind"] == "browser_mutation_pack"
+    assert trace["mutation_pack"]["summary"]["actionability_mutations"] == 1
+    assert browser["browser_mutations"][0]["id"] == "confirm_selector_drift"
+    assert "id='confirm-now'" in trace["snapshots"][0]["dom"]
+    assert local_storage["cart_version"] == "mutated"
+    assert browser["runtime_events"][0]["mutation_id"] == "hydration_runtime_warning"
+    assert browser["performance_entries"][0]["duration_ms"] == 240.0
+    assert browser["network_log"][0]["mutation_id"] == "checkout_api_latency"
+    assert stale_action["success"] is False
+    assert stale_action["mutation_id"] == "confirm_selector_drift"
+    assert stale_action["actionability"]["attached"] is False
+    assert fallback_action["success"] is True
+    assert fallback_action["mutation_id"] == "confirm_selector_drift"
+    assert browser["checkout"]["status"] == "confirmed"
+    assert any(event.type == "browser_mutation_pack" for event in result.events)
+    assert sum(1 for event in result.events if event.type == "browser_mutation") == 4
 
 
 @pytest.mark.asyncio

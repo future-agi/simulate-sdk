@@ -754,6 +754,8 @@ class BrowserEnvironment(EnvironmentAdapter):
         playwright_trace_source: Optional[str | os.PathLike[str]] = None,
         video_artifacts: Optional[Iterable[str | Mapping[str, Any]]] = None,
         perturbations: Optional[Iterable[str | Mapping[str, Any]]] = None,
+        mutation_pack: Optional[Any] = None,
+        mutations: Optional[Iterable[str | Mapping[str, Any]]] = None,
     ) -> None:
         trace_fixture = _merge_browser_trace_fixtures(
             _normalize_browser_trace_export(
@@ -781,23 +783,40 @@ class BrowserEnvironment(EnvironmentAdapter):
         self.allowed_domains = {domain.lower() for domain in allowed_domains or []}
         self.initial_state = copy.deepcopy(state or {})
         self.state = copy.deepcopy(self.initial_state)
-        initial_perturbations = _normalize_browser_perturbations(
-            [*list(trace_fixture.get("perturbations", [])), *list(perturbations or [])]
+        self.initial_mutation_pack = normalize_browser_mutation_pack(
+            mutation_pack,
+            mutations=mutations or [],
+            url=url,
         )
-        self.initial_snapshots = _apply_browser_perturbations_to_snapshots(
-            _normalize_browser_snapshots(
-                [*trace_snapshots, *list(snapshots or [])],
-                url=url,
-                dom=dom,
-                screenshot_uri=screenshot_uri,
-                state=self.initial_state,
+        self.mutation_pack = copy.deepcopy(self.initial_mutation_pack)
+        initial_perturbations = _normalize_browser_perturbations(
+            [
+                *list(trace_fixture.get("perturbations", [])),
+                *_browser_mutation_perturbations(self.initial_mutation_pack),
+                *list(perturbations or []),
+            ]
+        )
+        self.initial_snapshots = _apply_browser_mutations_to_snapshots(
+            _apply_browser_perturbations_to_snapshots(
+                _normalize_browser_snapshots(
+                    [*trace_snapshots, *list(snapshots or [])],
+                    url=url,
+                    dom=dom,
+                    screenshot_uri=screenshot_uri,
+                    state=self.initial_state,
+                ),
+                initial_perturbations,
             ),
-            initial_perturbations,
+            self.initial_mutation_pack,
         )
         self.snapshots = copy.deepcopy(self.initial_snapshots)
         self.current_snapshot_index = 0
         self.initial_actions = _normalize_browser_actions(
-            [*list(trace_fixture.get("actions", [])), *_browser_action_items(actions)]
+            [
+                *list(trace_fixture.get("actions", [])),
+                *_browser_mutation_action_effects(self.initial_mutation_pack),
+                *_browser_action_items(actions),
+            ]
         )
         self.actions = copy.deepcopy(self.initial_actions)
         self.initial_perturbations = initial_perturbations
@@ -812,10 +831,19 @@ class BrowserEnvironment(EnvironmentAdapter):
         ]
         self.initial_network_log = [
             dict(item)
-            for item in [*list(trace_fixture.get("network_log", [])), *list(network_log or [])]
+            for item in [
+                *list(trace_fixture.get("network_log", [])),
+                *_browser_mutation_network_log(self.initial_mutation_pack),
+                *list(network_log or []),
+            ]
         ]
         self.initial_resource_bodies = _dedupe_dicts(trace_fixture.get("resource_bodies", []))
-        self.initial_actionability_timeline = _dedupe_dicts(trace_fixture.get("actionability_timeline", []))
+        self.initial_actionability_timeline = _dedupe_dicts(
+            [
+                *list(trace_fixture.get("actionability_timeline", [])),
+                *_browser_mutation_actionability_timeline(self.initial_mutation_pack),
+            ]
+        )
         self.initial_storage_state = _merge_browser_storage_states(
             trace_fixture.get("storage_state"),
             _normalize_browser_storage_state(
@@ -825,14 +853,20 @@ class BrowserEnvironment(EnvironmentAdapter):
                 local_storage=local_storage,
                 session_storage=session_storage,
             ),
+            _browser_mutation_storage_state(self.initial_mutation_pack, url=url),
         )
         self.initial_runtime_events = [
             _normalize_browser_runtime_event(item)
-            for item in [*list(trace_fixture.get("runtime_events", [])), *list(runtime_events or [])]
+            for item in [
+                *list(trace_fixture.get("runtime_events", [])),
+                *_browser_mutation_runtime_events(self.initial_mutation_pack),
+                *list(runtime_events or []),
+            ]
         ]
         self.initial_performance_entries = _dedupe_dicts(
             [
                 *list(trace_fixture.get("performance_entries", [])),
+                *_browser_mutation_performance_entries(self.initial_mutation_pack),
                 *[_normalize_browser_performance_entry(item) for item in performance_entries or []],
             ]
         )
@@ -876,6 +910,7 @@ class BrowserEnvironment(EnvironmentAdapter):
         self.prompt_injections = copy.deepcopy(self.initial_prompt_injections)
         self.video_artifacts = copy.deepcopy(self.initial_video_artifacts)
         self.perturbations = copy.deepcopy(self.initial_perturbations)
+        self.mutation_pack = copy.deepcopy(self.initial_mutation_pack)
         self.current_snapshot_index = 0
         self.action_replay = []
         self.dom_mutations = []
@@ -883,6 +918,7 @@ class BrowserEnvironment(EnvironmentAdapter):
         artifacts = self._snapshot_artifacts(self._current_snapshot())
         artifacts.extend(self._video_artifacts())
         artifacts.append(self._trace_artifact())
+        artifacts.extend(self._mutation_pack_artifacts())
         events = [
             SimulationEvent(
                 type="environment",
@@ -904,6 +940,7 @@ class BrowserEnvironment(EnvironmentAdapter):
                     "layout_shift_distribution": bool(_browser_layout_shift_distribution(self.perturbations)),
                     "video_artifacts": len(self.video_artifacts),
                     "perturbations": len(self.perturbations),
+                    "browser_mutations": len(self.mutation_pack.get("mutations", [])),
                     "trace_import": copy.deepcopy(self.trace_import_metadata),
                 },
             ),
@@ -960,6 +997,22 @@ class BrowserEnvironment(EnvironmentAdapter):
                     },
                 )
             )
+        if self.mutation_pack.get("mutations"):
+            events.append(
+                SimulationEvent(
+                    type="browser_mutation_pack",
+                    name="browser_mutation_pack_loaded",
+                    payload=copy.deepcopy(self.mutation_pack),
+                )
+            )
+            for mutation in self.mutation_pack.get("mutations", []):
+                events.append(
+                    SimulationEvent(
+                        type="browser_mutation",
+                        name=str(mutation.get("id") or mutation.get("type") or "browser_mutation"),
+                        payload=copy.deepcopy(mutation),
+                    )
+                )
         for injection in self.prompt_injections:
             events.append(
                 SimulationEvent(
@@ -1027,6 +1080,10 @@ class BrowserEnvironment(EnvironmentAdapter):
                     "name": "browser_runtime",
                     "description": "Return simulated browser runtime events and performance entries.",
                 },
+                {
+                    "name": "browser_mutations",
+                    "description": "Return the structured browser mutation pack applied to this environment.",
+                },
             ],
             artifacts=artifacts,
             state={"browser": self._state_payload()},
@@ -1046,6 +1103,7 @@ class BrowserEnvironment(EnvironmentAdapter):
                     "performance_entries": len(self.performance_entries),
                     "video_artifacts": len(self.video_artifacts),
                     "perturbations": len(self.perturbations),
+                    "browser_mutations": len(self.mutation_pack.get("mutations", [])),
                 }
             },
         )
@@ -1063,6 +1121,7 @@ class BrowserEnvironment(EnvironmentAdapter):
             "browser_network",
             "browser_storage",
             "browser_runtime",
+            "browser_mutations",
         }:
             return self._inspection_result(tool_call, name)
         if name not in {"browser_navigate", "browser_click", "playwright_click", "computer_click"}:
@@ -1084,6 +1143,8 @@ class BrowserEnvironment(EnvironmentAdapter):
                 "selector": selector,
                 "matched": bool(matched_effect),
                 "effect_id": matched_effect.get("id") if matched_effect else None,
+                "mutation_id": _browser_action_effect_mutation_id(matched_effect),
+                "mutation_type": _browser_action_effect_mutation_type(matched_effect),
                 "arguments": copy.deepcopy(arguments),
                 "blocked": True,
                 "success": False,
@@ -1153,6 +1214,8 @@ class BrowserEnvironment(EnvironmentAdapter):
                 "selector": selector,
                 "matched": True,
                 "effect_id": matched_effect.get("id") if matched_effect else None,
+                "mutation_id": _browser_action_effect_mutation_id(matched_effect),
+                "mutation_type": _browser_action_effect_mutation_type(matched_effect),
                 "arguments": copy.deepcopy(arguments),
                 "blocked": False,
                 "success": False,
@@ -1190,6 +1253,8 @@ class BrowserEnvironment(EnvironmentAdapter):
                 "selector": selector,
                 "matched": True,
                 "effect_id": matched_effect.get("id"),
+                "mutation_id": _browser_action_effect_mutation_id(matched_effect),
+                "mutation_type": _browser_action_effect_mutation_type(matched_effect),
                 "arguments": copy.deepcopy(arguments),
                 "blocked": False,
                 "success": False,
@@ -1230,6 +1295,8 @@ class BrowserEnvironment(EnvironmentAdapter):
             "selector": selector,
             "matched": bool(matched_effect),
             "effect_id": matched_effect.get("id") if matched_effect else None,
+            "mutation_id": _browser_action_effect_mutation_id(matched_effect),
+            "mutation_type": _browser_action_effect_mutation_type(matched_effect),
             "arguments": copy.deepcopy(arguments),
             "blocked": False,
             "success": True,
@@ -1336,6 +1403,9 @@ class BrowserEnvironment(EnvironmentAdapter):
                 "summary": _browser_runtime_summary(self.runtime_events, self.performance_entries),
             }
             event_type = "browser_runtime"
+        elif name == "browser_mutations":
+            result = copy.deepcopy(self.mutation_pack)
+            event_type = "browser_mutation_pack"
         elif name == "browser_refresh_snapshot":
             refreshed = self._refresh_snapshot()
             result = {"refreshed": refreshed, "snapshot": self._snapshot_summary(self._current_snapshot())}
@@ -1647,6 +1717,19 @@ class BrowserEnvironment(EnvironmentAdapter):
             )
         return artifacts
 
+    def _mutation_pack_artifacts(self) -> List[SimulationArtifact]:
+        if not self.mutation_pack.get("mutations"):
+            return []
+        return [
+            SimulationArtifact(
+                type="trace",
+                data=copy.deepcopy(self.mutation_pack),
+                mime_type="application/json",
+                role="environment",
+                metadata={"kind": "browser_mutation_pack", "url": self.url},
+            )
+        ]
+
     def _trace_artifact(self) -> SimulationArtifact:
         return SimulationArtifact(
             type="trace",
@@ -1676,6 +1759,8 @@ class BrowserEnvironment(EnvironmentAdapter):
             "prompt_injections": copy.deepcopy(self.prompt_injections),
             "video_artifacts": copy.deepcopy(self.video_artifacts),
             "perturbations": copy.deepcopy(self.perturbations),
+            "mutation_pack": copy.deepcopy(self.mutation_pack),
+            "browser_mutations": copy.deepcopy(self.mutation_pack.get("mutations", [])),
             "layout_shift_distribution": _browser_layout_shift_distribution(self.perturbations),
             "trace_import": copy.deepcopy(self.trace_import_metadata),
             "final_state": {"browser": self._state_payload()},
@@ -1699,6 +1784,8 @@ class BrowserEnvironment(EnvironmentAdapter):
             "runtime_summary": _browser_runtime_summary(self.runtime_events, self.performance_entries),
             "video_artifacts": copy.deepcopy(self.video_artifacts),
             "perturbations": copy.deepcopy(self.perturbations),
+            "mutation_pack": copy.deepcopy(self.mutation_pack),
+            "browser_mutations": copy.deepcopy(self.mutation_pack.get("mutations", [])),
             "layout_shift_distribution": _browser_layout_shift_distribution(self.perturbations),
         }
         if last_action is not None:
@@ -2635,6 +2722,89 @@ def load_adversarial_attack_pack(
         blocked_tools=[str(tool) for tool in _as_iterable(data.get("blocked_tools"))],
         metadata=_as_mapping(data.get("metadata")),
     )
+
+
+def normalize_browser_mutation_pack(
+    mutation_pack: Optional[Any] = None,
+    *,
+    mutations: Iterable[str | Mapping[str, Any]] = (),
+    url: Optional[str] = None,
+    metadata: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Normalize portable browser-world mutations into one replayable pack."""
+
+    pack_data: Dict[str, Any] = {}
+    raw_mutations: List[Any] = []
+    if mutation_pack is not None:
+        if hasattr(mutation_pack, "model_dump"):
+            mutation_pack = mutation_pack.model_dump()
+        elif hasattr(mutation_pack, "dict"):
+            mutation_pack = mutation_pack.dict()
+        if isinstance(mutation_pack, Mapping):
+            pack_data = copy.deepcopy(dict(mutation_pack))
+            for key in ("mutations", "browser_mutations", "mutation_cases", "cases"):
+                raw_mutations.extend(_as_iterable(pack_data.get(key)))
+        else:
+            raw_mutations.extend(_as_iterable(mutation_pack))
+    raw_mutations.extend(_as_iterable(mutations))
+
+    default_url = str(
+        url
+        or pack_data.get("url")
+        or pack_data.get("default_url")
+        or pack_data.get("current_url")
+        or ""
+    )
+    normalized = [
+        _normalize_browser_mutation(mutation, index=index, default_url=default_url)
+        for index, mutation in enumerate(raw_mutations)
+    ]
+    normalized = [mutation for mutation in normalized if mutation]
+    signals = {
+        "browser_mutation",
+        "mutation_pack",
+        *(
+            signal
+            for mutation in normalized
+            for signal in _as_iterable(mutation.get("signals", []))
+            if signal
+        ),
+    }
+    mutation_types = sorted({str(mutation.get("type")) for mutation in normalized if mutation.get("type")})
+    return {
+        "kind": "browser_mutation_pack",
+        "url": default_url or None,
+        "mutations": normalized,
+        "mutation_types": mutation_types,
+        "signals": sorted(_normalize_world_contract_key(signal) for signal in signals if signal),
+        "summary": {
+            "mutation_count": len(normalized),
+            "mutation_types": mutation_types,
+            "storage_mutations": sum(1 for mutation in normalized if _browser_mutation_has_storage(mutation)),
+            "runtime_mutations": sum(1 for mutation in normalized if _browser_mutation_has_runtime(mutation)),
+            "actionability_mutations": sum(1 for mutation in normalized if _browser_mutation_has_actionability(mutation)),
+        },
+        "metadata": {
+            **copy.deepcopy(dict(pack_data.get("metadata", {}))),
+            **copy.deepcopy(dict(metadata or {})),
+        },
+    }
+
+
+def load_browser_mutation_pack(
+    source: str | Mapping[str, Any],
+    *,
+    headers: Optional[Mapping[str, str]] = None,
+    timeout: float = 30.0,
+) -> Dict[str, Any]:
+    data = (
+        copy.deepcopy(dict(source))
+        if isinstance(source, Mapping)
+        else _load_framework_trace_export_source(source, headers=headers, timeout=timeout)
+    )
+    if not isinstance(data, Mapping):
+        raise TypeError("Browser mutation pack export must be a mapping")
+    return normalize_browser_mutation_pack(data)
 
 
 def _normalize_adversarial_attack_case(
@@ -9840,6 +10010,523 @@ def _normalize_browser_perturbation(
         if regions is not None:
             item["affected_regions"] = [str(value) for value in _as_iterable(regions)]
     return item
+
+
+def _normalize_browser_mutation(
+    mutation: str | Mapping[str, Any],
+    *,
+    index: int,
+    default_url: Optional[str],
+) -> Dict[str, Any]:
+    item = copy.deepcopy(dict(mutation)) if isinstance(mutation, Mapping) else {"type": str(mutation)}
+    text = _stringify(item).lower() if "_stringify" in globals() else json.dumps(item, default=str).lower()
+    mutation_type = str(
+        item.get("type")
+        or item.get("kind")
+        or item.get("mutation_type")
+        or item.get("name")
+        or ""
+    )
+    if not mutation_type:
+        if "storage" in text:
+            mutation_type = "storage_drift"
+        elif "runtime" in text or "page_error" in text:
+            mutation_type = "runtime_error"
+        elif "overlay" in text or "modal" in text:
+            mutation_type = "overlay"
+        elif "selector" in text:
+            mutation_type = "selector_alias"
+        elif "layout" in text and "shift" in text:
+            mutation_type = "layout_shift"
+        elif "stale" in text:
+            mutation_type = "stale_screenshot"
+        else:
+            mutation_type = "browser_mutation"
+    mutation_type = _normalize_browser_mutation_type(mutation_type)
+    item["type"] = mutation_type
+    item.setdefault("id", f"{mutation_type}_{index + 1}")
+    if default_url and not item.get("url"):
+        item["url"] = default_url
+
+    selector = _browser_mutation_selector(item)
+    if selector:
+        item["selector"] = selector
+    selectors = _dedupe_strings(
+        str(value)
+        for value in [selector, *_as_iterable(item.get("selectors", []))]
+        if str(value or "").strip()
+    )
+    if selectors:
+        item["selectors"] = selectors
+    alternate_selectors = _dedupe_strings(
+        str(value)
+        for value in _as_iterable(
+            item.get(
+                "alternate_selectors",
+                item.get("selector_aliases", item.get("aliases", item.get("fallback_selectors", []))),
+            )
+        )
+        if str(value or "").strip()
+    )
+    for key in ("alternate_selector", "new_selector", "replacement_selector", "fallback_selector"):
+        if item.get(key):
+            alternate_selectors.append(str(item[key]))
+    alternate_selectors = _dedupe_strings(alternate_selectors)
+    if alternate_selectors:
+        item["alternate_selectors"] = alternate_selectors
+
+    actionability = _browser_mutation_actionability(item)
+    if actionability:
+        item["actionability"] = actionability
+    dom_patch = _browser_mutation_dom_patch(item)
+    if dom_patch:
+        item["dom_patch"] = dom_patch
+
+    signals = set(_as_iterable(item.get("signals", [])))
+    signals.update({"browser_mutation", mutation_type})
+    if _browser_mutation_has_storage(item):
+        signals.add("storage_state")
+    if _browser_mutation_has_runtime(item):
+        signals.add("runtime_event")
+    if _browser_mutation_has_actionability(item):
+        signals.add("actionability")
+    if alternate_selectors:
+        signals.add("selector_fallback")
+    item["signals"] = sorted(_normalize_world_contract_key(signal) for signal in signals if signal)
+    item["metadata"] = copy.deepcopy(_as_mapping(item.get("metadata")))
+    return {key: value for key, value in item.items() if value not in (None, "", [], {})}
+
+
+def _normalize_browser_mutation_type(value: Any) -> str:
+    normalized = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "dom_swap": "dom_text_swap",
+        "text_swap": "dom_text_swap",
+        "text_replacement": "dom_text_swap",
+        "dom_replacement": "dom_text_swap",
+        "dom_mutation": "dom_patch",
+        "selector_patch": "selector_alias",
+        "stale_selector": "selector_alias",
+        "selector_drift": "selector_alias",
+        "disabled": "element_disabled",
+        "disabled_element": "element_disabled",
+        "actionability_failure": "element_disabled",
+        "blocked_overlay": "overlay",
+        "modal_overlay": "overlay",
+        "storage": "storage_drift",
+        "storage_state": "storage_drift",
+        "storage_mutation": "storage_drift",
+        "local_storage_drift": "storage_drift",
+        "session_storage_drift": "storage_drift",
+        "page_error": "runtime_error",
+        "web_error": "runtime_error",
+        "console_error": "runtime_error",
+        "network": "network_fault",
+        "network_error": "network_fault",
+        "latency": "network_latency",
+        "resource_latency": "network_latency",
+        "layout_shift": "layout_shift",
+        "stale_screenshot": "stale_screenshot",
+    }
+    return aliases.get(normalized, normalized or "browser_mutation")
+
+
+def _browser_mutation_selector(mutation: Mapping[str, Any]) -> Optional[str]:
+    for key in ("selector", "target_selector", "old_selector", "locator", "target", "element"):
+        if mutation.get(key):
+            return str(mutation[key])
+    return None
+
+
+def _browser_mutation_actionability(mutation: Mapping[str, Any]) -> Dict[str, Any]:
+    checks = _coerce_plain_dict(mutation.get("actionability"))
+    mutation_type = str(mutation.get("type") or "")
+    if mutation_type in {"selector_alias"}:
+        checks.setdefault("attached", False)
+    if mutation_type in {"element_disabled"}:
+        checks.setdefault("enabled", False)
+    if mutation_type in {"overlay"}:
+        checks.setdefault("receives_events", False)
+    for key in ("attached", "visible", "enabled", "stable", "receives_events", "actionable"):
+        if key in mutation:
+            checks[key] = bool(mutation[key])
+    return checks
+
+
+def _browser_mutation_dom_patch(mutation: Mapping[str, Any]) -> Dict[str, Any]:
+    patch = _coerce_plain_dict(mutation.get("dom_patch", mutation.get("patch")))
+    replacements = _coerce_plain_dict(mutation.get("replace"))
+    if replacements:
+        patch["replace"] = {str(old): str(new) for old, new in replacements.items()}
+    old_text = (
+        mutation.get("old_text")
+        or mutation.get("from_text")
+        or mutation.get("target_text")
+        or mutation.get("before_text")
+    )
+    new_text = (
+        mutation.get("new_text")
+        or mutation.get("to_text")
+        or mutation.get("replacement_text")
+        or mutation.get("after_text")
+    )
+    if old_text is not None and new_text is not None:
+        replace = dict(patch.get("replace", {}))
+        replace[str(old_text)] = str(new_text)
+        patch["replace"] = replace
+    if mutation.get("append_html") is not None:
+        patch["append"] = str(mutation["append_html"])
+    if mutation.get("prepend_html") is not None:
+        patch["prepend"] = str(mutation["prepend_html"])
+    if mutation.get("type") == "overlay" and not any(key in patch for key in ("append", "prepend", "set")):
+        overlay = mutation.get("html") or mutation.get("dom") or (
+            f"<div data-browser-mutation='{mutation.get('id')}' role='dialog'>"
+            f"{mutation.get('message') or 'Blocking overlay'}</div>"
+        )
+        patch["append"] = str(overlay)
+    return patch
+
+
+def _browser_mutation_has_storage(mutation: Mapping[str, Any]) -> bool:
+    return any(
+        mutation.get(key) not in (None, "", [], {})
+        for key in (
+            "storage_state",
+            "storageState",
+            "cookies",
+            "cookie",
+            "local_storage",
+            "localStorage",
+            "session_storage",
+            "sessionStorage",
+        )
+    ) or str(mutation.get("type") or "") == "storage_drift"
+
+
+def _browser_mutation_has_runtime(mutation: Mapping[str, Any]) -> bool:
+    return any(
+        mutation.get(key) not in (None, "", [], {})
+        for key in (
+            "runtime_events",
+            "runtime_event",
+            "page_errors",
+            "page_error",
+            "web_errors",
+            "web_error",
+            "performance_entries",
+            "performance",
+            "resource_timing",
+        )
+    ) or str(mutation.get("type") or "") in {"runtime_error", "network_fault", "network_latency"}
+
+
+def _browser_mutation_has_actionability(mutation: Mapping[str, Any]) -> bool:
+    return bool(_coerce_plain_dict(mutation.get("actionability"))) or str(mutation.get("type") or "") in {
+        "selector_alias",
+        "element_disabled",
+        "overlay",
+    }
+
+
+def _browser_mutation_perturbations(mutation_pack: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    perturbations: List[Dict[str, Any]] = []
+    for mutation in _as_iterable(mutation_pack.get("mutations", [])):
+        mutation_dict = _coerce_plain_dict(mutation)
+        if mutation_dict.get("type") not in {"layout_shift", "stale_screenshot"}:
+            continue
+        perturbation = copy.deepcopy(mutation_dict)
+        perturbation["source"] = "browser_mutation_pack"
+        perturbation["mutation_id"] = mutation_dict.get("id")
+        perturbations.append(perturbation)
+    return perturbations
+
+
+def _apply_browser_mutations_to_snapshots(
+    snapshots: List[Dict[str, Any]],
+    mutation_pack: Mapping[str, Any],
+) -> List[Dict[str, Any]]:
+    updated = copy.deepcopy(snapshots)
+    for mutation in _as_iterable(mutation_pack.get("mutations", [])):
+        mutation_dict = _coerce_plain_dict(mutation)
+        mutation_type = str(mutation_dict.get("type") or "")
+        if mutation_type not in {"dom_text_swap", "dom_patch", "selector_alias", "element_disabled", "overlay"} and not any(
+            mutation_dict.get(key) not in (None, "", [], {})
+            for key in ("dom", "dom_patch", "patch", "replace", "append_html", "prepend_html")
+        ):
+            continue
+        for snapshot in updated:
+            if not _browser_mutation_targets_snapshot(mutation_dict, snapshot):
+                continue
+            before = str(snapshot.get("dom", "") or "")
+            base = str(mutation_dict.get("dom")) if mutation_dict.get("dom") is not None and mutation_type != "overlay" else before
+            after = _apply_dom_patch(base, mutation_dict.get("dom_patch"))
+            if after != before:
+                snapshot["dom"] = after
+            metadata = copy.deepcopy(dict(snapshot.get("metadata", {})))
+            mutation_ids = list(_as_iterable(metadata.get("browser_mutation_ids", [])))
+            if mutation_dict.get("id") not in mutation_ids:
+                mutation_ids.append(mutation_dict.get("id"))
+            metadata["browser_mutation_ids"] = [str(value) for value in mutation_ids if value]
+            metadata["browser_mutated"] = True
+            if mutation_type == "selector_alias":
+                metadata["stale_selector"] = mutation_dict.get("selector")
+                metadata["alternate_selectors"] = copy.deepcopy(mutation_dict.get("alternate_selectors", []))
+            snapshot["metadata"] = metadata
+    return updated
+
+
+def _browser_mutation_targets_snapshot(mutation: Mapping[str, Any], snapshot: Mapping[str, Any]) -> bool:
+    snapshot_targets = {
+        str(value)
+        for value in _as_iterable(
+            mutation.get("snapshot_id")
+            or mutation.get("snapshot")
+            or mutation.get("screenshot_id")
+            or mutation.get("screenshot")
+        )
+        if value not in (None, "")
+    }
+    if snapshot_targets:
+        candidates = {
+            str(snapshot.get("id", "")),
+            str(snapshot.get("screenshot_uri", "")),
+            str(snapshot.get("screenshot_path", "")),
+        }
+        return bool(snapshot_targets & candidates)
+    mutation_url = str(mutation.get("url") or "")
+    if mutation_url and str(snapshot.get("url") or "") != mutation_url:
+        return False
+    return True
+
+
+def _browser_mutation_storage_state(
+    mutation_pack: Mapping[str, Any],
+    *,
+    url: Optional[Any],
+) -> Dict[str, Any]:
+    states: List[Dict[str, Any]] = []
+    for mutation in _as_iterable(mutation_pack.get("mutations", [])):
+        mutation_dict = _coerce_plain_dict(mutation)
+        if not _browser_mutation_has_storage(mutation_dict):
+            continue
+        states.append(
+            _normalize_browser_storage_state(
+                mutation_dict.get("storage_state", mutation_dict.get("storageState")),
+                url=mutation_dict.get("url") or url,
+                cookies=mutation_dict.get("cookies", mutation_dict.get("cookie")),
+                local_storage=mutation_dict.get("local_storage", mutation_dict.get("localStorage")),
+                session_storage=mutation_dict.get("session_storage", mutation_dict.get("sessionStorage")),
+            )
+        )
+    return _merge_browser_storage_states(*states)
+
+
+def _browser_mutation_runtime_events(mutation_pack: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    events: List[Dict[str, Any]] = []
+    for mutation in _as_iterable(mutation_pack.get("mutations", [])):
+        mutation_dict = _coerce_plain_dict(mutation)
+        raw_events = [
+            *_as_iterable(mutation_dict.get("runtime_events", mutation_dict.get("runtime_event"))),
+            *_as_iterable(mutation_dict.get("page_errors", mutation_dict.get("page_error"))),
+            *_as_iterable(mutation_dict.get("web_errors", mutation_dict.get("web_error"))),
+        ]
+        if not raw_events and str(mutation_dict.get("type") or "") in {"runtime_error", "network_fault"}:
+            raw_events = [
+                {
+                    "type": "runtime_error" if mutation_dict.get("type") == "runtime_error" else "network_fault",
+                    "level": "error" if mutation_dict.get("type") == "runtime_error" else "warning",
+                    "message": mutation_dict.get("message") or mutation_dict.get("error") or mutation_dict.get("reason") or "Browser mutation runtime event.",
+                }
+            ]
+        for raw in raw_events:
+            event = _normalize_browser_runtime_event(raw)
+            event.setdefault("source", "browser_mutation_pack")
+            event.setdefault("mutation_id", mutation_dict.get("id"))
+            event.setdefault("mutation_type", mutation_dict.get("type"))
+            events.append(event)
+    return _dedupe_dicts(events)
+
+
+def _browser_mutation_performance_entries(mutation_pack: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    entries: List[Dict[str, Any]] = []
+    for mutation in _as_iterable(mutation_pack.get("mutations", [])):
+        mutation_dict = _coerce_plain_dict(mutation)
+        raw_entries = _as_iterable(
+            mutation_dict.get(
+                "performance_entries",
+                mutation_dict.get("performance", mutation_dict.get("resource_timing")),
+            )
+        )
+        if not raw_entries and mutation_dict.get("type") in {"network_fault", "network_latency"}:
+            duration = (
+                mutation_dict.get("duration_ms")
+                or mutation_dict.get("latency_ms")
+                or mutation_dict.get("delay_ms")
+                or mutation_dict.get("duration")
+            )
+            raw_entries = [
+                {
+                    "name": mutation_dict.get("request_url") or mutation_dict.get("url") or mutation_dict.get("resource") or "browser_mutation_resource",
+                    "entry_type": "resource",
+                    "duration_ms": duration or 0,
+                }
+            ]
+        for raw in raw_entries:
+            entry = _normalize_browser_performance_entry(raw)
+            entry.setdefault("source", "browser_mutation_pack")
+            entry.setdefault("mutation_id", mutation_dict.get("id"))
+            entry.setdefault("mutation_type", mutation_dict.get("type"))
+            entries.append(entry)
+    return _dedupe_dicts(entries)
+
+
+def _browser_mutation_network_log(mutation_pack: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    requests: List[Dict[str, Any]] = []
+    for mutation in _as_iterable(mutation_pack.get("mutations", [])):
+        mutation_dict = _coerce_plain_dict(mutation)
+        raw_requests = _as_iterable(mutation_dict.get("network_log", mutation_dict.get("network_request")))
+        if not raw_requests and mutation_dict.get("type") in {"network_fault", "network_latency"}:
+            raw_requests = [
+                {
+                    "url": mutation_dict.get("request_url") or mutation_dict.get("url") or mutation_dict.get("resource"),
+                    "status": mutation_dict.get("status", 503 if mutation_dict.get("type") == "network_fault" else 200),
+                    "latency_ms": mutation_dict.get("latency_ms", mutation_dict.get("delay_ms")),
+                }
+            ]
+        for raw in raw_requests:
+            request = copy.deepcopy(dict(raw)) if isinstance(raw, Mapping) else {"url": str(raw)}
+            request.setdefault("source", "browser_mutation_pack")
+            request.setdefault("mutation_id", mutation_dict.get("id"))
+            request.setdefault("mutation_type", mutation_dict.get("type"))
+            requests.append({key: value for key, value in request.items() if value not in (None, "", [], {})})
+    return _dedupe_dicts(requests)
+
+
+def _browser_mutation_actionability_timeline(mutation_pack: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    checks: List[Dict[str, Any]] = []
+    for mutation in _as_iterable(mutation_pack.get("mutations", [])):
+        mutation_dict = _coerce_plain_dict(mutation)
+        actionability = _browser_mutation_actionability(mutation_dict)
+        if not actionability:
+            continue
+        checks.append(
+            {
+                "id": f"{mutation_dict.get('id')}_actionability",
+                "selector": mutation_dict.get("selector"),
+                "mutation_id": mutation_dict.get("id"),
+                "mutation_type": mutation_dict.get("type"),
+                "checks": copy.deepcopy(actionability),
+                "passed": all(value is not False for value in actionability.values()),
+                "source": "browser_mutation_pack",
+            }
+        )
+    return _dedupe_dicts(checks)
+
+
+def _browser_mutation_action_effects(mutation_pack: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    effects: List[Dict[str, Any]] = []
+    for mutation in _as_iterable(mutation_pack.get("mutations", [])):
+        mutation_dict = _coerce_plain_dict(mutation)
+        selector = mutation_dict.get("selector")
+        actionability = _browser_mutation_actionability(mutation_dict)
+        if selector and actionability:
+            effects.append(
+                _browser_mutation_action_effect(
+                    mutation_dict,
+                    selector=str(selector),
+                    effect_id=f"{mutation_dict.get('id')}_primary",
+                    actionability=actionability,
+                    success_fields=False,
+                )
+            )
+        for index, alternate_selector in enumerate(_as_iterable(mutation_dict.get("alternate_selectors", []))):
+            effects.append(
+                _browser_mutation_action_effect(
+                    mutation_dict,
+                    selector=str(alternate_selector),
+                    effect_id=f"{mutation_dict.get('id')}_alternate_{index + 1}",
+                    actionability={
+                        "attached": True,
+                        "visible": True,
+                        "enabled": True,
+                        "stable": True,
+                        "receives_events": True,
+                    },
+                    success_fields=True,
+                )
+            )
+    return [effect for effect in effects if effect]
+
+
+def _browser_mutation_action_effect(
+    mutation: Mapping[str, Any],
+    *,
+    selector: str,
+    effect_id: str,
+    actionability: Mapping[str, Any],
+    success_fields: bool,
+) -> Dict[str, Any]:
+    effect: Dict[str, Any] = {
+        "id": effect_id,
+        "mutation_id": mutation.get("id"),
+        "mutation_type": mutation.get("type"),
+        "tool_names": ["browser_click", "playwright_click", "computer_click"],
+        "selector": selector,
+        "selectors": [selector],
+        "current_url": mutation.get("current_url") or mutation.get("from_url") or mutation.get("url"),
+        "actionability": copy.deepcopy(dict(actionability)),
+        "metadata": {
+            **copy.deepcopy(_as_mapping(mutation.get("metadata"))),
+            "source": "browser_mutation_pack",
+            "mutation_id": mutation.get("id"),
+            "mutation_type": mutation.get("type"),
+        },
+    }
+    if mutation.get("match_action_without_selector"):
+        action = mutation.get("action") or mutation.get("expected_action") or "click"
+        effect["action"] = str(action)
+        effect["actions"] = [str(value) for value in _as_iterable(mutation.get("actions", action)) if str(value or "").strip()]
+    if success_fields:
+        for source_key, effect_key in (
+            ("next_url", "next_url"),
+            ("target_url", "target_url"),
+            ("navigate_to", "navigate_to"),
+            ("success_dom", "dom"),
+            ("success_dom_patch", "dom_patch"),
+            ("success_state_updates", "state_updates"),
+            ("success_screenshot_uri", "screenshot_uri"),
+            ("success_screenshot_path", "screenshot_path"),
+            ("screenshot_diff", "screenshot_diff"),
+            ("storage_state", "storage_state"),
+            ("cookies", "cookies"),
+            ("local_storage", "local_storage"),
+            ("session_storage", "session_storage"),
+            ("runtime_events", "runtime_events"),
+            ("performance_entries", "performance_entries"),
+        ):
+            if mutation.get(source_key) not in (None, "", [], {}):
+                effect[effect_key] = copy.deepcopy(mutation[source_key])
+        if "state_updates" not in effect and mutation.get("state_updates") not in (None, "", [], {}):
+            effect["state_updates"] = copy.deepcopy(mutation["state_updates"])
+    else:
+        effect["error"] = mutation.get("error") or mutation.get("reason") or "browser mutation actionability failure"
+    return {key: value for key, value in effect.items() if value not in (None, "", [], {})}
+
+
+def _browser_action_effect_mutation_id(effect: Optional[Mapping[str, Any]]) -> Optional[str]:
+    if not effect:
+        return None
+    metadata = _as_mapping(effect.get("metadata"))
+    value = effect.get("mutation_id") or metadata.get("mutation_id")
+    return str(value) if value not in (None, "") else None
+
+
+def _browser_action_effect_mutation_type(effect: Optional[Mapping[str, Any]]) -> Optional[str]:
+    if not effect:
+        return None
+    metadata = _as_mapping(effect.get("metadata"))
+    value = effect.get("mutation_type") or metadata.get("mutation_type")
+    return str(value) if value not in (None, "") else None
 
 
 def _browser_layout_shift_samples(source: Mapping[str, Any]) -> List[float]:
