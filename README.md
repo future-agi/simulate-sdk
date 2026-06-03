@@ -547,7 +547,8 @@ resistance, environment-injection resistance, memory integrity, browser/CUA
 safety, browser action outcome/state success, browser trace coverage, voice
 turn-taking, voice interaction quality, voice trace coverage, framework trace
 coverage, framework transcript quality, tool argument schema validation, retrieval context quality, source grounding,
-retrieval/memory attribution, autonomy-loop coverage, autonomy-loop quality,
+retrieval/memory attribution, source contradiction, artifact grounding quality,
+autonomy-loop coverage, autonomy-loop quality,
 multi-agent trace coverage, multi-agent coordination quality, artifact coverage,
 trajectory-template checks for agent goal accuracy, tool-call accuracy, Tool Call
 F1, policy adherence, trajectory browser action safety, memory correctness,
@@ -613,6 +614,23 @@ evaluation = evaluate_agent_report(
         "forbidden_retrieval_doc_ids": ["refund_policy_old"],
         "require_current_retrieval": True,
         "require_source_grounding": True,
+        "source_contradiction_checks": [
+            {
+                "id": "refund_window",
+                "source_terms": ["30 day refund window"],
+                "answer_terms": ["refund window"],
+                "contradict_terms": ["90 day refund window"],
+            }
+        ],
+        "artifact_grounding_checks": [
+            {
+                "id": "receipt_total",
+                "artifact": {"type": "image", "id": "receipt_123"},
+                "answer_terms": ["receipt total", "$42.00"],
+                "support_terms": ["total $42.00"],
+                "forbidden_answer_terms": ["$24.00"],
+            }
+        ],
         "required_autonomy_loop": ["observe", "orient", "plan", "act", "verify", "reflect"],
         "expected_autonomy_plan": {"required_steps": ["lookup", "policy", "respond"], "min_steps": 3},
         "expected_autonomy_verification": {"required_checks": ["order found"], "passed_required": True},
@@ -636,6 +654,7 @@ print(report.results[0].evaluation["agent_report"]["case_score"])
 See [`examples/local_agent_report_evaluation.py`](examples/local_agent_report_evaluation.py) for a full local simulate -> evaluate cookbook.
 See [`examples/local_trajectory_template_evaluation.py`](examples/local_trajectory_template_evaluation.py) for a generated trajectory-template cookbook with mocked tools, browser action safety, memory, state, and image artifact grounding.
 See [`examples/local_langgraph_event_stream_replay.py`](examples/local_langgraph_event_stream_replay.py) for local LangGraph/LangChain event-stream replay with framework transcript quality checks.
+See [`examples/local_evidence_grounding.py`](examples/local_evidence_grounding.py) for retrieval plus image artifact evidence checks that catch source contradictions and unsupported artifact claims.
 
 50+ metrics are available out of the box — groundedness, faithfulness, tool-use correctness, RAG context relevance, hallucination, PII, toxicity, bias, audio quality, and custom rubrics. See the [evaluation docs](https://docs.futureagi.com/docs/evaluation) for the full catalog.
 
@@ -685,7 +704,7 @@ Traces from simulations flow into `Monitor`, scores flow into `Evaluate`, and fa
 - [x] Per-speaker + combined audio capture
 - [x] Scenario auto-generation from a topic
 - [x] `evaluate_report` integration with `ai-evaluation`
-- [x] Local `evaluate_agent_report` scoring for trajectory, trajectory templates, agent goal accuracy, tool-call accuracy/F1, policy adherence, tools, memory correctness, multimodal faithfulness, framework trace coverage, framework transcript quality, retrieval/memory attribution, autonomy-loop coverage, autonomy-loop quality, multi-agent trace coverage, multi-agent coordination quality, browser/CUA action outcome and grounding quality, browser trace coverage, voice trace coverage, voice interaction quality, environment injection, and pentest signals
+- [x] Local `evaluate_agent_report` scoring for trajectory, trajectory templates, agent goal accuracy, tool-call accuracy/F1, policy adherence, tools, memory correctness, multimodal faithfulness, framework trace coverage, framework transcript quality, retrieval/memory attribution, source contradiction, artifact grounding quality, autonomy-loop coverage, autonomy-loop quality, multi-agent trace coverage, multi-agent coordination quality, browser/CUA action outcome and grounding quality, browser trace coverage, voice trace coverage, voice interaction quality, environment injection, and pentest signals
 - [x] Tool-call capture in wrapper responses
 
 </td>
