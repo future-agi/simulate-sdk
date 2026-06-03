@@ -36,6 +36,7 @@ from fi.simulate import (
     WorldAttackReplayEnvironment,
     WorldContractEnvironment,
     WorldOrchestrationReplayEnvironment,
+    WorkspaceRunEnvironment,
     evaluate_agent_report,
     load_adversarial_attack_pack,
     load_agent_integration_manifest,
@@ -43,6 +44,7 @@ from fi.simulate import (
     load_voice_export,
     load_world_attack_replay,
     load_world_orchestration_replay,
+    load_workspace_run_manifest,
     load_pipecat_frame_log,
     load_world_contract,
     load_playwright_trace_export,
@@ -61,6 +63,7 @@ from fi.simulate import (
     normalize_adversarial_attack_pack,
     normalize_agent_control_plane,
     normalize_agent_integration_manifest,
+    normalize_workspace_run_manifest,
     normalize_agent_trust_boundary_model,
     normalize_framework_capability_matrix,
     normalize_framework_lifecycle_trace,
@@ -3069,6 +3072,243 @@ async def test_agent_integration_environment_covers_voice_chat_providers_and_tra
         required_channels=["webrtc"],
     )
     assert isinstance(loaded, AgentIntegrationEnvironment)
+
+
+@pytest.mark.asyncio
+async def test_workspace_run_environment_covers_autonomous_code_red_team_loop():
+    manifest = {
+        "repository": {
+            "provider": "github",
+            "url": "https://github.com/futureagi/support-agent",
+            "owner": "futureagi",
+            "name": "support-agent",
+            "default_branch": "main",
+        },
+        "checkout": {
+            "ref": "refs/heads/main",
+            "commit_sha": "abc123def456",
+            "directory": "/tmp/futureagi/support-agent",
+            "status": "completed",
+        },
+        "commands": [
+            {
+                "id": "checkout",
+                "command": "git clone --depth=1 https://github.com/futureagi/support-agent",
+                "exit_code": 0,
+                "log_ref": "logs/checkout.log",
+            },
+            {
+                "id": "unit_tests",
+                "command": "pytest -q",
+                "exit_code": 0,
+                "stdout": "128 passed",
+                "artifacts": [{"path": "artifacts/junit.xml", "type": "test_report"}],
+            },
+            {
+                "id": "red_team",
+                "command": "garak --probes promptinject,encoding --report red-team.jsonl",
+                "exit_code": 0,
+                "log_ref": "logs/garak.jsonl",
+            },
+            {
+                "id": "optimization",
+                "command": "python optimize_agent.py --optimizer AgentOptimizer",
+                "exit_code": 0,
+                "log_ref": "logs/optimization.log",
+            },
+        ],
+        "logs": [
+            {"id": "checkout_log", "path": "logs/checkout.log", "redacted": True},
+            {"id": "garak_log", "path": "logs/garak.jsonl", "redacted": True},
+            {"id": "ui_log", "path": "logs/playwright-ui.log", "redacted": True},
+        ],
+        "artifacts": [
+            {"id": "trace", "type": "trace", "path": "artifacts/trace.jsonl"},
+            {"id": "eval", "type": "eval_report", "path": "artifacts/eval.json"},
+            {"id": "screenshot", "type": "screenshot", "path": "artifacts/ui.png"},
+        ],
+        "simulations": [{"id": "sim_voice_sip", "status": "passed", "provider": "livekit_bridge"}],
+        "evals": [{"id": "eval_agent_report", "status": "passed", "metrics": {"workspace_run_quality": 1.0}}],
+        "optimization_runs": [{"id": "opt_agentoptimizer", "status": "passed", "best_score": 0.97}],
+        "red_team_runs": [
+            {
+                "id": "rt_owasp",
+                "framework": "garak",
+                "taxonomies": ["owasp_llm_top_10", "agentic_ai"],
+                "attack_types": ["prompt_injection", "secret_exfiltration", "tool_abuse"],
+                "status": "passed",
+                "findings": [{"id": "rt_low_1", "severity": "low", "status": "accepted"}],
+            }
+        ],
+        "observability": {
+            "platform": "futureagi",
+            "traces": ["trace_workspace"],
+            "logs": ["logs/checkout.log", "logs/garak.jsonl"],
+            "webhooks": ["workspace_run.completed"],
+        },
+        "ui_verification": {
+            "opened": True,
+            "url": "https://app.futureagi.com/workspace-runs/ws_123",
+            "screenshot": "artifacts/ui.png",
+            "status": "verified",
+        },
+        "credentials": [
+            {"provider": "github", "ref": "GITHUB_APP_INSTALLATION_TOKEN", "status": "verified"},
+            {"provider": "futureagi", "ref": "FI_API_KEY", "status": "verified"},
+        ],
+        "security": {
+            "sandbox": "ephemeral_container",
+            "secrets_redacted": True,
+            "policy_gates": ["network_egress_allowlist", "human_approval_for_write"],
+            "secret_leak_count": 0,
+        },
+    }
+    normalized = normalize_workspace_run_manifest(
+        manifest,
+        required_evidence=[
+            "repository",
+            "checkout",
+            "commit_sha",
+            "command",
+            "log",
+            "artifact",
+            "simulation",
+            "eval",
+            "optimization",
+            "red_team",
+            "security",
+            "secret_redaction",
+            "ui_verification",
+            "observability",
+            "futureagi_platform",
+        ],
+    )
+    assert normalized["summary"]["missing_required_evidence"] == []
+    assert normalized["summary"]["open_red_team_finding_count"] == 0
+    assert {"workspace_run", "github", "garak", "red_team", "futureagi_platform"} <= set(normalized["signals"])
+
+    async def agent(input):
+        return AgentResponse(
+            content=(
+                "Workspace run inspected. GitHub checkout, tests, red-team probes, UI verification, "
+                "Future AGI observability, evals, and optimization evidence are attached."
+            ),
+            tool_calls=[
+                {"id": "status", "name": "workspace_run_status", "arguments": {}},
+                {"id": "commands", "name": "list_workspace_run_commands", "arguments": {"kind": "red_team"}},
+                {"id": "inspect", "name": "inspect_workspace_run_command", "arguments": {"id": "unit_tests"}},
+                {"id": "artifacts", "name": "list_workspace_run_artifacts", "arguments": {"type": "screenshot"}},
+                {"id": "redteam", "name": "list_workspace_red_team_runs", "arguments": {"taxonomy": "owasp_llm_top_10"}},
+                {"id": "gaps", "name": "list_workspace_run_gaps", "arguments": {}},
+            ],
+        )
+
+    report = await LocalTextEngine().run(
+        scenario=_scenario(),
+        agent_callback=agent,
+        environment=WorkspaceRunEnvironment(
+            manifest,
+            required_evidence=[
+                "repository",
+                "checkout",
+                "command",
+                "log",
+                "artifact",
+                "red_team",
+                "futureagi_platform",
+            ],
+        ),
+        max_turns=1,
+        min_turns=1,
+    )
+    result = report.results[0]
+    workspace_state = result.metadata["environment_state"]["workspace_run_manifest"]
+    assert workspace_state["platform"] == "futureagi"
+    assert workspace_state["summary"]["passed_command_count"] == 4
+    assert {"workspace_run_status", "list_workspace_run_commands", "list_workspace_red_team_runs"} <= {
+        tool["name"] for tool in result.tool_calls
+    }
+
+    evaluation = evaluate_agent_report(
+        report,
+        config={
+            "required_tools": [
+                "workspace_run_status",
+                "list_workspace_run_commands",
+                "inspect_workspace_run_command",
+                "list_workspace_run_artifacts",
+                "list_workspace_red_team_runs",
+                "list_workspace_run_gaps",
+            ],
+            "available_tools": [
+                "workspace_run_status",
+                "list_workspace_run_commands",
+                "inspect_workspace_run_command",
+                "list_workspace_run_artifacts",
+                "list_workspace_red_team_runs",
+                "list_workspace_run_gaps",
+            ],
+            "required_workspace_run": [
+                "workspace_run",
+                "repository",
+                "checkout",
+                "commit_sha",
+                "command",
+                "test",
+                "log",
+                "artifact",
+                "simulation",
+                "eval",
+                "optimization",
+                "red_team",
+                "garak",
+                "owasp_llm_top_10",
+                "security",
+                "secret_redaction",
+                "ui_verification",
+                "observability",
+                "credential",
+                "futureagi_platform",
+            ],
+            "workspace_run_quality": {
+                "require_repository": True,
+                "require_checkout": True,
+                "require_commit_sha": True,
+                "require_clean_exit": True,
+                "require_logs": True,
+                "require_artifacts": True,
+                "require_simulation": True,
+                "require_evals": True,
+                "require_optimization": True,
+                "require_red_team": True,
+                "require_security_gate": True,
+                "require_secret_redaction": True,
+                "require_no_secret_leakage": True,
+                "require_ui_verification": True,
+                "require_observability": True,
+                "require_futureagi_platform": True,
+                "min_command_count": 4,
+                "min_passed_commands": 4,
+                "min_log_count": 3,
+                "min_artifact_count": 3,
+                "min_red_team_runs": 1,
+                "min_eval_count": 1,
+                "min_optimization_count": 1,
+                "max_failed_commands": 0,
+                "max_open_red_team_findings": 0,
+                "max_secret_leaks": 0,
+                "required_red_team_taxonomies": ["owasp_llm_top_10"],
+                "required_artifact_types": ["trace", "eval_report", "screenshot"],
+            },
+        },
+        threshold=0.9,
+    )
+    metrics = evaluation.summary["metric_averages"]
+    assert metrics["workspace_run_coverage"] == 1.0
+    assert metrics["workspace_run_quality"] == 1.0
+
+    loaded = load_workspace_run_manifest(manifest, required_evidence=["repository", "red_team"])
+    assert isinstance(loaded, WorkspaceRunEnvironment)
 
 
 @pytest.mark.asyncio

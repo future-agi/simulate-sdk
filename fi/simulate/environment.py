@@ -6,6 +6,7 @@ import io
 import json
 import math
 import os
+import re
 import struct
 import urllib.request
 import wave
@@ -6952,6 +6953,261 @@ class AgentIntegrationEnvironment(EnvironmentAdapter):
         return copy.deepcopy(self.manifest)
 
 
+class WorkspaceRunEnvironment(EnvironmentAdapter):
+    """
+    Replay autonomous repository checkout/run evidence as a simulation surface.
+
+    This is the platform-control-plane boundary for Future AGI: code access,
+    checkout provenance, command logs, artifacts, simulations, evals,
+    optimization runs, UI verification, and red-team evidence become one
+    auditable manifest. It is intentionally deterministic; live GitHub/provider
+    execution must attach real logs and credentials before production claims.
+    """
+
+    name = "workspace_run"
+
+    def __init__(
+        self,
+        manifest: Any = None,
+        *,
+        name: str = "workspace-run-manifest",
+        platform: str = "futureagi",
+        repository: Optional[Mapping[str, Any]] = None,
+        checkout: Optional[Mapping[str, Any]] = None,
+        commands: Optional[Iterable[Any]] = None,
+        logs: Optional[Iterable[Any]] = None,
+        artifacts: Optional[Iterable[Any]] = None,
+        simulations: Optional[Iterable[Any]] = None,
+        evals: Optional[Iterable[Any] | Mapping[str, Any]] = None,
+        optimization_runs: Optional[Iterable[Any]] = None,
+        red_team_runs: Optional[Iterable[Any]] = None,
+        observability: Optional[Mapping[str, Any]] = None,
+        ui_verification: Optional[Mapping[str, Any]] = None,
+        credentials: Optional[Iterable[Any]] = None,
+        security: Optional[Mapping[str, Any]] = None,
+        required_evidence: Optional[Iterable[str]] = None,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        self.initial_manifest = normalize_workspace_run_manifest(
+            manifest,
+            name=name,
+            platform=platform,
+            repository=repository,
+            checkout=checkout,
+            commands=commands,
+            logs=logs,
+            artifacts=artifacts,
+            simulations=simulations,
+            evals=evals,
+            optimization_runs=optimization_runs,
+            red_team_runs=red_team_runs,
+            observability=observability,
+            ui_verification=ui_verification,
+            credentials=credentials,
+            security=security,
+            required_evidence=required_evidence,
+            metadata=metadata,
+        )
+        self.manifest: Dict[str, Any] = {}
+
+    def reset(self, **context: Any) -> EnvironmentSnapshot:
+        self.manifest = copy.deepcopy(self.initial_manifest)
+        return EnvironmentSnapshot(
+            tools=self._tool_specs(),
+            artifacts=[self._trace_artifact()],
+            events=[
+                SimulationEvent(
+                    type="workspace_run",
+                    name="workspace_run_manifest_ready",
+                    payload={
+                        "name": self.manifest.get("name"),
+                        "platform": self.manifest.get("platform"),
+                        "summary": copy.deepcopy(self.manifest.get("summary", {})),
+                        "signals": copy.deepcopy(self.manifest.get("signals", [])),
+                    },
+                )
+            ],
+            state={"workspace_run_manifest": self._trace_payload()},
+            metadata={"workspace_run_manifest": copy.deepcopy(self.manifest.get("summary", {}))},
+        )
+
+    def handle_tool_call(
+        self,
+        tool_call: Mapping[str, Any],
+        **context: Any,
+    ) -> Optional[ToolExecutionResult]:
+        name = _tool_name(tool_call)
+        if name not in {
+            "workspace_run_status",
+            "list_workspace_run_commands",
+            "inspect_workspace_run_command",
+            "list_workspace_run_artifacts",
+            "list_workspace_red_team_runs",
+            "list_workspace_run_gaps",
+        }:
+            return None
+        arguments = _tool_arguments(tool_call)
+        call_id = _tool_call_id(tool_call)
+
+        if name == "workspace_run_status":
+            result = self._trace_payload()
+            event_name = "workspace_run_status"
+            content = f"Workspace run manifest {self.manifest.get('name')} status recorded."
+            success = True
+            error = None
+        elif name == "list_workspace_run_commands":
+            commands = copy.deepcopy(self.manifest.get("commands", []))
+            status = _normalize_workspace_run_status(arguments.get("status"))
+            kind = _normalize_workspace_run_key(arguments.get("kind") or arguments.get("signal"))
+            if status:
+                commands = [item for item in commands if item.get("status") == status]
+            if kind:
+                commands = [item for item in commands if kind in set(item.get("signals", []))]
+            result = {"commands": commands, "count": len(commands)}
+            event_name = "workspace_run_commands_listed"
+            content = f"Listed {len(commands)} workspace run command(s)."
+            success = True
+            error = None
+        elif name == "inspect_workspace_run_command":
+            command_id = str(arguments.get("id") or arguments.get("command_id") or arguments.get("name") or "")
+            command = next(
+                (
+                    item
+                    for item in self.manifest.get("commands", [])
+                    if command_id
+                    and command_id
+                    in {str(item.get("id")), str(item.get("name")), str(item.get("command"))}
+                ),
+                None,
+            )
+            success = command is not None
+            result = {"command": copy.deepcopy(command), "query": command_id}
+            event_name = "workspace_run_command_inspected" if success else "workspace_run_command_missing"
+            content = (
+                f"Inspected workspace run command {command_id}."
+                if success
+                else f"Workspace run command not found: {command_id}"
+            )
+            error = None if success else "command_not_found"
+        elif name == "list_workspace_run_artifacts":
+            artifacts = copy.deepcopy(self.manifest.get("artifacts", []))
+            artifact_type = _normalize_workspace_run_key(arguments.get("type") or arguments.get("kind"))
+            if artifact_type:
+                artifacts = [
+                    item
+                    for item in artifacts
+                    if artifact_type
+                    in {
+                        _normalize_workspace_run_key(item.get("type")),
+                        *set(item.get("signals", [])),
+                    }
+                ]
+            result = {"artifacts": artifacts, "count": len(artifacts)}
+            event_name = "workspace_run_artifacts_listed"
+            content = f"Listed {len(artifacts)} workspace run artifact(s)."
+            success = True
+            error = None
+        elif name == "list_workspace_red_team_runs":
+            runs = copy.deepcopy(self.manifest.get("red_team_runs", []))
+            taxonomy = _normalize_workspace_run_key(arguments.get("taxonomy") or arguments.get("attack"))
+            if taxonomy:
+                runs = [
+                    item
+                    for item in runs
+                    if taxonomy
+                    in {
+                        *set(item.get("taxonomies", [])),
+                        *set(item.get("attack_types", [])),
+                        *set(item.get("signals", [])),
+                    }
+                ]
+            result = {"red_team_runs": runs, "count": len(runs)}
+            event_name = "workspace_red_team_runs_listed"
+            content = f"Listed {len(runs)} workspace red-team run(s)."
+            success = True
+            error = None
+        else:
+            summary = copy.deepcopy(self.manifest.get("summary", {}))
+            result = {
+                "missing_required_evidence": summary.get("missing_required_evidence", []),
+                "failed_commands": summary.get("failed_commands", []),
+                "open_red_team_findings": summary.get("open_red_team_findings", []),
+                "secret_leak_count": summary.get("secret_leak_count", 0),
+                "logs_with_secrets": summary.get("logs_with_secrets", []),
+                "unverified_credentials": summary.get("unverified_credentials", []),
+            }
+            event_name = "workspace_run_gaps_listed"
+            content = "Listed workspace run gaps."
+            success = True
+            error = None
+
+        return ToolExecutionResult(
+            tool_call_id=call_id,
+            tool_name=name,
+            content=content,
+            result=result,
+            success=success,
+            error=error,
+            state_updates={"workspace_run_manifest": self._trace_payload()},
+            artifacts=[self._trace_artifact()],
+            events=[
+                SimulationEvent(
+                    type="workspace_run",
+                    name=event_name,
+                    payload=result,
+                )
+            ],
+        )
+
+    def _tool_specs(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                "name": "workspace_run_status",
+                "description": "Return the normalized workspace run manifest and summary.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            {
+                "name": "list_workspace_run_commands",
+                "description": "List checkout/test/sim/eval/optimization commands, optionally filtered by status or signal.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"status": {"type": "string"}, "kind": {"type": "string"}},
+                },
+            },
+            {
+                "name": "inspect_workspace_run_command",
+                "description": "Inspect one workspace command by id, name, or command text.",
+                "parameters": {"type": "object", "properties": {"id": {"type": "string"}}},
+            },
+            {
+                "name": "list_workspace_run_artifacts",
+                "description": "List logs, reports, traces, screenshots, and other run artifacts.",
+                "parameters": {"type": "object", "properties": {"type": {"type": "string"}}},
+            },
+            {
+                "name": "list_workspace_red_team_runs",
+                "description": "List adversarial/red-team runs, optionally filtered by taxonomy or attack type.",
+                "parameters": {"type": "object", "properties": {"taxonomy": {"type": "string"}}},
+            },
+            {
+                "name": "list_workspace_run_gaps",
+                "description": "List missing evidence, failed commands, leaked secrets, unverified credentials, and open red-team findings.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        ]
+
+    def _trace_artifact(self) -> SimulationArtifact:
+        return SimulationArtifact(
+            type="trace",
+            role="environment",
+            data=self._trace_payload(),
+            metadata={"kind": "workspace_run_manifest", "platform": self.manifest.get("platform")},
+        )
+
+    def _trace_payload(self) -> Dict[str, Any]:
+        return copy.deepcopy(self.manifest)
+
+
 class OptimizerTraceEnvironment(EnvironmentAdapter):
     """
     Replay optimizer deliberation as local simulation evidence.
@@ -10724,6 +10980,13 @@ AGENT_INTEGRATION_PROVIDER_CAPABILITIES: Dict[str, List[str]] = {
     "twilio": ["phone", "sip", "websocket", "media_stream", "sms", "whatsapp"],
 }
 
+WORKSPACE_SECRET_PATTERNS = [
+    r"\bsk-[A-Za-z0-9_\-]{16,}\b",
+    r"\bAKIA[0-9A-Z]{16}\b",
+    r"\bgh[opsu]_[A-Za-z0-9_]{20,}\b",
+    r"\b(api[_-]?key|secret|token|password)\s*[:=]\s*[^\s,;]+",
+]
+
 
 def normalize_agent_integration_manifest(
     payload: Any = None,
@@ -10874,6 +11137,726 @@ def load_agent_integration_manifest(
         required_trace_frameworks=required_trace_frameworks,
         metadata={**source_metadata, **dict(metadata or {})},
     )
+
+
+def normalize_workspace_run_manifest(
+    payload: Any = None,
+    *,
+    name: str = "workspace-run-manifest",
+    platform: str = "futureagi",
+    repository: Optional[Mapping[str, Any]] = None,
+    checkout: Optional[Mapping[str, Any]] = None,
+    commands: Optional[Iterable[Any]] = None,
+    logs: Optional[Iterable[Any]] = None,
+    artifacts: Optional[Iterable[Any]] = None,
+    simulations: Optional[Iterable[Any]] = None,
+    evals: Optional[Iterable[Any] | Mapping[str, Any]] = None,
+    optimization_runs: Optional[Iterable[Any]] = None,
+    red_team_runs: Optional[Iterable[Any]] = None,
+    observability: Optional[Mapping[str, Any]] = None,
+    ui_verification: Optional[Mapping[str, Any]] = None,
+    credentials: Optional[Iterable[Any]] = None,
+    security: Optional[Mapping[str, Any]] = None,
+    required_evidence: Optional[Iterable[str]] = None,
+    metadata: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Normalize autonomous checkout/run/log/eval/optimization evidence."""
+
+    payload_dict = dict(payload) if isinstance(payload, Mapping) else {}
+    manifest_name = str(payload_dict.get("name") or name)
+    manifest_platform = _normalize_workspace_run_key(payload_dict.get("platform") or platform)
+    repository_record = _normalize_workspace_repository(
+        repository if repository is not None else payload_dict.get("repository", payload_dict.get("repo"))
+    )
+    checkout_record = _normalize_workspace_checkout(
+        checkout if checkout is not None else payload_dict.get("checkout"),
+        repository=repository_record,
+    )
+    command_records = _normalize_workspace_commands(
+        commands if commands is not None else payload_dict.get("commands")
+    )
+    log_records = _normalize_workspace_logs(
+        logs if logs is not None else payload_dict.get("logs"),
+        command_records=command_records,
+    )
+    artifact_records = _normalize_workspace_artifacts(
+        artifacts if artifacts is not None else payload_dict.get("artifacts"),
+        command_records=command_records,
+        log_records=log_records,
+    )
+    simulation_records = _normalize_workspace_named_runs(
+        simulations if simulations is not None else payload_dict.get("simulations"),
+        default_kind="simulation",
+    )
+    eval_records = _normalize_workspace_named_runs(
+        evals if evals is not None else payload_dict.get("evals", payload_dict.get("evaluation")),
+        default_kind="eval",
+    )
+    optimization_records = _normalize_workspace_named_runs(
+        optimization_runs
+        if optimization_runs is not None
+        else payload_dict.get("optimization_runs", payload_dict.get("optimizations")),
+        default_kind="optimization",
+    )
+    red_team_records = _normalize_workspace_red_team_runs(
+        red_team_runs
+        if red_team_runs is not None
+        else payload_dict.get("red_team_runs", payload_dict.get("adversarial_runs"))
+    )
+    observability_record = _normalize_workspace_mapping(
+        observability if observability is not None else payload_dict.get("observability")
+    )
+    ui_record = _normalize_workspace_mapping(
+        ui_verification
+        if ui_verification is not None
+        else payload_dict.get("ui_verification", payload_dict.get("ui"))
+    )
+    credential_records = _normalize_workspace_credentials(
+        credentials if credentials is not None else payload_dict.get("credentials")
+    )
+    security_record = _normalize_workspace_security(
+        security if security is not None else payload_dict.get("security"),
+        log_records=log_records,
+    )
+    required_keys = [
+        _normalize_workspace_run_key(item)
+        for item in _as_iterable(required_evidence if required_evidence is not None else payload_dict.get("required_evidence"))
+    ]
+    required_keys = [item for item in required_keys if item]
+    summary = _workspace_run_summary(
+        platform=manifest_platform,
+        repository=repository_record,
+        checkout=checkout_record,
+        commands=command_records,
+        logs=log_records,
+        artifacts=artifact_records,
+        simulations=simulation_records,
+        evals=eval_records,
+        optimization_runs=optimization_records,
+        red_team_runs=red_team_records,
+        observability=observability_record,
+        ui_verification=ui_record,
+        credentials=credential_records,
+        security=security_record,
+        required_evidence=required_keys,
+    )
+    signals = _workspace_run_signals(
+        platform=manifest_platform,
+        repository=repository_record,
+        checkout=checkout_record,
+        commands=command_records,
+        logs=log_records,
+        artifacts=artifact_records,
+        simulations=simulation_records,
+        evals=eval_records,
+        optimization_runs=optimization_records,
+        red_team_runs=red_team_records,
+        observability=observability_record,
+        ui_verification=ui_record,
+        credentials=credential_records,
+        security=security_record,
+        summary=summary,
+    )
+    merged_metadata = {
+        **dict(payload_dict.get("metadata") or {}),
+        **dict(metadata or {}),
+    }
+    return {
+        "kind": "workspace_run_manifest",
+        "name": manifest_name,
+        "platform": manifest_platform,
+        "repository": repository_record,
+        "checkout": checkout_record,
+        "commands": command_records,
+        "logs": log_records,
+        "artifacts": artifact_records,
+        "simulations": simulation_records,
+        "evals": eval_records,
+        "optimization_runs": optimization_records,
+        "red_team_runs": red_team_records,
+        "observability": observability_record,
+        "ui_verification": ui_record,
+        "credentials": credential_records,
+        "security": security_record,
+        "required_evidence": sorted(set(required_keys)),
+        "summary": summary,
+        "signals": signals,
+        "metadata": copy.deepcopy(merged_metadata),
+    }
+
+
+def load_workspace_run_manifest(
+    source: str | os.PathLike[str] | Mapping[str, Any] | Iterable[Any],
+    *,
+    name: str = "workspace-run-manifest",
+    platform: str = "futureagi",
+    required_evidence: Optional[Iterable[str]] = None,
+    headers: Optional[Mapping[str, str]] = None,
+    auth: Optional[Mapping[str, Any]] = None,
+    pagination: Optional[Mapping[str, Any]] = None,
+    max_pages: int = 20,
+    timeout: float = 30.0,
+    metadata: Optional[Mapping[str, Any]] = None,
+) -> WorkspaceRunEnvironment:
+    """Load a local/HTTP autonomous workspace run manifest and return an environment."""
+
+    source_metadata: Dict[str, Any] = {}
+    if isinstance(source, (str, os.PathLike)) or _is_export_source_spec(source):
+        loaded, source_metadata = _load_framework_trace_export_source_with_metadata(
+            source,
+            headers=headers,
+            auth=auth,
+            pagination=pagination,
+            max_pages=max_pages,
+            timeout=timeout,
+        )
+    else:
+        loaded = source
+    return WorkspaceRunEnvironment(
+        loaded,
+        name=name,
+        platform=platform,
+        required_evidence=required_evidence,
+        metadata={**source_metadata, **dict(metadata or {})},
+    )
+
+
+def _normalize_workspace_repository(value: Any) -> Dict[str, Any]:
+    if value in (None, "", [], {}):
+        return {}
+    if isinstance(value, str):
+        item: Dict[str, Any] = {"url": value}
+    elif isinstance(value, Mapping):
+        item = copy.deepcopy(dict(value))
+    else:
+        item = {"name": str(value)}
+    url = str(item.get("url") or item.get("clone_url") or item.get("html_url") or "")
+    provider = _normalize_workspace_run_key(item.get("provider") or ("github" if "github.com" in url else ""))
+    item.update(
+        {
+            "provider": provider,
+            "url": url,
+            "owner": str(item.get("owner") or item.get("org") or ""),
+            "name": str(item.get("name") or item.get("repo") or ""),
+            "default_branch": str(item.get("default_branch") or item.get("branch") or ""),
+            "commit_sha": str(item.get("commit_sha") or item.get("sha") or ""),
+        }
+    )
+    return item
+
+
+def _normalize_workspace_checkout(value: Any, *, repository: Mapping[str, Any]) -> Dict[str, Any]:
+    if value in (None, "", [], {}):
+        value = {}
+    item = copy.deepcopy(dict(value)) if isinstance(value, Mapping) else {"ref": str(value)}
+    item.setdefault("ref", item.get("branch") or repository.get("default_branch") or "")
+    item.setdefault("commit_sha", item.get("sha") or repository.get("commit_sha") or "")
+    item.setdefault("repository_url", repository.get("url") or "")
+    item["status"] = _normalize_workspace_run_status(item.get("status") or item.get("conclusion"))
+    if not item["status"] and (item.get("commit_sha") or item.get("ref")):
+        item["status"] = "passed"
+    return item
+
+
+def _normalize_workspace_commands(value: Any) -> List[Dict[str, Any]]:
+    records: List[Dict[str, Any]] = []
+    for index, raw in enumerate(_as_iterable(value), start=1):
+        item = copy.deepcopy(dict(raw)) if isinstance(raw, Mapping) else {"command": str(raw)}
+        command = str(item.get("command") or item.get("cmd") or item.get("name") or "")
+        exit_code = _workspace_int(item.get("exit_code", item.get("returncode")))
+        status = _normalize_workspace_run_status(item.get("status") or item.get("conclusion"))
+        if not status and exit_code is not None:
+            status = "passed" if exit_code == 0 else "failed"
+        signals = _workspace_text_signals(
+            " ".join(
+                str(part)
+                for part in [
+                    item.get("id"),
+                    item.get("name"),
+                    command,
+                    item.get("kind"),
+                    item.get("category"),
+                ]
+                if part
+            )
+        )
+        if item.get("log_ref") or item.get("stdout") or item.get("stderr") or item.get("logs"):
+            signals.add("log")
+        if item.get("artifacts"):
+            signals.add("artifact")
+        item.update(
+            {
+                "id": str(item.get("id") or item.get("name") or f"command_{index}"),
+                "name": str(item.get("name") or item.get("id") or f"command_{index}"),
+                "command": command,
+                "status": status or "unknown",
+                "exit_code": exit_code,
+                "signals": sorted(signal for signal in signals if signal),
+            }
+        )
+        records.append(item)
+    return records
+
+
+def _normalize_workspace_logs(
+    value: Any,
+    *,
+    command_records: Sequence[Mapping[str, Any]],
+) -> List[Dict[str, Any]]:
+    records: List[Dict[str, Any]] = []
+    for index, raw in enumerate(_as_iterable(value), start=1):
+        if isinstance(raw, str):
+            item = {"content": raw}
+        elif isinstance(raw, Mapping):
+            item = copy.deepcopy(dict(raw))
+        else:
+            item = {"content": str(raw)}
+        content = str(item.get("content") or item.get("text") or item.get("excerpt") or "")
+        contains_secret = _workspace_contains_secret(content)
+        item.update(
+            {
+                "id": str(item.get("id") or item.get("name") or f"log_{index}"),
+                "path": str(item.get("path") or item.get("uri") or ""),
+                "redacted": bool(item.get("redacted", item.get("secrets_redacted", False))),
+                "contains_secret": bool(item.get("contains_secret", contains_secret)),
+                "signals": sorted({"log", *_workspace_text_signals(content), *_as_iterable(item.get("signals"))}),
+            }
+        )
+        records.append(item)
+    for command in command_records:
+        if not (command.get("stdout") or command.get("stderr") or command.get("log_ref")):
+            continue
+        content = "\n".join(str(command.get(key) or "") for key in ("stdout", "stderr"))
+        records.append(
+            {
+                "id": f"{command.get('id')}_log",
+                "path": str(command.get("log_ref") or ""),
+                "command_id": command.get("id"),
+                "redacted": bool(command.get("logs_redacted", command.get("redacted", False))),
+                "contains_secret": _workspace_contains_secret(content),
+                "signals": sorted({"log", *set(command.get("signals", []))}),
+            }
+        )
+    return records
+
+
+def _normalize_workspace_artifacts(
+    value: Any,
+    *,
+    command_records: Sequence[Mapping[str, Any]],
+    log_records: Sequence[Mapping[str, Any]],
+) -> List[Dict[str, Any]]:
+    records: List[Dict[str, Any]] = []
+    for index, raw in enumerate(_as_iterable(value), start=1):
+        item = copy.deepcopy(dict(raw)) if isinstance(raw, Mapping) else {"path": str(raw)}
+        artifact_type = _normalize_workspace_run_key(item.get("type") or item.get("kind") or "")
+        path = str(item.get("path") or item.get("uri") or item.get("url") or "")
+        signals = {"artifact", artifact_type, *_workspace_text_signals(path), *_as_iterable(item.get("signals"))}
+        item.update(
+            {
+                "id": str(item.get("id") or item.get("name") or f"artifact_{index}"),
+                "type": artifact_type or "artifact",
+                "path": path,
+                "status": _normalize_workspace_run_status(item.get("status")) or "available",
+                "signals": sorted(str(signal) for signal in signals if signal),
+            }
+        )
+        records.append(item)
+    for log in log_records:
+        path = str(log.get("path") or "")
+        if path:
+            records.append(
+                {
+                    "id": f"{log.get('id')}_artifact",
+                    "type": "log",
+                    "path": path,
+                    "status": "available",
+                    "signals": sorted({"artifact", "log", *set(log.get("signals", []))}),
+                }
+            )
+    for command in command_records:
+        for artifact in _as_iterable(command.get("artifacts")):
+            item = copy.deepcopy(dict(artifact)) if isinstance(artifact, Mapping) else {"path": str(artifact)}
+            item.setdefault("id", f"{command.get('id')}_artifact_{len(records) + 1}")
+            item.setdefault("type", "artifact")
+            item.setdefault("status", "available")
+            item["signals"] = sorted({"artifact", *set(command.get("signals", [])), *_as_iterable(item.get("signals"))})
+            records.append(item)
+    return records
+
+
+def _normalize_workspace_named_runs(value: Any, *, default_kind: str) -> List[Dict[str, Any]]:
+    records: List[Dict[str, Any]] = []
+    if isinstance(value, Mapping) and default_kind == "eval":
+        runs = value.get("runs") if "runs" in value else [value]
+    else:
+        runs = value
+    for index, raw in enumerate(_as_iterable(runs), start=1):
+        item = copy.deepcopy(dict(raw)) if isinstance(raw, Mapping) else {"name": str(raw)}
+        status = _normalize_workspace_run_status(item.get("status") or item.get("conclusion"))
+        passed = bool(item.get("passed", item.get("success", status == "passed")))
+        if not status:
+            status = "passed" if passed else "failed"
+        signals = {
+            default_kind,
+            *_workspace_text_signals(str(item.get("name") or item.get("id") or item.get("command") or "")),
+            *_as_iterable(item.get("signals")),
+        }
+        item.update(
+            {
+                "id": str(item.get("id") or item.get("run_id") or f"{default_kind}_{index}"),
+                "kind": _normalize_workspace_run_key(item.get("kind") or default_kind),
+                "status": status,
+                "passed": passed and status == "passed",
+                "signals": sorted(str(signal) for signal in signals if signal),
+            }
+        )
+        records.append(item)
+    return records
+
+
+def _normalize_workspace_red_team_runs(value: Any) -> List[Dict[str, Any]]:
+    records: List[Dict[str, Any]] = []
+    for index, raw in enumerate(_as_iterable(value), start=1):
+        item = copy.deepcopy(dict(raw)) if isinstance(raw, Mapping) else {"name": str(raw)}
+        status = _normalize_workspace_run_status(item.get("status") or item.get("conclusion"))
+        findings = [_normalize_workspace_red_team_finding(finding) for finding in _as_iterable(item.get("findings"))]
+        open_high = [
+            finding
+            for finding in findings
+            if finding.get("status") not in {"closed", "fixed", "accepted"}
+            and finding.get("severity") in {"critical", "high"}
+        ]
+        passed = bool(item.get("passed", item.get("success", not open_high)))
+        if not status:
+            status = "passed" if passed else "failed"
+        taxonomies = sorted(
+            {
+                _normalize_workspace_run_key(taxonomy)
+                for taxonomy in [
+                    *_as_iterable(item.get("taxonomies")),
+                    *_as_iterable(item.get("taxonomy")),
+                    *_as_iterable(item.get("frameworks")),
+                ]
+                if _normalize_workspace_run_key(taxonomy)
+            }
+        )
+        attack_types = sorted(
+            {
+                _normalize_workspace_run_key(attack)
+                for attack in [
+                    *_as_iterable(item.get("attack_types")),
+                    *_as_iterable(item.get("attacks")),
+                    *_as_iterable(item.get("probes")),
+                ]
+                if _normalize_workspace_run_key(attack)
+            }
+        )
+        signals = {
+            "red_team",
+            "adversarial",
+            "security",
+            *taxonomies,
+            *attack_types,
+            *_workspace_text_signals(str(item.get("name") or item.get("framework") or "")),
+            *_as_iterable(item.get("signals")),
+        }
+        item.update(
+            {
+                "id": str(item.get("id") or item.get("run_id") or f"red_team_{index}"),
+                "status": status,
+                "passed": passed and status == "passed",
+                "findings": findings,
+                "taxonomies": taxonomies,
+                "attack_types": attack_types,
+                "open_high_finding_count": len(open_high),
+                "signals": sorted(str(signal) for signal in signals if signal),
+            }
+        )
+        records.append(item)
+    return records
+
+
+def _normalize_workspace_red_team_finding(value: Any) -> Dict[str, Any]:
+    item = copy.deepcopy(dict(value)) if isinstance(value, Mapping) else {"description": str(value)}
+    item["severity"] = _normalize_workspace_run_key(item.get("severity") or item.get("level") or "medium")
+    item["status"] = _normalize_workspace_run_key(item.get("status") or item.get("state") or "open")
+    item["taxonomy"] = _normalize_workspace_run_key(item.get("taxonomy") or item.get("category") or "")
+    return item
+
+
+def _normalize_workspace_mapping(value: Any) -> Dict[str, Any]:
+    if value in (None, "", [], {}):
+        return {}
+    if isinstance(value, Mapping):
+        return copy.deepcopy(dict(value))
+    return {"items": copy.deepcopy(_as_iterable(value))}
+
+
+def _normalize_workspace_credentials(value: Any) -> List[Dict[str, Any]]:
+    records: List[Dict[str, Any]] = []
+    for index, raw in enumerate(_as_iterable(value), start=1):
+        if isinstance(raw, str):
+            item = {"ref": raw}
+        elif isinstance(raw, Mapping):
+            item = copy.deepcopy(dict(raw))
+        else:
+            item = {"ref": str(raw)}
+        item.update(
+            {
+                "id": str(item.get("id") or item.get("ref") or f"credential_{index}"),
+                "provider": _normalize_workspace_run_key(item.get("provider") or item.get("service")),
+                "ref": str(item.get("ref") or item.get("env") or item.get("name") or ""),
+                "status": _normalize_workspace_run_status(item.get("status") or item.get("credential_status")) or (
+                    "configured" if item.get("ref") or item.get("env") else "missing"
+                ),
+            }
+        )
+        records.append(item)
+    return records
+
+
+def _normalize_workspace_security(value: Any, *, log_records: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+    item = _normalize_workspace_mapping(value)
+    secret_logs = [log.get("id") for log in log_records if log.get("contains_secret")]
+    if "secret_leak_count" not in item:
+        item["secret_leak_count"] = len(secret_logs)
+    if "logs_with_secrets" not in item:
+        item["logs_with_secrets"] = [str(log_id) for log_id in secret_logs if log_id]
+    if "secrets_redacted" not in item and log_records:
+        item["secrets_redacted"] = all(log.get("redacted") or not log.get("contains_secret") for log in log_records)
+    return item
+
+
+def _workspace_run_summary(
+    *,
+    platform: str,
+    repository: Mapping[str, Any],
+    checkout: Mapping[str, Any],
+    commands: Sequence[Mapping[str, Any]],
+    logs: Sequence[Mapping[str, Any]],
+    artifacts: Sequence[Mapping[str, Any]],
+    simulations: Sequence[Mapping[str, Any]],
+    evals: Sequence[Mapping[str, Any]],
+    optimization_runs: Sequence[Mapping[str, Any]],
+    red_team_runs: Sequence[Mapping[str, Any]],
+    observability: Mapping[str, Any],
+    ui_verification: Mapping[str, Any],
+    credentials: Sequence[Mapping[str, Any]],
+    security: Mapping[str, Any],
+    required_evidence: Sequence[str],
+) -> Dict[str, Any]:
+    failed_commands = [str(item.get("id")) for item in commands if item.get("status") == "failed"]
+    open_findings = [
+        str(finding.get("id") or finding.get("description") or f"{run.get('id')}:finding")
+        for run in red_team_runs
+        for finding in _as_iterable(run.get("findings"))
+        if isinstance(finding, Mapping)
+        and finding.get("status") not in {"closed", "fixed", "accepted"}
+        and finding.get("severity") in {"critical", "high"}
+    ]
+    signals = _workspace_run_signals(
+        platform=platform,
+        repository=repository,
+        checkout=checkout,
+        commands=commands,
+        logs=logs,
+        artifacts=artifacts,
+        simulations=simulations,
+        evals=evals,
+        optimization_runs=optimization_runs,
+        red_team_runs=red_team_runs,
+        observability=observability,
+        ui_verification=ui_verification,
+        credentials=credentials,
+        security=security,
+        summary={},
+    )
+    missing_required = sorted(set(required_evidence) - set(signals))
+    observability_hook_count = sum(
+        len(_as_iterable(observability.get(key)))
+        for key in ("traces", "logs", "metrics", "dashboards", "webhooks", "events")
+    )
+    if observability and not observability_hook_count:
+        observability_hook_count = 1
+    ui_verified = bool(
+        ui_verification
+        and (
+            ui_verification.get("opened")
+            or ui_verification.get("screenshot")
+            or ui_verification.get("playwright_trace")
+            or ui_verification.get("status") in {"passed", "verified", "success"}
+        )
+    )
+    unverified_credentials = [
+        str(item.get("id") or item.get("ref"))
+        for item in credentials
+        if item.get("status") not in {"verified", "live_verified", "passed"}
+    ]
+    return {
+        "has_repository": bool(repository),
+        "has_checkout": bool(checkout) and checkout.get("status") == "passed",
+        "has_commit_sha": bool(checkout.get("commit_sha") or repository.get("commit_sha")),
+        "has_futureagi_platform": platform == "futureagi",
+        "command_count": len(commands),
+        "passed_command_count": sum(1 for item in commands if item.get("status") == "passed"),
+        "failed_command_count": len(failed_commands),
+        "failed_commands": failed_commands,
+        "log_count": len(logs),
+        "artifact_count": len(artifacts),
+        "simulation_count": len(simulations),
+        "passed_simulation_count": sum(1 for item in simulations if item.get("passed")),
+        "eval_count": len(evals),
+        "passed_eval_count": sum(1 for item in evals if item.get("passed")),
+        "optimization_count": len(optimization_runs),
+        "passed_optimization_count": sum(1 for item in optimization_runs if item.get("passed")),
+        "red_team_count": len(red_team_runs),
+        "passed_red_team_count": sum(1 for item in red_team_runs if item.get("passed")),
+        "open_red_team_findings": open_findings,
+        "open_red_team_finding_count": len(open_findings),
+        "observability_hook_count": observability_hook_count,
+        "ui_verification_count": 1 if ui_verified else 0,
+        "verified_credential_count": sum(1 for item in credentials if item.get("status") in {"verified", "live_verified", "passed"}),
+        "unverified_credentials": unverified_credentials,
+        "secret_leak_count": _workspace_int(security.get("secret_leak_count")) or 0,
+        "logs_with_secrets": copy.deepcopy(_as_iterable(security.get("logs_with_secrets"))),
+        "has_sandbox": bool(security.get("sandbox") or security.get("sandboxed")),
+        "has_secret_redaction": bool(security.get("secrets_redacted")),
+        "has_policy_gate": bool(security.get("policy_gates") or security.get("approval_gates")),
+        "missing_required_evidence": missing_required,
+    }
+
+
+def _workspace_run_signals(
+    *,
+    platform: str,
+    repository: Mapping[str, Any],
+    checkout: Mapping[str, Any],
+    commands: Sequence[Mapping[str, Any]],
+    logs: Sequence[Mapping[str, Any]],
+    artifacts: Sequence[Mapping[str, Any]],
+    simulations: Sequence[Mapping[str, Any]],
+    evals: Sequence[Mapping[str, Any]],
+    optimization_runs: Sequence[Mapping[str, Any]],
+    red_team_runs: Sequence[Mapping[str, Any]],
+    observability: Mapping[str, Any],
+    ui_verification: Mapping[str, Any],
+    credentials: Sequence[Mapping[str, Any]],
+    security: Mapping[str, Any],
+    summary: Mapping[str, Any],
+) -> List[str]:
+    signals = {"workspace_run"}
+    if platform:
+        signals.update({"platform", platform})
+    if platform == "futureagi":
+        signals.add("futureagi_platform")
+    if repository:
+        signals.add("repository")
+        if repository.get("provider"):
+            signals.add(str(repository.get("provider")))
+    if checkout:
+        signals.add("checkout")
+        if checkout.get("commit_sha"):
+            signals.add("commit_sha")
+    for collection, signal in [
+        (commands, "command"),
+        (logs, "log"),
+        (artifacts, "artifact"),
+        (simulations, "simulation"),
+        (evals, "eval"),
+        (optimization_runs, "optimization"),
+        (red_team_runs, "red_team"),
+    ]:
+        if collection:
+            signals.add(signal)
+        for item in collection:
+            signals.update(str(value) for value in _as_iterable(item.get("signals")) if value)
+    if observability:
+        signals.add("observability")
+    if ui_verification:
+        signals.add("ui_verification")
+        signals.update(_workspace_text_signals(str(ui_verification)))
+    if credentials:
+        signals.add("credential")
+        for item in credentials:
+            if item.get("provider"):
+                signals.add(str(item.get("provider")))
+    if security:
+        signals.add("security")
+        if security.get("sandbox") or security.get("sandboxed"):
+            signals.add("sandbox")
+        if security.get("secrets_redacted"):
+            signals.add("secret_redaction")
+        if security.get("policy_gates") or security.get("approval_gates"):
+            signals.add("policy_gate")
+    if summary.get("secret_leak_count"):
+        signals.add("secret_leak")
+    return sorted(_normalize_workspace_run_key(signal) for signal in signals if _normalize_workspace_run_key(signal))
+
+
+def _normalize_workspace_run_status(value: Any) -> str:
+    normalized = _normalize_workspace_run_key(value)
+    if normalized in {"", "ok", "complete", "completed", "success", "succeeded", "passed", "available", "verified"}:
+        return "passed"
+    if normalized in {"fail", "failed", "error", "errored", "timeout", "timed_out", "cancelled", "canceled"}:
+        return "failed"
+    if normalized in {"queued", "pending", "running", "in_progress", "configured", "missing", "unknown"}:
+        return normalized
+    return normalized
+
+
+def _workspace_text_signals(text: str) -> set[str]:
+    normalized = _normalize_workspace_run_key(text)
+    signals: set[str] = set()
+    keyword_map = {
+        "pytest": "test",
+        "test": "test",
+        "simulation": "simulation",
+        "simulate": "simulation",
+        "eval": "eval",
+        "evaluation": "eval",
+        "optimize": "optimization",
+        "optimization": "optimization",
+        "agentoptimizer": "optimization",
+        "red_team": "red_team",
+        "redteam": "red_team",
+        "adversarial": "red_team",
+        "jailbreak": "red_team",
+        "pentest": "red_team",
+        "garak": "garak",
+        "pyrit": "pyrit",
+        "owasp": "owasp",
+        "inspect": "inspect",
+        "playwright": "ui_verification",
+        "browser": "ui_verification",
+        "screenshot": "ui_verification",
+        "github": "github",
+        "otel": "observability",
+        "opentelemetry": "observability",
+        "trace": "observability",
+        "log": "log",
+    }
+    for keyword, signal in keyword_map.items():
+        if keyword in normalized:
+            signals.add(signal)
+    return signals
+
+
+def _workspace_contains_secret(text: str) -> bool:
+    return any(re.search(pattern, text or "", flags=re.IGNORECASE) for pattern in WORKSPACE_SECRET_PATTERNS)
+
+
+def _normalize_workspace_run_key(value: Any) -> str:
+    return str(value or "").strip().lower().replace("-", "_").replace(" ", "_").replace(".", "_")
+
+
+def _workspace_int(value: Any) -> Optional[int]:
+    if value in (None, ""):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _normalize_agent_integration_agent_definition(value: Any) -> Dict[str, Any]:
