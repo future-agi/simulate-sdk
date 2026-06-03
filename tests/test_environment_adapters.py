@@ -11,6 +11,7 @@ from fi.simulate import (
     AdversarialEnvironmentPack,
     AgentResponse,
     AgentControlPlaneEnvironment,
+    AgentIntegrationEnvironment,
     AgentTrustBoundaryEnvironment,
     AutonomyLoopEnvironment,
     BrowserEnvironment,
@@ -37,6 +38,7 @@ from fi.simulate import (
     WorldOrchestrationReplayEnvironment,
     evaluate_agent_report,
     load_adversarial_attack_pack,
+    load_agent_integration_manifest,
     load_browser_trace_export,
     load_voice_export,
     load_world_attack_replay,
@@ -58,6 +60,7 @@ from fi.simulate import (
     normalize_streaming_trace_export,
     normalize_adversarial_attack_pack,
     normalize_agent_control_plane,
+    normalize_agent_integration_manifest,
     normalize_agent_trust_boundary_model,
     normalize_framework_capability_matrix,
     normalize_framework_lifecycle_trace,
@@ -2839,6 +2842,233 @@ async def test_observability_replay_environment_replays_regression_pack():
         required_trace_signals=["agent", "model", "tool"],
     )
     assert isinstance(loaded, ObservabilityReplayEnvironment)
+
+
+@pytest.mark.asyncio
+async def test_agent_integration_environment_covers_voice_chat_providers_and_traceai_frameworks():
+    manifest = {
+        "agent_definition": {
+            "id": "support-agent-v3",
+            "name": "Support Agent",
+            "type": "voice_chat",
+            "instructions": "Resolve billing and refund issues across chat and voice.",
+        },
+        "personas": [
+            {"id": "caller_billing", "name": "Asha", "channel": "phone"},
+            {"id": "chat_refund", "name": "Ravi", "channel": "chat"},
+        ],
+        "providers": [
+            {
+                "provider": "livekit_bridge",
+                "channels": ["chat", "voice", "webrtc", "phone", "sip"],
+                "trace_framework": "livekit",
+                "credential_ref": "LIVEKIT_API_KEY",
+                "credential_status": "verified",
+            },
+            {
+                "provider": "retell",
+                "channels": ["chat", "voice", "phone"],
+                "credential_ref": "RETELL_API_KEY",
+                "credential_status": "verified",
+            },
+            {
+                "provider": "elevenlabs",
+                "channels": ["voice", "phone", "sip"],
+                "credential_ref": "ELEVENLABS_API_KEY",
+                "credential_status": "verified",
+            },
+            {
+                "provider": "deepgram",
+                "channels": ["voice", "webrtc"],
+                "credential_ref": "DEEPGRAM_API_KEY",
+                "credential_status": "verified",
+            },
+            {
+                "provider": "agora",
+                "channels": ["voice", "webrtc"],
+                "credential_ref": "AGORA_APP_ID",
+                "credential_status": "verified",
+            },
+            {
+                "provider": "pipecat",
+                "channels": ["voice", "webrtc", "phone", "sip"],
+                "trace_framework": "pipecat",
+                "credential_status": "verified",
+            },
+            {
+                "provider": "twilio",
+                "channels": ["phone", "sip", "media_stream"],
+                "credential_ref": "TWILIO_ACCOUNT_SID",
+                "credential_status": "verified",
+            },
+            {
+                "provider": "langchain",
+                "channels": ["chat"],
+                "trace_framework": "langchain",
+                "credential_status": "verified",
+            },
+            {
+                "provider": "openai_agents",
+                "channels": ["chat", "voice"],
+                "trace_framework": "openai_agents",
+                "credential_status": "verified",
+            },
+        ],
+        "sessions": [
+            {
+                "id": "lk_webrtc_1",
+                "provider": "livekit_bridge",
+                "channel": "webrtc",
+                "status": "completed",
+                "trace_id": "trace_lk",
+                "transcript": "Billing issue for order 123.",
+                "webrtc_stats": [{"packetsReceived": 1000, "packetsLost": 1}],
+            },
+            {
+                "id": "twilio_sip_1",
+                "provider": "twilio",
+                "channel": "sip",
+                "status": "completed",
+                "call_id": "CA123",
+                "sip_trunk": "support-trunk",
+                "transcript": "Refund call transferred to specialist.",
+            },
+            {
+                "id": "retell_chat_1",
+                "provider": "retell",
+                "channel": "chat",
+                "status": "completed",
+                "messages": [{"role": "user", "content": "Need a refund."}],
+                "trace_id": "trace_retell_chat",
+            },
+        ],
+        "simulations": [
+            {"id": "sim_phone", "provider": "livekit_bridge", "channel": "phone", "passed": True},
+            {"id": "sim_chat", "provider": "retell", "channel": "chat", "passed": True},
+        ],
+        "observability": {
+            "platform": "futureagi",
+            "traces": ["trace_lk", "trace_retell_chat"],
+            "webhooks": ["eval_run.completed"],
+        },
+        "evals": {
+            "metrics": {
+                "agent_goal_accuracy": 0.94,
+                "voice_interaction_quality": 0.96,
+                "agent_integration_quality": 1.0,
+            }
+        },
+    }
+    normalized = normalize_agent_integration_manifest(
+        manifest,
+        required_providers=["livekit_bridge", "retell", "elevenlabs", "deepgram", "agora", "pipecat", "twilio"],
+        required_channels=["chat", "voice", "webrtc", "phone", "sip"],
+        required_trace_frameworks=["livekit", "pipecat", "langchain", "openai_agents"],
+    )
+    assert normalized["summary"]["missing_required_providers"] == []
+    assert normalized["summary"]["missing_required_channels"] == []
+    assert "futureagi_platform" in normalized["signals"]
+
+    async def agent(input):
+        return AgentResponse(
+            content="Integration manifest inspected for chat, WebRTC, phone, SIP, observability, and eval readiness.",
+            tool_calls=[
+                {"id": "status", "name": "agent_integration_status", "arguments": {}},
+                {"id": "providers", "name": "list_agent_integration_providers", "arguments": {"channel": "voice"}},
+                {"id": "livekit", "name": "inspect_agent_integration_provider", "arguments": {"provider": "livekit_bridge"}},
+                {"id": "sessions", "name": "list_agent_integration_sessions", "arguments": {"channel": "sip"}},
+                {"id": "gaps", "name": "list_agent_integration_gaps", "arguments": {}},
+            ],
+        )
+
+    report = await LocalTextEngine().run(
+        scenario=_scenario(),
+        agent_callback=agent,
+        environment=AgentIntegrationEnvironment(
+            manifest,
+            required_providers=["livekit_bridge", "retell", "elevenlabs", "deepgram", "agora", "pipecat", "twilio"],
+            required_channels=["chat", "voice", "webrtc", "phone", "sip"],
+            required_trace_frameworks=["livekit", "pipecat", "langchain", "openai_agents"],
+        ),
+        max_turns=1,
+        min_turns=1,
+    )
+    result = report.results[0]
+    integration_state = result.metadata["environment_state"]["agent_integration_manifest"]
+    assert integration_state["platform"] == "futureagi"
+    assert {"agent_integration_status", "list_agent_integration_providers", "inspect_agent_integration_provider"} <= {
+        tool["name"] for tool in result.tool_calls
+    }
+
+    evaluation = evaluate_agent_report(
+        report,
+        config={
+            "required_agent_integrations": [
+                "agent_integration",
+                "agent_definition",
+                "persona",
+                "provider",
+                "channel",
+                "simulation",
+                "observability",
+                "eval",
+                "credential",
+                "livekit_bridge",
+                "retell",
+                "elevenlabs",
+                "deepgram",
+                "agora",
+                "pipecat",
+                "twilio",
+                "webrtc",
+                "phone",
+                "sip",
+                "chat",
+                "voice",
+                "traceai_framework",
+                "futureagi_platform",
+            ],
+            "agent_integration_quality": {
+                "required_providers": ["livekit_bridge", "retell", "elevenlabs", "deepgram", "agora", "pipecat", "twilio"],
+                "required_channels": ["chat", "voice", "webrtc", "phone", "sip"],
+                "required_trace_frameworks": ["livekit", "pipecat", "langchain", "openai_agents"],
+                "required_provider_channels": {
+                    "livekit_bridge": ["chat", "voice", "webrtc", "phone", "sip"],
+                    "retell": ["chat", "voice", "phone"],
+                    "twilio": ["phone", "sip"],
+                },
+                "require_agent_definition": True,
+                "require_persona": True,
+                "require_simulation": True,
+                "require_observability": True,
+                "require_evals": True,
+                "require_verified_credentials": True,
+                "min_provider_count": 7,
+                "min_session_count": 3,
+                "min_simulation_count": 2,
+                "min_persona_count": 2,
+                "min_observability_hooks": 2,
+                "min_eval_metric_count": 3,
+                "min_verified_providers": 7,
+                "min_passed_simulations": 2,
+                "min_trace_sessions": 2,
+                "min_transcript_sessions": 2,
+                "max_missing_credentials": 0,
+                "max_failed_sessions": 0,
+            },
+        },
+        threshold=0.9,
+    )
+    metrics = evaluation.summary["metric_averages"]
+    assert metrics["agent_integration_coverage"] == 1.0
+    assert metrics["agent_integration_quality"] == 1.0
+
+    loaded = load_agent_integration_manifest(
+        manifest,
+        required_providers=["livekit_bridge"],
+        required_channels=["webrtc"],
+    )
+    assert isinstance(loaded, AgentIntegrationEnvironment)
 
 
 @pytest.mark.asyncio

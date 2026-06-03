@@ -6729,6 +6729,229 @@ class ObservabilityReplayEnvironment(EnvironmentAdapter):
         return sorted(signals)
 
 
+class AgentIntegrationEnvironment(EnvironmentAdapter):
+    """
+    Replay provider/channel integration evidence for agent simulations.
+
+    This environment is the neutral integration boundary for LiveKit, Retell,
+    ElevenLabs, Deepgram, Agora, Pipecat, Twilio, and TraceAI instrumented
+    frameworks. Future AGI belongs in `platform`, not as an agent framework.
+    """
+
+    name = "agent_integration"
+
+    def __init__(
+        self,
+        manifest: Any = None,
+        *,
+        name: str = "agent-integration-manifest",
+        platform: str = "futureagi",
+        agent_definition: Optional[Mapping[str, Any]] = None,
+        personas: Optional[Iterable[Any]] = None,
+        providers: Optional[Iterable[Any]] = None,
+        sessions: Optional[Iterable[Any]] = None,
+        simulations: Optional[Iterable[Any]] = None,
+        observability: Optional[Any] = None,
+        evals: Optional[Any] = None,
+        required_providers: Optional[Iterable[str]] = None,
+        required_channels: Optional[Iterable[str]] = None,
+        required_trace_frameworks: Optional[Iterable[str]] = None,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        self.initial_manifest = normalize_agent_integration_manifest(
+            manifest,
+            name=name,
+            platform=platform,
+            agent_definition=agent_definition,
+            personas=personas,
+            providers=providers,
+            sessions=sessions,
+            simulations=simulations,
+            observability=observability,
+            evals=evals,
+            required_providers=required_providers,
+            required_channels=required_channels,
+            required_trace_frameworks=required_trace_frameworks,
+            metadata=metadata,
+        )
+        self.manifest: Dict[str, Any] = {}
+
+    def reset(self, **context: Any) -> EnvironmentSnapshot:
+        self.manifest = copy.deepcopy(self.initial_manifest)
+        return EnvironmentSnapshot(
+            tools=self._tool_specs(),
+            artifacts=[self._trace_artifact()],
+            events=[
+                SimulationEvent(
+                    type="agent_integration",
+                    name="agent_integration_manifest_ready",
+                    payload={
+                        "name": self.manifest.get("name"),
+                        "platform": self.manifest.get("platform"),
+                        "summary": copy.deepcopy(self.manifest.get("summary", {})),
+                        "signals": copy.deepcopy(self.manifest.get("signals", [])),
+                    },
+                )
+            ],
+            state={"agent_integration_manifest": self._trace_payload()},
+            metadata={"agent_integration_manifest": copy.deepcopy(self.manifest.get("summary", {}))},
+        )
+
+    def handle_tool_call(
+        self,
+        tool_call: Mapping[str, Any],
+        **context: Any,
+    ) -> Optional[ToolExecutionResult]:
+        name = _tool_name(tool_call)
+        if name not in {
+            "agent_integration_status",
+            "list_agent_integration_providers",
+            "inspect_agent_integration_provider",
+            "list_agent_integration_sessions",
+            "list_agent_integration_gaps",
+        }:
+            return None
+        arguments = _tool_arguments(tool_call)
+        call_id = _tool_call_id(tool_call)
+
+        if name == "agent_integration_status":
+            result = self._trace_payload()
+            event_name = "agent_integration_status"
+            content = f"Agent integration manifest {self.manifest.get('name')} status recorded."
+            success = True
+        elif name == "list_agent_integration_providers":
+            providers = copy.deepcopy(self.manifest.get("providers", []))
+            channel = _normalize_agent_integration_key(arguments.get("channel") or "")
+            if channel:
+                providers = [provider for provider in providers if channel in set(provider.get("channels", []))]
+            result = {"providers": providers, "count": len(providers)}
+            event_name = "agent_integration_providers_listed"
+            content = f"Listed {len(providers)} agent integration provider(s)."
+            success = True
+        elif name == "inspect_agent_integration_provider":
+            provider_key = _normalize_agent_integration_key(
+                arguments.get("provider") or arguments.get("name") or arguments.get("id") or ""
+            )
+            provider = next(
+                (
+                    item
+                    for item in self.manifest.get("providers", [])
+                    if provider_key
+                    and provider_key
+                    in {
+                        _normalize_agent_integration_key(item.get("provider")),
+                        _normalize_agent_integration_key(item.get("id")),
+                        _normalize_agent_integration_key(item.get("name")),
+                    }
+                ),
+                None,
+            )
+            success = provider is not None
+            result = {"provider": copy.deepcopy(provider), "query": provider_key}
+            event_name = "agent_integration_provider_inspected" if success else "agent_integration_provider_missing"
+            content = (
+                f"Inspected agent integration provider {provider_key}."
+                if success
+                else f"Agent integration provider not found: {provider_key}"
+            )
+        elif name == "list_agent_integration_sessions":
+            sessions = copy.deepcopy(self.manifest.get("sessions", []))
+            provider = _normalize_agent_integration_key(arguments.get("provider") or "")
+            channel = _normalize_agent_integration_key(arguments.get("channel") or "")
+            if provider:
+                sessions = [
+                    item
+                    for item in sessions
+                    if _normalize_agent_integration_key(item.get("provider")) == provider
+                ]
+            if channel:
+                sessions = [
+                    item
+                    for item in sessions
+                    if _normalize_agent_integration_key(item.get("channel")) == channel
+                ]
+            result = {"sessions": sessions, "count": len(sessions)}
+            event_name = "agent_integration_sessions_listed"
+            content = f"Listed {len(sessions)} agent integration session(s)."
+            success = True
+        else:
+            summary = copy.deepcopy(self.manifest.get("summary", {}))
+            result = {
+                "missing_required_providers": summary.get("missing_required_providers", []),
+                "missing_required_channels": summary.get("missing_required_channels", []),
+                "missing_required_trace_frameworks": summary.get("missing_required_trace_frameworks", []),
+                "providers_without_verified_credentials": summary.get("providers_without_verified_credentials", []),
+                "failed_sessions": summary.get("failed_sessions", []),
+            }
+            event_name = "agent_integration_gaps_listed"
+            content = "Listed agent integration gaps."
+            success = True
+
+        return ToolExecutionResult(
+            tool_call_id=call_id,
+            tool_name=name,
+            content=content,
+            result=result,
+            success=success,
+            error=None if success else "provider_not_found",
+            state_updates={"agent_integration_manifest": self._trace_payload()},
+            artifacts=[self._trace_artifact()],
+            events=[
+                SimulationEvent(
+                    type="agent_integration",
+                    name=event_name,
+                    payload=result,
+                )
+            ],
+        )
+
+    def _tool_specs(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                "name": "agent_integration_status",
+                "description": "Return the normalized agent integration manifest and summary.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            {
+                "name": "list_agent_integration_providers",
+                "description": "List configured provider integrations, optionally filtered by channel.",
+                "parameters": {"type": "object", "properties": {"channel": {"type": "string"}}},
+            },
+            {
+                "name": "inspect_agent_integration_provider",
+                "description": "Inspect one configured provider integration by provider, name, or id.",
+                "parameters": {"type": "object", "properties": {"provider": {"type": "string"}}},
+            },
+            {
+                "name": "list_agent_integration_sessions",
+                "description": "List replayed sessions, optionally filtered by provider or channel.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "provider": {"type": "string"},
+                        "channel": {"type": "string"},
+                    },
+                },
+            },
+            {
+                "name": "list_agent_integration_gaps",
+                "description": "List missing providers, channels, trace frameworks, credentials, and failed sessions.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        ]
+
+    def _trace_artifact(self) -> SimulationArtifact:
+        return SimulationArtifact(
+            type="trace",
+            role="environment",
+            data=self._trace_payload(),
+            metadata={"kind": "agent_integration_manifest", "platform": self.manifest.get("platform")},
+        )
+
+    def _trace_payload(self) -> Dict[str, Any]:
+        return copy.deepcopy(self.manifest)
+
+
 class OptimizerTraceEnvironment(EnvironmentAdapter):
     """
     Replay optimizer deliberation as local simulation evidence.
@@ -10435,6 +10658,583 @@ def load_observability_replay_pack(
         required_trace_signals=required_trace_signals,
         metadata=merged_metadata,
     )
+
+
+TRACEAI_SUPPORTED_AGENT_FRAMEWORKS = {
+    "a2a",
+    "agno",
+    "anthropic",
+    "autogen",
+    "bedrock",
+    "beeai",
+    "cerebras",
+    "chromadb",
+    "claude_agent_sdk",
+    "cohere",
+    "crewai",
+    "deepseek",
+    "dspy",
+    "fireworks",
+    "google_adk",
+    "google_genai",
+    "groq",
+    "guardrails",
+    "haystack",
+    "huggingface",
+    "instructor",
+    "lancedb",
+    "langchain",
+    "llamaindex",
+    "litellm",
+    "livekit",
+    "mastra",
+    "mcp",
+    "milvus",
+    "mistralai",
+    "mongodb_vector",
+    "ollama",
+    "openai",
+    "openai_agents",
+    "pgvector",
+    "pipecat",
+    "pinecone",
+    "portkey",
+    "pydantic_ai",
+    "qdrant",
+    "redis_vector",
+    "smolagents",
+    "strands",
+    "together",
+    "vercel",
+    "vertexai",
+    "vllm",
+    "weaviate",
+    "xai",
+}
+
+
+AGENT_INTEGRATION_PROVIDER_CAPABILITIES: Dict[str, List[str]] = {
+    "livekit_bridge": ["chat", "voice", "webrtc", "phone", "sip", "video", "data", "observability"],
+    "livekit": ["webrtc", "phone", "sip", "system_engine", "transport"],
+    "retell": ["chat", "voice", "phone", "web_call", "webhook", "analysis"],
+    "elevenlabs": ["voice", "phone", "sip", "twilio", "websocket", "agent_workflow"],
+    "deepgram": ["voice", "stt", "tts", "websocket", "livekit", "agent_api"],
+    "agora": ["voice", "webrtc", "tts", "multimodal", "realtime_state"],
+    "pipecat": ["voice", "webrtc", "websocket", "phone", "sip", "twilio", "livekit"],
+    "twilio": ["phone", "sip", "websocket", "media_stream", "sms", "whatsapp"],
+}
+
+
+def normalize_agent_integration_manifest(
+    payload: Any = None,
+    *,
+    name: str = "agent-integration-manifest",
+    platform: str = "futureagi",
+    agent_definition: Optional[Mapping[str, Any]] = None,
+    personas: Optional[Iterable[Any]] = None,
+    providers: Optional[Iterable[Any]] = None,
+    sessions: Optional[Iterable[Any]] = None,
+    simulations: Optional[Iterable[Any]] = None,
+    observability: Optional[Any] = None,
+    evals: Optional[Any] = None,
+    required_providers: Optional[Iterable[str]] = None,
+    required_channels: Optional[Iterable[str]] = None,
+    required_trace_frameworks: Optional[Iterable[str]] = None,
+    metadata: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Normalize provider, channel, persona, simulation, observability, and eval evidence."""
+
+    payload_dict = dict(payload) if isinstance(payload, Mapping) else {}
+    manifest_name = str(payload_dict.get("name") or name)
+    manifest_platform = _normalize_agent_integration_key(payload_dict.get("platform") or platform)
+    agent_def = _normalize_agent_integration_agent_definition(
+        agent_definition if agent_definition is not None else payload_dict.get("agent_definition")
+    )
+    persona_records = _normalize_agent_integration_personas(
+        personas if personas is not None else payload_dict.get("personas")
+    )
+    provider_records = _normalize_agent_integration_providers(
+        providers if providers is not None else payload_dict.get("providers")
+    )
+    session_records = _normalize_agent_integration_sessions(
+        sessions if sessions is not None else payload_dict.get("sessions")
+    )
+    simulation_records = _normalize_agent_integration_simulations(
+        simulations if simulations is not None else payload_dict.get("simulations")
+    )
+    observability_record = _normalize_agent_integration_observability(
+        observability if observability is not None else payload_dict.get("observability")
+    )
+    eval_record = _normalize_agent_integration_evals(
+        evals if evals is not None else payload_dict.get("evals", payload_dict.get("evaluation"))
+    )
+
+    required_provider_keys = [
+        _normalize_agent_integration_provider_name(item)
+        for item in _as_iterable(required_providers if required_providers is not None else payload_dict.get("required_providers"))
+    ]
+    required_provider_keys = [item for item in required_provider_keys if item]
+    required_channel_keys = [
+        _normalize_agent_integration_channel(item)
+        for item in _as_iterable(required_channels if required_channels is not None else payload_dict.get("required_channels"))
+    ]
+    required_channel_keys = [item for item in required_channel_keys if item]
+    required_framework_keys = [
+        _normalize_agent_integration_provider_name(item)
+        for item in _as_iterable(
+            required_trace_frameworks
+            if required_trace_frameworks is not None
+            else payload_dict.get("required_trace_frameworks")
+        )
+    ]
+    required_framework_keys = [item for item in required_framework_keys if item]
+
+    summary = _agent_integration_summary(
+        agent_definition=agent_def,
+        personas=persona_records,
+        providers=provider_records,
+        sessions=session_records,
+        simulations=simulation_records,
+        observability=observability_record,
+        evals=eval_record,
+        required_providers=required_provider_keys,
+        required_channels=required_channel_keys,
+        required_trace_frameworks=required_framework_keys,
+    )
+    signals = _agent_integration_signals(
+        platform=manifest_platform,
+        agent_definition=agent_def,
+        personas=persona_records,
+        providers=provider_records,
+        sessions=session_records,
+        simulations=simulation_records,
+        observability=observability_record,
+        evals=eval_record,
+        summary=summary,
+    )
+    merged_metadata = {
+        **dict(payload_dict.get("metadata") or {}),
+        **dict(metadata or {}),
+    }
+    return {
+        "kind": "agent_integration_manifest",
+        "name": manifest_name,
+        "platform": manifest_platform,
+        "agent_definition": agent_def,
+        "personas": persona_records,
+        "providers": provider_records,
+        "sessions": session_records,
+        "simulations": simulation_records,
+        "observability": observability_record,
+        "evals": eval_record,
+        "required_providers": sorted(set(required_provider_keys)),
+        "required_channels": sorted(set(required_channel_keys)),
+        "required_trace_frameworks": sorted(set(required_framework_keys)),
+        "summary": summary,
+        "signals": signals,
+        "metadata": copy.deepcopy(merged_metadata),
+    }
+
+
+def load_agent_integration_manifest(
+    source: str | os.PathLike[str] | Mapping[str, Any] | Iterable[Any],
+    *,
+    name: str = "agent-integration-manifest",
+    platform: str = "futureagi",
+    required_providers: Optional[Iterable[str]] = None,
+    required_channels: Optional[Iterable[str]] = None,
+    required_trace_frameworks: Optional[Iterable[str]] = None,
+    headers: Optional[Mapping[str, str]] = None,
+    auth: Optional[Mapping[str, Any]] = None,
+    pagination: Optional[Mapping[str, Any]] = None,
+    max_pages: int = 20,
+    timeout: float = 30.0,
+    metadata: Optional[Mapping[str, Any]] = None,
+) -> AgentIntegrationEnvironment:
+    """Load a local/HTTP provider integration manifest and return an environment."""
+
+    source_metadata: Dict[str, Any] = {}
+    if isinstance(source, (str, os.PathLike)) or _is_export_source_spec(source):
+        loaded, source_metadata = _load_framework_trace_export_source_with_metadata(
+            source,
+            headers=headers,
+            auth=auth,
+            pagination=pagination,
+            max_pages=max_pages,
+            timeout=timeout,
+        )
+    else:
+        loaded = source
+    return AgentIntegrationEnvironment(
+        loaded,
+        name=name,
+        platform=platform,
+        required_providers=required_providers,
+        required_channels=required_channels,
+        required_trace_frameworks=required_trace_frameworks,
+        metadata={**source_metadata, **dict(metadata or {})},
+    )
+
+
+def _normalize_agent_integration_agent_definition(value: Any) -> Dict[str, Any]:
+    if value in (None, "", [], {}):
+        return {}
+    if hasattr(value, "model_dump"):
+        value = value.model_dump()
+    elif hasattr(value, "dict"):
+        value = value.dict()
+    if not isinstance(value, Mapping):
+        return {"name": str(value)}
+    item = copy.deepcopy(dict(value))
+    if item.get("system_prompt") and "instructions" not in item:
+        item["instructions"] = item.get("system_prompt")
+    if item.get("agent_type") and "type" not in item:
+        item["type"] = item.get("agent_type")
+    return item
+
+
+def _normalize_agent_integration_personas(value: Any) -> List[Dict[str, Any]]:
+    records: List[Dict[str, Any]] = []
+    for index, persona in enumerate(_as_iterable(value), start=1):
+        if hasattr(persona, "model_dump"):
+            persona = persona.model_dump()
+        elif hasattr(persona, "dict"):
+            persona = persona.dict()
+        if isinstance(persona, Mapping):
+            item = copy.deepcopy(dict(persona))
+        else:
+            item = {"name": str(persona)}
+        item.setdefault("id", item.get("name") or f"persona_{index}")
+        records.append(item)
+    return records
+
+
+def _normalize_agent_integration_providers(value: Any) -> List[Dict[str, Any]]:
+    records: List[Dict[str, Any]] = []
+    for index, raw in enumerate(_as_iterable(value), start=1):
+        if isinstance(raw, str):
+            item = {"provider": raw}
+        elif isinstance(raw, Mapping):
+            item = copy.deepcopy(dict(raw))
+        else:
+            item = {"provider": str(raw)}
+        provider = _normalize_agent_integration_provider_name(
+            item.get("provider") or item.get("name") or item.get("framework") or item.get("vendor")
+        )
+        if not provider:
+            provider = f"provider_{index}"
+        channels = {
+            _normalize_agent_integration_channel(channel)
+            for channel in [
+                *_as_iterable(item.get("channels")),
+                *_as_iterable(item.get("modalities")),
+                *_as_iterable(item.get("capabilities")),
+                *AGENT_INTEGRATION_PROVIDER_CAPABILITIES.get(provider, []),
+            ]
+            if _normalize_agent_integration_channel(channel)
+        }
+        trace_framework = _normalize_agent_integration_provider_name(
+            item.get("trace_framework") or item.get("framework")
+        )
+        if provider in TRACEAI_SUPPORTED_AGENT_FRAMEWORKS and not trace_framework:
+            trace_framework = provider
+        credential_status = _normalize_agent_integration_key(
+            item.get("credential_status")
+            or item.get("credentials_status")
+            or ("verified" if item.get("credential_verified") is True else "")
+        )
+        credential_ref = item.get("credential_ref") or item.get("credentials_ref") or item.get("env")
+        if not credential_status:
+            credential_status = "configured" if credential_ref else "missing"
+        item.update(
+            {
+                "id": str(item.get("id") or provider),
+                "provider": provider,
+                "name": str(item.get("name") or provider),
+                "channels": sorted(channels),
+                "trace_framework": trace_framework,
+                "credential_ref": credential_ref,
+                "credential_status": credential_status,
+                "integration_points": sorted(
+                    {
+                        _normalize_agent_integration_key(point)
+                        for point in [
+                            *_as_iterable(item.get("integration_points")),
+                            *_as_iterable(item.get("integrations")),
+                            *_as_iterable(item.get("webhooks")),
+                            *_as_iterable(item.get("tools")),
+                        ]
+                        if _normalize_agent_integration_key(point)
+                    }
+                ),
+            }
+        )
+        records.append(item)
+    return records
+
+
+def _normalize_agent_integration_sessions(value: Any) -> List[Dict[str, Any]]:
+    records: List[Dict[str, Any]] = []
+    for index, raw in enumerate(_as_iterable(value), start=1):
+        item = copy.deepcopy(dict(raw)) if isinstance(raw, Mapping) else {"transcript": str(raw)}
+        provider = _normalize_agent_integration_provider_name(item.get("provider") or item.get("framework"))
+        channel = _normalize_agent_integration_channel(item.get("channel") or item.get("modality") or item.get("call_type"))
+        if not channel and provider in {"retell", "twilio"}:
+            channel = "phone" if item.get("phone_number") or item.get("call_id") else "voice"
+        if not channel:
+            channel = "chat" if item.get("messages") else "voice" if item.get("audio") or item.get("transcript") else "session"
+        signals = {
+            provider,
+            channel,
+            *[
+                _normalize_agent_integration_key(signal)
+                for signal in _as_iterable(item.get("signals"))
+                if _normalize_agent_integration_key(signal)
+            ],
+        }
+        if item.get("trace_id") or item.get("spans") or item.get("events"):
+            signals.add("trace")
+        if item.get("transcript") or item.get("transcript_object") or item.get("messages"):
+            signals.add("transcript")
+        if item.get("webrtc_stats") or item.get("rtc_stats"):
+            signals.add("webrtc")
+        if item.get("sip_trunk") or item.get("sip_call_id"):
+            signals.add("sip")
+        if item.get("phone_number") or item.get("call_id"):
+            signals.add("phone")
+        if item.get("observability"):
+            signals.add("observability")
+        if item.get("evals") or item.get("evaluation") or item.get("metrics"):
+            signals.add("eval")
+        item.update(
+            {
+                "id": str(item.get("id") or item.get("session_id") or item.get("call_id") or f"session_{index}"),
+                "provider": provider,
+                "channel": channel,
+                "status": _normalize_agent_integration_status(item.get("status") or item.get("call_status")),
+                "signals": sorted(signal for signal in signals if signal),
+            }
+        )
+        records.append(item)
+    return records
+
+
+def _normalize_agent_integration_simulations(value: Any) -> List[Dict[str, Any]]:
+    records: List[Dict[str, Any]] = []
+    for index, raw in enumerate(_as_iterable(value), start=1):
+        item = copy.deepcopy(dict(raw)) if isinstance(raw, Mapping) else {"scenario": str(raw)}
+        item.update(
+            {
+                "id": str(item.get("id") or item.get("run_id") or f"simulation_{index}"),
+                "provider": _normalize_agent_integration_provider_name(item.get("provider") or item.get("framework")),
+                "channel": _normalize_agent_integration_channel(item.get("channel") or item.get("modality")),
+                "passed": bool(item.get("passed", item.get("success", True))),
+            }
+        )
+        records.append(item)
+    return records
+
+
+def _normalize_agent_integration_observability(value: Any) -> Dict[str, Any]:
+    if value in (None, "", [], {}):
+        return {}
+    if isinstance(value, Mapping):
+        item = copy.deepcopy(dict(value))
+    else:
+        item = {"events": copy.deepcopy(_as_iterable(value))}
+    item.setdefault("platform", item.get("source") or "futureagi")
+    return item
+
+
+def _normalize_agent_integration_evals(value: Any) -> Dict[str, Any]:
+    if value in (None, "", [], {}):
+        return {}
+    if isinstance(value, Mapping):
+        return copy.deepcopy(dict(value))
+    return {"runs": copy.deepcopy(_as_iterable(value))}
+
+
+def _agent_integration_summary(
+    *,
+    agent_definition: Mapping[str, Any],
+    personas: Sequence[Mapping[str, Any]],
+    providers: Sequence[Mapping[str, Any]],
+    sessions: Sequence[Mapping[str, Any]],
+    simulations: Sequence[Mapping[str, Any]],
+    observability: Mapping[str, Any],
+    evals: Mapping[str, Any],
+    required_providers: Sequence[str],
+    required_channels: Sequence[str],
+    required_trace_frameworks: Sequence[str],
+) -> Dict[str, Any]:
+    observed_providers = {
+        _normalize_agent_integration_provider_name(item.get("provider"))
+        for item in [*providers, *sessions, *simulations]
+    }
+    observed_channels = {
+        _normalize_agent_integration_channel(channel)
+        for provider in providers
+        for channel in _as_iterable(provider.get("channels"))
+    }
+    observed_channels.update(
+        _normalize_agent_integration_channel(item.get("channel"))
+        for item in [*sessions, *simulations]
+    )
+    trace_frameworks = {
+        _normalize_agent_integration_provider_name(item.get("trace_framework"))
+        for item in providers
+        if item.get("trace_framework")
+    }
+    trace_frameworks.update(
+        _normalize_agent_integration_provider_name(item.get("framework") or item.get("trace_framework"))
+        for item in sessions
+        if item.get("framework") or item.get("trace_framework")
+    )
+    missing_providers = sorted(set(required_providers) - {item for item in observed_providers if item})
+    missing_channels = sorted(set(required_channels) - {item for item in observed_channels if item})
+    missing_trace_frameworks = sorted(set(required_trace_frameworks) - {item for item in trace_frameworks if item})
+    providers_without_verified_credentials = sorted(
+        item.get("provider")
+        for item in providers
+        if item.get("provider") and item.get("credential_status") not in {"verified", "live_verified"}
+    )
+    failed_sessions = [
+        item.get("id")
+        for item in sessions
+        if item.get("status") in {"failed", "error", "timeout", "dial_failed", "cancelled"}
+    ]
+    eval_metrics = set(_agent_integration_dict(evals.get("metrics")).keys())
+    for run in _as_iterable(evals.get("runs")):
+        if isinstance(run, Mapping):
+            eval_metrics.update(str(metric) for metric in _agent_integration_dict(run.get("metrics")).keys())
+    observability_hook_count = sum(
+        len(_as_iterable(observability.get(key)))
+        for key in ("traces", "webhooks", "alerts", "incidents", "dashboards", "runs")
+    )
+    if observability and not observability_hook_count:
+        observability_hook_count = 1
+    return {
+        "has_agent_definition": bool(agent_definition),
+        "persona_count": len(personas),
+        "provider_count": len(providers),
+        "session_count": len(sessions),
+        "simulation_count": len(simulations),
+        "passed_simulation_count": sum(1 for item in simulations if item.get("passed")),
+        "failed_session_count": len(failed_sessions),
+        "observability_hook_count": observability_hook_count,
+        "eval_metric_count": len(eval_metrics),
+        "observed_providers": sorted(item for item in observed_providers if item),
+        "observed_channels": sorted(item for item in observed_channels if item),
+        "trace_frameworks": sorted(item for item in trace_frameworks if item),
+        "missing_required_providers": missing_providers,
+        "missing_required_channels": missing_channels,
+        "missing_required_trace_frameworks": missing_trace_frameworks,
+        "verified_provider_count": sum(
+            1 for item in providers if item.get("credential_status") in {"verified", "live_verified"}
+        ),
+        "providers_without_verified_credentials": providers_without_verified_credentials,
+        "failed_sessions": failed_sessions,
+        "transcript_session_count": sum(1 for item in sessions if "transcript" in set(item.get("signals", []))),
+        "trace_session_count": sum(1 for item in sessions if "trace" in set(item.get("signals", []))),
+        "eval_metrics": sorted(eval_metrics),
+    }
+
+
+def _agent_integration_signals(
+    *,
+    platform: str,
+    agent_definition: Mapping[str, Any],
+    personas: Sequence[Mapping[str, Any]],
+    providers: Sequence[Mapping[str, Any]],
+    sessions: Sequence[Mapping[str, Any]],
+    simulations: Sequence[Mapping[str, Any]],
+    observability: Mapping[str, Any],
+    evals: Mapping[str, Any],
+    summary: Mapping[str, Any],
+) -> List[str]:
+    signals = {"agent_integration", "provider", "channel"}
+    if platform:
+        signals.add(platform)
+        signals.add("platform")
+    if platform == "futureagi":
+        signals.add("futureagi_platform")
+    if agent_definition:
+        signals.add("agent_definition")
+    if personas:
+        signals.add("persona")
+    if sessions:
+        signals.add("session")
+    if simulations:
+        signals.add("simulation")
+    if observability:
+        signals.add("observability")
+    if evals:
+        signals.add("eval")
+    if summary.get("verified_provider_count", 0):
+        signals.add("credential")
+    for provider in providers:
+        signals.add(_normalize_agent_integration_provider_name(provider.get("provider")))
+        if provider.get("trace_framework"):
+            signals.add("traceai_framework")
+            signals.add(_normalize_agent_integration_provider_name(provider.get("trace_framework")))
+        for channel in _as_iterable(provider.get("channels")):
+            signals.add(_normalize_agent_integration_channel(channel))
+    for session in sessions:
+        signals.update(str(signal) for signal in _as_iterable(session.get("signals")) if signal)
+    return sorted(signal for signal in signals if signal)
+
+
+def _normalize_agent_integration_status(value: Any) -> str:
+    normalized = _normalize_agent_integration_key(value)
+    if normalized in {"", "registered", "completed", "complete", "ended", "success", "succeeded", "passed"}:
+        return "passed"
+    if normalized in {"fail", "failed", "error", "timeout", "cancelled", "canceled", "dial_failed"}:
+        return "failed"
+    return normalized
+
+
+def _normalize_agent_integration_channel(value: Any) -> str:
+    normalized = _normalize_agent_integration_key(value)
+    aliases = {
+        "web_call": "webrtc",
+        "web": "webrtc",
+        "rtc": "webrtc",
+        "pstn": "phone",
+        "telephony": "phone",
+        "media_streams": "media_stream",
+        "media_streaming": "media_stream",
+        "conversation": "chat",
+        "text": "chat",
+        "audio": "voice",
+    }
+    return aliases.get(normalized, normalized)
+
+
+def _normalize_agent_integration_provider_name(value: Any) -> str:
+    normalized = _normalize_agent_integration_key(value)
+    aliases = {
+        "llama_index": "llamaindex",
+        "openai-agents": "openai_agents",
+        "openai_agents_sdk": "openai_agents",
+        "pydantic-ai": "pydantic_ai",
+        "google-adk": "google_adk",
+        "google-genai": "google_genai",
+        "mongodb": "mongodb_vector",
+        "redis": "redis_vector",
+        "eleven_labs": "elevenlabs",
+        "11labs": "elevenlabs",
+        "retell_ai": "retell",
+        "trace_ai": "traceai",
+    }
+    return aliases.get(normalized, normalized)
+
+
+def _normalize_agent_integration_key(value: Any) -> str:
+    return str(value or "").strip().lower().replace("-", "_").replace(" ", "_").replace(".", "_")
+
+
+def _agent_integration_dict(value: Any) -> Dict[str, Any]:
+    return copy.deepcopy(dict(value)) if isinstance(value, Mapping) else {}
 
 
 def _observability_replay_records(payload: Any) -> List[Any]:
