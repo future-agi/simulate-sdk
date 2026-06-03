@@ -7297,6 +7297,10 @@ def _normalize_browser_screenshot_diff(
     item.setdefault("id", f"{effect_id}_screenshot_diff" if effect_id else "screenshot_diff")
     if effect_id:
         item.setdefault("source_action", effect_id)
+    if item.get("changed_regions") or item.get("regions") or item.get("semantic_summary"):
+        semantic = _browser_semantic_screenshot_diff(item, item, {})
+        if semantic:
+            item = _merge_browser_screenshot_diff_semantics(item, semantic)
     return item
 
 
@@ -7307,14 +7311,33 @@ def _merge_browser_screenshot_diff(
     if explicit and computed:
         merged = copy.deepcopy(computed)
         merged.update(copy.deepcopy(explicit))
-        for key in ("changed_regions", "regions"):
+        for key in (
+            "changed_regions",
+            "regions",
+            "required_regions",
+            "required_semantic_regions",
+            "allowed_regions",
+            "masked_regions",
+            "mask_regions",
+            "forbidden_regions",
+        ):
             explicit_values = [str(value) for value in _as_iterable(explicit.get(key, []))]
             computed_values = [str(value) for value in _as_iterable(computed.get(key, []))]
             values = list(dict.fromkeys([*explicit_values, *computed_values]))
             if values:
                 merged[key] = values
+        if explicit.get("semantic_regions") or computed.get("semantic_regions"):
+            merged["semantic_regions"] = _merge_browser_semantic_region_entries(
+                computed.get("semantic_regions"),
+                explicit.get("semantic_regions"),
+            )
+        if computed.get("semantic_summary") and "semantic_summary" not in explicit:
+            merged["semantic_summary"] = copy.deepcopy(computed["semantic_summary"])
         merged.setdefault("pixel_diff", copy.deepcopy(computed.get("pixel_diff", computed)))
         return merged
+    if explicit:
+        semantic = _browser_semantic_screenshot_diff(explicit, explicit, {})
+        return _merge_browser_screenshot_diff_semantics(explicit, semantic) if semantic else explicit
     return explicit or computed
 
 
@@ -7366,6 +7389,9 @@ def _compute_browser_screenshot_diff(
     diff["after"] = str(after_ref)
     diff["source"] = "pixel_diff"
     diff["algorithm"] = "pixel_absdiff_v1"
+    semantic = _browser_semantic_screenshot_diff(diff, diff_spec, regions)
+    if semantic:
+        diff.update(semantic)
     diff["pixel_diff"] = {
         key: copy.deepcopy(value)
         for key, value in diff.items()
@@ -7385,6 +7411,208 @@ def _compute_browser_screenshot_diff(
         }
     }
     return diff
+
+
+def _browser_semantic_screenshot_diff(
+    diff: Mapping[str, Any],
+    spec: Mapping[str, Any],
+    regions: Mapping[str, Mapping[str, Any]],
+) -> Dict[str, Any]:
+    changed_names = _browser_region_names_from_values(
+        diff.get("changed_regions", diff.get("regions", []))
+    )
+    semantic_names = _browser_region_names_from_values(
+        spec.get("semantic_regions", spec.get("required_semantic_regions", []))
+    )
+    required_names = _browser_region_names_from_values(
+        spec.get("required_regions", spec.get("required_semantic_regions", spec.get("semantic_regions", [])))
+    )
+    allowed_names = _browser_region_names_from_values(
+        spec.get("allowed_regions", spec.get("allow_regions", spec.get("allowed_changed_regions", [])))
+    )
+    masked_names = _browser_region_names_from_values(
+        spec.get(
+            "masked_regions",
+            spec.get("mask_regions", spec.get("ignore_regions", spec.get("ignored_regions", []))),
+        )
+    )
+    forbidden_names = _browser_region_names_from_values(
+        spec.get(
+            "forbidden_regions",
+            spec.get("forbid_regions", spec.get("forbidden_changed_regions", [])),
+        )
+    )
+
+    for name, region in regions.items():
+        region_name = str(region.get("name") or region.get("id") or name)
+        if _truthy(region.get("masked", region.get("mask", region.get("ignored", region.get("dynamic"))))):
+            masked_names.append(region_name)
+        if _truthy(region.get("allowed_change", region.get("allow_change", region.get("expected_change")))):
+            allowed_names.append(region_name)
+        if _truthy(region.get("forbidden_change", region.get("forbid_change", region.get("forbidden")))):
+            forbidden_names.append(region_name)
+        if _truthy(region.get("required_change", region.get("required"))):
+            required_names.append(region_name)
+
+    changed_names = _dedupe_names(changed_names)
+    semantic_names = _dedupe_names(semantic_names)
+    required_names = _dedupe_names(required_names)
+    allowed_names = _dedupe_names(allowed_names)
+    masked_names = _dedupe_names(masked_names)
+    forbidden_names = _dedupe_names(forbidden_names)
+
+    ordered_names = _dedupe_names(
+        [
+            *changed_names,
+            *semantic_names,
+            *required_names,
+            *allowed_names,
+            *masked_names,
+            *forbidden_names,
+        ]
+    )
+    if not ordered_names and not any(
+        spec.get(key) is not None
+        for key in (
+            "semantic_regions",
+            "required_regions",
+            "required_semantic_regions",
+            "allowed_regions",
+            "masked_regions",
+            "mask_regions",
+            "forbidden_regions",
+        )
+    ):
+        return {}
+
+    masked_changed = [name for name in changed_names if name in masked_names]
+    effective_changed = [name for name in changed_names if name not in masked_names]
+    allowed_or_required = _dedupe_names([*allowed_names, *required_names])
+    unexpected_changed = [
+        name for name in effective_changed if allowed_or_required and name not in allowed_or_required
+    ]
+    forbidden_changed = [name for name in effective_changed if name in forbidden_names]
+    missing_required = [name for name in required_names if name not in changed_names]
+    semantic_entries = [
+        _browser_semantic_region_entry(
+            name,
+            regions.get(name, {}),
+            changed=name in changed_names,
+            masked=name in masked_names,
+            allowed=name in allowed_names or name in required_names,
+            forbidden=name in forbidden_names,
+            required=name in required_names,
+        )
+        for name in ordered_names
+    ]
+
+    return {
+        "semantic_regions": semantic_entries,
+        "required_regions": required_names,
+        "allowed_regions": allowed_names,
+        "masked_regions": masked_names,
+        "forbidden_regions": forbidden_names,
+        "semantic_summary": {
+            "changed_regions": changed_names,
+            "changed_semantic_regions": [name for name in changed_names if name in ordered_names],
+            "masked_regions": masked_names,
+            "masked_changed_regions": masked_changed,
+            "effective_changed_regions": effective_changed,
+            "required_regions": required_names,
+            "missing_required_regions": missing_required,
+            "allowed_regions": allowed_names,
+            "unexpected_changed_regions": unexpected_changed,
+            "forbidden_regions": forbidden_names,
+            "forbidden_regions_changed": forbidden_changed,
+            "only_allowed_regions_changed": not unexpected_changed and not forbidden_changed,
+        },
+    }
+
+
+def _merge_browser_screenshot_diff_semantics(
+    target: Mapping[str, Any],
+    semantic: Mapping[str, Any],
+) -> Dict[str, Any]:
+    merged = copy.deepcopy(dict(target))
+    for key, value in semantic.items():
+        if key == "semantic_regions" and merged.get("semantic_regions"):
+            merged[key] = _merge_browser_semantic_region_entries(value, merged.get(key))
+        elif key == "semantic_summary" and merged.get("semantic_summary"):
+            summary = copy.deepcopy(dict(value))
+            summary.update(copy.deepcopy(dict(merged.get(key) or {})))
+            merged[key] = summary
+        else:
+            merged.setdefault(key, copy.deepcopy(value))
+    return merged
+
+
+def _merge_browser_semantic_region_entries(*sources: Any) -> List[Dict[str, Any]]:
+    merged: Dict[str, Dict[str, Any]] = {}
+    order: List[str] = []
+    for source in sources:
+        for raw in _as_iterable(source):
+            entry = dict(raw) if isinstance(raw, Mapping) else {"name": str(raw)}
+            name = _browser_region_name(entry)
+            if not name:
+                continue
+            if name not in merged:
+                merged[name] = {"name": name}
+                order.append(name)
+            merged[name].update(copy.deepcopy(entry))
+            merged[name]["name"] = name
+    return [merged[name] for name in order]
+
+
+def _browser_semantic_region_entry(
+    name: str,
+    region: Mapping[str, Any],
+    *,
+    changed: bool,
+    masked: bool,
+    allowed: bool,
+    forbidden: bool,
+    required: bool,
+) -> Dict[str, Any]:
+    entry = copy.deepcopy(dict(region)) if region else {"name": name}
+    entry["name"] = str(entry.get("name") or entry.get("id") or name)
+    entry["changed"] = bool(changed)
+    entry["masked"] = bool(masked)
+    entry["allowed"] = bool(allowed)
+    entry["forbidden"] = bool(forbidden)
+    entry["required"] = bool(required)
+    if changed:
+        entry["change_type"] = "masked" if masked else "semantic"
+    return entry
+
+
+def _browser_region_names_from_values(values: Any) -> List[str]:
+    names: List[str] = []
+    for value in _as_iterable(values):
+        name = _browser_region_name(value)
+        if name:
+            names.append(name)
+    return names
+
+
+def _browser_region_name(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, Mapping):
+        for key in ("name", "id", "region", "target_region", "selector", "label"):
+            if value.get(key):
+                return str(value[key])
+        return None
+    return str(value)
+
+
+def _dedupe_names(values: Iterable[Any]) -> List[str]:
+    return list(dict.fromkeys(str(value) for value in values if value is not None and str(value)))
+
+
+def _truthy(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return bool(value)
 
 
 def _browser_pixel_threshold(value: Any) -> int:

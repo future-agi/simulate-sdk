@@ -565,6 +565,120 @@ async def test_browser_environment_extracts_pixel_screenshot_diff_and_layout_dis
     assert trace["perturbations"][0]["distribution"]["max"] == 0.16
 
 
+@pytest.mark.asyncio
+async def test_browser_environment_summarizes_semantic_masked_screenshot_regions(tmp_path):
+    before_path = tmp_path / "checkout-semantic-before.png"
+    after_path = tmp_path / "checkout-semantic-after.png"
+    white = (255, 255, 255, 255)
+    green = (20, 180, 80, 255)
+    blue = (30, 120, 240, 255)
+    before_pixels = [[white for _ in range(4)] for _ in range(4)]
+    after_pixels = [[white for _ in range(4)] for _ in range(4)]
+    after_pixels[0][0] = blue
+    for y in (1, 2):
+        for x in (1, 2):
+            after_pixels[y][x] = green
+    _write_png(before_path, 4, 4, before_pixels)
+    _write_png(after_path, 4, 4, after_pixels)
+
+    async def agent(input):
+        return AgentResponse(
+            content="I clicked confirm and captured the semantic visual delta.",
+            tool_calls=[
+                {
+                    "id": "click",
+                    "name": "browser_click",
+                    "arguments": {"selector": "#confirm", "action": "click confirm"},
+                }
+            ],
+        )
+
+    report = await LocalTextEngine().run(
+        scenario=_scenario(),
+        agent_callback=agent,
+        environment=BrowserEnvironment(
+            url="https://shop.example.com/checkout",
+            dom="<button id='confirm'>Confirm</button><output id='status'>Pending</output>",
+            screenshot_uri=f"file://{before_path}",
+            allowed_domains=["shop.example.com"],
+            regions={
+                "session_clock": {
+                    "x": 0,
+                    "y": 0,
+                    "width": 1,
+                    "height": 1,
+                    "role": "timer",
+                    "text": "10:01",
+                    "masked": True,
+                },
+                "status_banner": {
+                    "x": 1,
+                    "y": 1,
+                    "width": 2,
+                    "height": 2,
+                    "selector": "#status",
+                    "role": "status",
+                    "text": "Confirmed",
+                    "allowed_change": True,
+                },
+                "total_due": {
+                    "x": 3,
+                    "y": 3,
+                    "width": 1,
+                    "height": 1,
+                    "role": "amount",
+                    "text": "$42.00",
+                    "forbidden_change": True,
+                },
+            },
+            actions=[
+                {
+                    "id": "confirm_semantic_change",
+                    "tool_names": ["browser_click"],
+                    "selector": "#confirm",
+                    "screenshot_path": str(after_path),
+                    "screenshot_diff": {
+                        "id": "confirm_semantic_delta",
+                        "threshold": 0,
+                        "semantic_regions": ["status_banner"],
+                        "allowed_regions": ["status_banner"],
+                        "masked_regions": ["session_clock"],
+                        "forbidden_regions": ["total_due"],
+                    },
+                }
+            ],
+        ),
+        max_turns=1,
+        min_turns=1,
+        modality="cua",
+    )
+
+    result = report.results[0]
+    browser = result.metadata["environment_state"]["browser"]
+    diff = browser["screenshot_diffs"][-1]
+    trace = [
+        artifact.data
+        for artifact in result.artifacts
+        if artifact.type == "trace" and artifact.metadata.get("kind") == "browser_trace"
+    ][-1]
+    semantic_regions = {region["name"]: region for region in diff["semantic_regions"]}
+
+    assert diff["id"] == "confirm_semantic_delta"
+    assert diff["changed_pixels"] == 5
+    assert diff["changed_regions"] == ["session_clock", "status_banner"]
+    assert diff["semantic_summary"]["masked_changed_regions"] == ["session_clock"]
+    assert diff["semantic_summary"]["effective_changed_regions"] == ["status_banner"]
+    assert diff["semantic_summary"]["forbidden_regions_changed"] == []
+    assert diff["semantic_summary"]["only_allowed_regions_changed"] is True
+    assert semantic_regions["session_clock"]["masked"] is True
+    assert semantic_regions["status_banner"]["allowed"] is True
+    assert semantic_regions["status_banner"]["role"] == "status"
+    assert semantic_regions["total_due"]["forbidden"] is True
+    assert browser["action_replay"][-1]["screenshot_diff"]["semantic_summary"] == diff["semantic_summary"]
+    assert trace["screenshot_diffs"][-1]["semantic_summary"]["effective_changed_regions"] == ["status_banner"]
+    assert any(event.type == "browser_screenshot_diff" for event in result.events)
+
+
 def test_normalize_playwright_trace_export_extracts_trace_zip(tmp_path):
     trace_path = tmp_path / "playwright-trace.zip"
     trace_records = [
