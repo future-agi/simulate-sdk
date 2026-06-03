@@ -398,6 +398,116 @@ async def test_browser_environment_applies_mutable_action_effects():
 
 
 @pytest.mark.asyncio
+async def test_browser_environment_captures_storage_and_runtime_hooks():
+    async def agent(input):
+        return AgentResponse(
+            content="I will inspect browser runtime state and then confirm checkout.",
+            tool_calls=[
+                {"id": "storage", "name": "browser_storage", "arguments": {}},
+                {"id": "runtime", "name": "browser_runtime", "arguments": {}},
+                {
+                    "id": "click",
+                    "name": "browser_click",
+                    "arguments": {"selector": "#confirm", "action": "click confirm"},
+                },
+            ],
+        )
+
+    report = await LocalTextEngine().run(
+        scenario=_scenario(),
+        agent_callback=agent,
+        environment=BrowserEnvironment(
+            url="https://shop.example.com/checkout",
+            dom="<button id='confirm'>Confirm</button>",
+            screenshot_uri="file:///fixtures/checkout.png",
+            allowed_domains=["shop.example.com"],
+            storage_state={
+                "cookies": [
+                    {
+                        "name": "session",
+                        "value": "before",
+                        "domain": "shop.example.com",
+                        "path": "/",
+                    }
+                ],
+                "origins": [
+                    {
+                        "origin": "https://shop.example.com",
+                        "localStorage": [{"name": "cart_id", "value": "cart_123"}],
+                    }
+                ],
+            },
+            performance_entries=[
+                {"name": "initial-navigation", "entry_type": "navigation", "duration": 82.5}
+            ],
+            actions=[
+                {
+                    "id": "confirm_runtime_capture",
+                    "tool_names": ["browser_click"],
+                    "selector": "#confirm",
+                    "next_url": "https://shop.example.com/done",
+                    "dom": "<main>Done</main>",
+                    "cookies": {
+                        "checkout_session": "confirmed",
+                    },
+                    "local_storage": {
+                        "https://shop.example.com": {"checkout_status": "confirmed"}
+                    },
+                    "session_storage": {
+                        "https://shop.example.com": {"last_action": "confirm"}
+                    },
+                    "runtime_events": [
+                        {
+                            "type": "page_error",
+                            "level": "error",
+                            "message": "Recoverable hydration mismatch handled.",
+                        }
+                    ],
+                    "performance_entries": [
+                        {
+                            "name": "https://shop.example.com/api/checkout",
+                            "entry_type": "resource",
+                            "duration": 120,
+                        }
+                    ],
+                }
+            ],
+        ),
+        max_turns=1,
+        min_turns=1,
+        modality="cua",
+    )
+
+    result = report.results[0]
+    browser = result.metadata["environment_state"]["browser"]
+    trace = [
+        artifact.data
+        for artifact in result.artifacts
+        if artifact.type == "trace" and artifact.metadata.get("kind") == "browser_trace"
+    ][-1]
+    cookies = {cookie["name"]: cookie["value"] for cookie in browser["storage_state"]["cookies"]}
+    origin = browser["storage_state"]["origins"][0]
+    local_storage = {item["name"]: item["value"] for item in origin["localStorage"]}
+    session_storage = {item["name"]: item["value"] for item in origin["sessionStorage"]}
+    action = browser["action_replay"][-1]
+
+    assert cookies["session"] == "before"
+    assert cookies["checkout_session"] == "confirmed"
+    assert local_storage["cart_id"] == "cart_123"
+    assert local_storage["checkout_status"] == "confirmed"
+    assert session_storage["last_action"] == "confirm"
+    assert action["storage_mutation"]["updated"]["cookies"][0]["name"] == "checkout_session"
+    assert browser["runtime_events"][-1]["type"] == "page_error"
+    assert browser["performance_entries"][-1]["duration_ms"] == 120.0
+    assert browser["runtime_summary"]["error_count"] == 1
+    assert trace["storage_state"]["cookies"][-1]["name"] == "checkout_session"
+    assert trace["runtime_summary"]["max_duration_ms"] == 120.0
+    assert trace["final_state"]["browser"]["storage_state"]["origins"][0]["origin"] == "https://shop.example.com"
+    assert any(event.type == "browser_storage" for event in result.events)
+    assert any(event.type == "browser_runtime" for event in result.events)
+
+
+@pytest.mark.asyncio
 async def test_browser_environment_records_coordinate_regions_and_screenshot_diffs():
     async def agent(input):
         return AgentResponse(
@@ -764,6 +874,50 @@ def test_normalize_playwright_trace_export_extracts_trace_zip(tmp_path):
     assert any(artifact.type == "video" for artifact in snapshot.artifacts)
     assert any(event.type == "browser_perturbation" for event in snapshot.events)
     assert snapshot.metadata["browser_trace"]["video_artifacts"] == 1
+
+
+def test_normalize_browser_trace_export_extracts_storage_and_runtime_hooks():
+    fixture = normalize_browser_trace_export(
+        {
+            "provider": "playwright",
+            "storageState": {
+                "cookies": [
+                    {
+                        "name": "checkout_session",
+                        "value": "confirmed",
+                        "domain": "shop.example.com",
+                        "path": "/",
+                    }
+                ],
+                "origins": [
+                    {
+                        "origin": "https://shop.example.com",
+                        "localStorage": [{"name": "checkout_status", "value": "confirmed"}],
+                    }
+                ],
+            },
+            "runtime_events": [
+                {
+                    "type": "page_error",
+                    "level": "error",
+                    "message": "Recoverable hydration mismatch handled.",
+                }
+            ],
+            "performance_entries": [
+                {
+                    "name": "https://shop.example.com/api/checkout",
+                    "entry_type": "resource",
+                    "duration": 120,
+                }
+            ],
+        },
+        provider="playwright",
+    )
+
+    assert fixture["storage_state"]["cookies"][0]["name"] == "checkout_session"
+    assert fixture["storage_state"]["origins"][0]["localStorage"][0]["name"] == "checkout_status"
+    assert fixture["runtime_events"][0]["type"] == "page_error"
+    assert fixture["performance_entries"][0]["duration_ms"] == 120.0
 
 
 @pytest.mark.asyncio

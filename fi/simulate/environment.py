@@ -286,6 +286,12 @@ class BrowserEnvironment(EnvironmentAdapter):
         regions: Optional[Mapping[str, Any] | Iterable[Mapping[str, Any]]] = None,
         console_logs: Optional[Iterable[str | Mapping[str, Any]]] = None,
         network_log: Optional[Iterable[Mapping[str, Any]]] = None,
+        storage_state: Optional[Any] = None,
+        cookies: Optional[Iterable[Mapping[str, Any]] | Mapping[str, Any]] = None,
+        local_storage: Optional[Mapping[str, Any] | Iterable[Mapping[str, Any]]] = None,
+        session_storage: Optional[Mapping[str, Any] | Iterable[Mapping[str, Any]]] = None,
+        runtime_events: Optional[Iterable[str | Mapping[str, Any]]] = None,
+        performance_entries: Optional[Iterable[Mapping[str, Any]]] = None,
         prompt_injections: Optional[Iterable[str | Mapping[str, Any]]] = None,
         browser_trace: Optional[Any] = None,
         browser_trace_source: Optional[str | os.PathLike[str]] = None,
@@ -356,10 +362,33 @@ class BrowserEnvironment(EnvironmentAdapter):
         ]
         self.initial_resource_bodies = _dedupe_dicts(trace_fixture.get("resource_bodies", []))
         self.initial_actionability_timeline = _dedupe_dicts(trace_fixture.get("actionability_timeline", []))
+        self.initial_storage_state = _merge_browser_storage_states(
+            trace_fixture.get("storage_state"),
+            _normalize_browser_storage_state(
+                storage_state,
+                url=url,
+                cookies=cookies,
+                local_storage=local_storage,
+                session_storage=session_storage,
+            ),
+        )
+        self.initial_runtime_events = [
+            _normalize_browser_runtime_event(item)
+            for item in [*list(trace_fixture.get("runtime_events", [])), *list(runtime_events or [])]
+        ]
+        self.initial_performance_entries = _dedupe_dicts(
+            [
+                *list(trace_fixture.get("performance_entries", [])),
+                *[_normalize_browser_performance_entry(item) for item in performance_entries or []],
+            ]
+        )
         self.console_logs = copy.deepcopy(self.initial_console_logs)
         self.network_log = copy.deepcopy(self.initial_network_log)
         self.resource_bodies = copy.deepcopy(self.initial_resource_bodies)
         self.actionability_timeline = copy.deepcopy(self.initial_actionability_timeline)
+        self.storage_state = copy.deepcopy(self.initial_storage_state)
+        self.runtime_events = copy.deepcopy(self.initial_runtime_events)
+        self.performance_entries = copy.deepcopy(self.initial_performance_entries)
         self.initial_prompt_injections = _normalize_browser_prompt_injections(
             [*list(trace_fixture.get("prompt_injections", [])), *list(prompt_injections or [])],
             self.initial_regions,
@@ -387,6 +416,9 @@ class BrowserEnvironment(EnvironmentAdapter):
         self.network_log = copy.deepcopy(self.initial_network_log)
         self.resource_bodies = copy.deepcopy(self.initial_resource_bodies)
         self.actionability_timeline = copy.deepcopy(self.initial_actionability_timeline)
+        self.storage_state = copy.deepcopy(self.initial_storage_state)
+        self.runtime_events = copy.deepcopy(self.initial_runtime_events)
+        self.performance_entries = copy.deepcopy(self.initial_performance_entries)
         self.prompt_injections = copy.deepcopy(self.initial_prompt_injections)
         self.video_artifacts = copy.deepcopy(self.initial_video_artifacts)
         self.perturbations = copy.deepcopy(self.initial_perturbations)
@@ -411,6 +443,10 @@ class BrowserEnvironment(EnvironmentAdapter):
                     "network_log": len(self.network_log),
                     "resource_bodies": len(self.resource_bodies),
                     "actionability_timeline": len(self.actionability_timeline),
+                    "cookies": len(self.storage_state.get("cookies", [])),
+                    "storage_origins": len(self.storage_state.get("origins", [])),
+                    "runtime_events": len(self.runtime_events),
+                    "performance_entries": len(self.performance_entries),
                     "layout_shift_distribution": bool(_browser_layout_shift_distribution(self.perturbations)),
                     "video_artifacts": len(self.video_artifacts),
                     "perturbations": len(self.perturbations),
@@ -448,6 +484,26 @@ class BrowserEnvironment(EnvironmentAdapter):
                     type="browser_actionability",
                     name="actionability_timeline_loaded",
                     payload={"checks": copy.deepcopy(self.actionability_timeline)},
+                )
+            )
+        if _browser_storage_state_has_data(self.storage_state):
+            events.append(
+                SimulationEvent(
+                    type="browser_storage",
+                    name="storage_state_loaded",
+                    payload={"storage_state": copy.deepcopy(self.storage_state)},
+                )
+            )
+        if self.runtime_events or self.performance_entries:
+            events.append(
+                SimulationEvent(
+                    type="browser_runtime",
+                    name="runtime_capture_loaded",
+                    payload={
+                        "runtime_events": copy.deepcopy(self.runtime_events),
+                        "performance_entries": copy.deepcopy(self.performance_entries),
+                        "summary": _browser_runtime_summary(self.runtime_events, self.performance_entries),
+                    },
                 )
             )
         for injection in self.prompt_injections:
@@ -509,6 +565,14 @@ class BrowserEnvironment(EnvironmentAdapter):
                     "name": "browser_network",
                     "description": "Return simulated browser network requests.",
                 },
+                {
+                    "name": "browser_storage",
+                    "description": "Return simulated browser cookies and origin storage state.",
+                },
+                {
+                    "name": "browser_runtime",
+                    "description": "Return simulated browser runtime events and performance entries.",
+                },
             ],
             artifacts=artifacts,
             state={"browser": self._state_payload()},
@@ -522,6 +586,10 @@ class BrowserEnvironment(EnvironmentAdapter):
                     "network_log": len(self.network_log),
                     "resource_bodies": len(self.resource_bodies),
                     "actionability_timeline": len(self.actionability_timeline),
+                    "cookies": len(self.storage_state.get("cookies", [])),
+                    "storage_origins": len(self.storage_state.get("origins", [])),
+                    "runtime_events": len(self.runtime_events),
+                    "performance_entries": len(self.performance_entries),
                     "video_artifacts": len(self.video_artifacts),
                     "perturbations": len(self.perturbations),
                 }
@@ -534,7 +602,14 @@ class BrowserEnvironment(EnvironmentAdapter):
         **context: Any,
     ) -> Optional[ToolExecutionResult]:
         name = _tool_name(tool_call)
-        if name in {"browser_snapshot", "browser_refresh_snapshot", "browser_console", "browser_network"}:
+        if name in {
+            "browser_snapshot",
+            "browser_refresh_snapshot",
+            "browser_console",
+            "browser_network",
+            "browser_storage",
+            "browser_runtime",
+        }:
             return self._inspection_result(tool_call, name)
         if name not in {"browser_navigate", "browser_click", "playwright_click", "computer_click"}:
             return None
@@ -705,6 +780,9 @@ class BrowserEnvironment(EnvironmentAdapter):
             "blocked": False,
             "success": True,
             "state_updates": copy.deepcopy(effect_updates.get("state_updates", {})),
+            "storage_mutation": copy.deepcopy(effect_updates.get("storage_mutation", {})),
+            "runtime_events": copy.deepcopy(effect_updates.get("runtime_events", [])),
+            "performance_entries": copy.deepcopy(effect_updates.get("performance_entries", [])),
             "before_snapshot": before_snapshot,
             "after_snapshot": self._snapshot_summary(self._current_snapshot()),
             "actionability": _browser_actionability_payload(matched_effect),
@@ -745,6 +823,26 @@ class BrowserEnvironment(EnvironmentAdapter):
                     payload=copy.deepcopy(effect_updates["screenshot_diff"]),
                 )
             )
+        if effect_updates.get("storage_mutation"):
+            events.append(
+                SimulationEvent(
+                    type="browser_storage",
+                    name=str(matched_effect.get("id") if matched_effect else name),
+                    payload=copy.deepcopy(effect_updates["storage_mutation"]),
+                )
+            )
+        if effect_updates.get("runtime_events") or effect_updates.get("performance_entries"):
+            events.append(
+                SimulationEvent(
+                    type="browser_runtime",
+                    name=str(matched_effect.get("id") if matched_effect else name),
+                    payload={
+                        "runtime_events": copy.deepcopy(effect_updates.get("runtime_events", [])),
+                        "performance_entries": copy.deepcopy(effect_updates.get("performance_entries", [])),
+                        "summary": _browser_runtime_summary(self.runtime_events, self.performance_entries),
+                    },
+                )
+            )
         return ToolExecutionResult(
             tool_call_id=call_id,
             tool_name=name,
@@ -774,6 +872,16 @@ class BrowserEnvironment(EnvironmentAdapter):
                 "resource_bodies": copy.deepcopy(self.resource_bodies),
             }
             event_type = "browser_network"
+        elif name == "browser_storage":
+            result = {"storage_state": copy.deepcopy(self.storage_state)}
+            event_type = "browser_storage"
+        elif name == "browser_runtime":
+            result = {
+                "runtime_events": copy.deepcopy(self.runtime_events),
+                "performance_entries": copy.deepcopy(self.performance_entries),
+                "summary": _browser_runtime_summary(self.runtime_events, self.performance_entries),
+            }
+            event_type = "browser_runtime"
         elif name == "browser_refresh_snapshot":
             refreshed = self._refresh_snapshot()
             result = {"refreshed": refreshed, "snapshot": self._snapshot_summary(self._current_snapshot())}
@@ -908,6 +1016,37 @@ class BrowserEnvironment(EnvironmentAdapter):
                 self.network_log.append(dict(request))
             else:
                 self.network_log.append({"url": str(request)})
+        storage_mutation = _browser_apply_storage_effect(self.storage_state, effect, url=requested_url)
+        runtime_events = [
+            _normalize_browser_runtime_event(item)
+            for item in _as_iterable(effect.get("runtime_events", effect.get("runtime_event")))
+        ]
+        for key in ("page_errors", "page_error", "web_errors", "web_error"):
+            for item in _as_iterable(effect.get(key)):
+                event = _normalize_browser_runtime_event(item)
+                if "type" not in event:
+                    event["type"] = "page_error" if "page" in key else "web_error"
+                runtime_events.append(event)
+        performance_entries = [
+            _normalize_browser_performance_entry(item)
+            for item in _as_iterable(
+                effect.get(
+                    "performance_entries",
+                    effect.get("performance", effect.get("resource_timing")),
+                )
+            )
+        ]
+        if effect.get("navigation_timing"):
+            performance_entries.append(
+                _normalize_browser_performance_entry(
+                    {"entry_type": "navigation", **_coerce_plain_dict(effect.get("navigation_timing"))}
+                )
+            )
+        if runtime_events:
+            self.runtime_events.extend(runtime_events)
+        if performance_entries:
+            self.performance_entries.extend(performance_entries)
+            self.performance_entries = _dedupe_dicts(self.performance_entries)
         screenshot_diff = _normalize_browser_screenshot_diff(
             effect.get("screenshot_diff", effect.get("screenshot_delta")),
             effect_id=str(effect.get("id") or ""),
@@ -920,6 +1059,12 @@ class BrowserEnvironment(EnvironmentAdapter):
                 self.current_snapshot_index = index
                 self.url = str(self.snapshots[index].get("url") or requested_url)
                 result = {"state_updates": state_updates}
+                if storage_mutation:
+                    result["storage_mutation"] = storage_mutation
+                if runtime_events:
+                    result["runtime_events"] = runtime_events
+                if performance_entries:
+                    result["performance_entries"] = performance_entries
                 if screenshot_diff:
                     result["screenshot_diff"] = screenshot_diff
                 return result
@@ -975,14 +1120,29 @@ class BrowserEnvironment(EnvironmentAdapter):
                 "snapshot_id": new_snapshot["id"],
                 "dom_changed": dom_after != dom_before,
                 "state_updates": copy.deepcopy(state_updates),
+                "storage_mutation": copy.deepcopy(storage_mutation),
+                "runtime_events": copy.deepcopy(runtime_events),
+                "performance_entries": copy.deepcopy(performance_entries),
                     "metadata": copy.deepcopy(dict(effect.get("metadata", {}))),
                 }
             result = {"state_updates": state_updates, "dom_mutation": dom_mutation}
+            if storage_mutation:
+                result["storage_mutation"] = storage_mutation
+            if runtime_events:
+                result["runtime_events"] = runtime_events
+            if performance_entries:
+                result["performance_entries"] = performance_entries
             if screenshot_diff:
                 result["screenshot_diff"] = screenshot_diff
             return result
 
         result = {"state_updates": state_updates}
+        if storage_mutation:
+            result["storage_mutation"] = storage_mutation
+        if runtime_events:
+            result["runtime_events"] = runtime_events
+        if performance_entries:
+            result["performance_entries"] = performance_entries
         if screenshot_diff:
             result["screenshot_diff"] = screenshot_diff
         return result
@@ -1055,6 +1215,10 @@ class BrowserEnvironment(EnvironmentAdapter):
             "network_log": copy.deepcopy(self.network_log),
             "resource_bodies": copy.deepcopy(self.resource_bodies),
             "actionability_timeline": copy.deepcopy(self.actionability_timeline),
+            "storage_state": copy.deepcopy(self.storage_state),
+            "runtime_events": copy.deepcopy(self.runtime_events),
+            "performance_entries": copy.deepcopy(self.performance_entries),
+            "runtime_summary": _browser_runtime_summary(self.runtime_events, self.performance_entries),
             "prompt_injections": copy.deepcopy(self.prompt_injections),
             "video_artifacts": copy.deepcopy(self.video_artifacts),
             "perturbations": copy.deepcopy(self.perturbations),
@@ -1075,6 +1239,10 @@ class BrowserEnvironment(EnvironmentAdapter):
             "network_log": copy.deepcopy(self.network_log),
             "resource_bodies": copy.deepcopy(self.resource_bodies),
             "actionability_timeline": copy.deepcopy(self.actionability_timeline),
+            "storage_state": copy.deepcopy(self.storage_state),
+            "runtime_events": copy.deepcopy(self.runtime_events),
+            "performance_entries": copy.deepcopy(self.performance_entries),
+            "runtime_summary": _browser_runtime_summary(self.runtime_events, self.performance_entries),
             "video_artifacts": copy.deepcopy(self.video_artifacts),
             "perturbations": copy.deepcopy(self.perturbations),
             "layout_shift_distribution": _browser_layout_shift_distribution(self.perturbations),
@@ -5669,6 +5837,9 @@ def _empty_browser_trace_fixture(
         "network_log": [],
         "resource_bodies": [],
         "actionability_timeline": [],
+        "storage_state": {"cookies": [], "origins": []},
+        "runtime_events": [],
+        "performance_entries": [],
         "video_artifacts": [],
         "prompt_injections": [],
         "perturbations": [],
@@ -5686,6 +5857,10 @@ def _merge_browser_trace_fixtures(*fixtures: Mapping[str, Any]) -> Dict[str, Any
         if not fixture:
             continue
         merged["metadata"].update(copy.deepcopy(dict(fixture.get("metadata", {}))))
+        merged["storage_state"] = _merge_browser_storage_states(
+            merged.get("storage_state"),
+            fixture.get("storage_state"),
+        )
         for key in (
             "snapshots",
             "actions",
@@ -5694,6 +5869,8 @@ def _merge_browser_trace_fixtures(*fixtures: Mapping[str, Any]) -> Dict[str, Any
             "network_log",
             "resource_bodies",
             "actionability_timeline",
+            "runtime_events",
+            "performance_entries",
             "video_artifacts",
             "prompt_injections",
             "perturbations",
@@ -5707,6 +5884,8 @@ def _merge_browser_trace_fixtures(*fixtures: Mapping[str, Any]) -> Dict[str, Any
         "network_log",
         "resource_bodies",
         "actionability_timeline",
+        "runtime_events",
+        "performance_entries",
         "video_artifacts",
         "prompt_injections",
         "perturbations",
@@ -5808,6 +5987,24 @@ def _normalize_browser_trace_export(
     direct = _coerce_plain_dict(export) if isinstance(export, Mapping) else {}
     fixture["resource_bodies"].extend(_as_iterable(direct.get("resource_bodies", [])))
     fixture["actionability_timeline"].extend(_as_iterable(direct.get("actionability_timeline", [])))
+    fixture["storage_state"] = _merge_browser_storage_states(
+        fixture.get("storage_state"),
+        _normalize_browser_storage_state(
+            direct.get("storage_state", direct.get("storageState")),
+            url=direct.get("url") or direct.get("current_url"),
+            cookies=direct.get("cookies"),
+            local_storage=direct.get("local_storage", direct.get("localStorage")),
+            session_storage=direct.get("session_storage", direct.get("sessionStorage")),
+        ),
+    )
+    fixture["runtime_events"].extend(
+        _normalize_browser_runtime_event(item)
+        for item in _as_iterable(direct.get("runtime_events", direct.get("runtime", [])))
+    )
+    fixture["performance_entries"].extend(
+        _normalize_browser_performance_entry(item)
+        for item in _as_iterable(direct.get("performance_entries", direct.get("performance", [])))
+    )
 
     har_fixture = _browser_har_fixture(export, resources=resources)
     if har_fixture["network_log"] or har_fixture["resource_bodies"]:
@@ -5840,6 +6037,12 @@ def _normalize_browser_trace_export(
         resource = _browser_resource_body_from_record(record_dict)
         if resource:
             fixture["resource_bodies"].append(resource)
+        fixture["storage_state"] = _merge_browser_storage_states(
+            fixture.get("storage_state"),
+            _browser_storage_state_from_record(record_dict),
+        )
+        fixture["runtime_events"].extend(_browser_runtime_events_from_record(record_dict, index=index))
+        fixture["performance_entries"].extend(_browser_performance_entries_from_record(record_dict, index=index))
         fixture["prompt_injections"].extend(_browser_prompt_injections_from_record(record_dict))
     fixture["actions"].extend(actions_by_id.values())
     fixture["actionability_timeline"].extend(actionability)
@@ -5852,6 +6055,8 @@ def _normalize_browser_trace_export(
         "network_log",
         "resource_bodies",
         "actionability_timeline",
+        "runtime_events",
+        "performance_entries",
         "video_artifacts",
         "prompt_injections",
         "perturbations",
@@ -5915,7 +6120,26 @@ def _looks_like_browser_trace_record(record: Mapping[str, Any]) -> bool:
     record_type = str(record.get("type") or record.get("event") or record.get("kind") or "").lower()
     if record_type in {"computer_call", "computer_call_output", "computer_screenshot", "browser_state", "action_result"}:
         return True
-    if any(key in record for key in ("action", "actions", "current_url", "screenshot", "screenshot_path", "image_url", "browser_state")):
+    if any(
+        key in record
+        for key in (
+            "action",
+            "actions",
+            "current_url",
+            "screenshot",
+            "screenshot_path",
+            "image_url",
+            "browser_state",
+            "storage_state",
+            "storageState",
+            "cookies",
+            "localStorage",
+            "sessionStorage",
+            "runtime_events",
+            "page_errors",
+            "performance_entries",
+        )
+    ):
         return True
     return False
 
@@ -6362,6 +6586,9 @@ def _normalize_playwright_trace_export(
         "regions": [],
         "console_logs": [],
         "network_log": [],
+        "storage_state": {"cookies": [], "origins": []},
+        "runtime_events": [],
+        "performance_entries": [],
         "video_artifacts": [],
         "prompt_injections": [],
         "perturbations": [],
@@ -6385,6 +6612,24 @@ def _normalize_playwright_trace_export(
     fixture["regions"].extend(_as_iterable(direct.get("regions", [])))
     fixture["console_logs"].extend(_as_iterable(direct.get("console_logs", direct.get("console", []))))
     fixture["network_log"].extend(_as_iterable(direct.get("network_log", direct.get("network", []))))
+    fixture["storage_state"] = _merge_browser_storage_states(
+        fixture.get("storage_state"),
+        _normalize_browser_storage_state(
+            direct.get("storage_state", direct.get("storageState")),
+            url=direct.get("url") or direct.get("current_url"),
+            cookies=direct.get("cookies"),
+            local_storage=direct.get("local_storage", direct.get("localStorage")),
+            session_storage=direct.get("session_storage", direct.get("sessionStorage")),
+        ),
+    )
+    fixture["runtime_events"].extend(
+        _normalize_browser_runtime_event(item)
+        for item in _as_iterable(direct.get("runtime_events", direct.get("runtime", [])))
+    )
+    fixture["performance_entries"].extend(
+        _normalize_browser_performance_entry(item)
+        for item in _as_iterable(direct.get("performance_entries", direct.get("performance", [])))
+    )
     fixture["video_artifacts"].extend(_as_iterable(direct.get("videos", direct.get("video", []))))
     fixture["prompt_injections"].extend(_as_iterable(direct.get("prompt_injections", [])))
     fixture["perturbations"].extend(_as_iterable(direct.get("perturbations", [])))
@@ -6421,6 +6666,12 @@ def _normalize_playwright_trace_export(
         request = _playwright_network_log_from_record(record_dict)
         if request:
             fixture["network_log"].append(request)
+        fixture["storage_state"] = _merge_browser_storage_states(
+            fixture.get("storage_state"),
+            _browser_storage_state_from_record(record_dict),
+        )
+        fixture["runtime_events"].extend(_browser_runtime_events_from_record(record_dict, index=index))
+        fixture["performance_entries"].extend(_browser_performance_entries_from_record(record_dict, index=index))
 
         fixture["video_artifacts"].extend(_playwright_video_artifacts_from_record(record_dict, resources=resources))
         fixture["perturbations"].extend(_playwright_perturbations_from_record(record_dict))
@@ -6432,6 +6683,8 @@ def _normalize_playwright_trace_export(
     fixture["regions"] = _dedupe_dicts(fixture["regions"])
     fixture["console_logs"] = _dedupe_dicts(fixture["console_logs"])
     fixture["network_log"] = _dedupe_dicts(fixture["network_log"])
+    fixture["runtime_events"] = _dedupe_dicts(fixture["runtime_events"])
+    fixture["performance_entries"] = _dedupe_dicts(fixture["performance_entries"])
     fixture["perturbations"] = _dedupe_dicts(fixture["perturbations"])
     if any(fixture[key] for key in ("snapshots", "actions", "video_artifacts", "perturbations")):
         fixture["metadata"].setdefault("source_type", "playwright_trace")
@@ -7083,6 +7336,408 @@ def _normalize_browser_log(item: str | Mapping[str, Any]) -> Dict[str, Any]:
         log.setdefault("message", "")
         return log
     return {"level": "info", "message": str(item)}
+
+
+def _normalize_browser_storage_state(
+    storage_state: Any,
+    *,
+    url: Optional[Any] = None,
+    cookies: Optional[Iterable[Mapping[str, Any]] | Mapping[str, Any]] = None,
+    local_storage: Optional[Mapping[str, Any] | Iterable[Mapping[str, Any]]] = None,
+    session_storage: Optional[Mapping[str, Any] | Iterable[Mapping[str, Any]]] = None,
+) -> Dict[str, Any]:
+    default_origin = _browser_origin_from_url(url)
+    state = {"cookies": [], "origins": []}
+    raw = _load_browser_storage_state(storage_state)
+    if raw:
+        state["cookies"].extend(_normalize_browser_cookies(raw.get("cookies"), url=url))
+        for origin in _as_iterable(raw.get("origins", [])):
+            origin_dict = _normalize_browser_storage_origin(origin, default_origin=default_origin)
+            if origin_dict:
+                state["origins"].append(origin_dict)
+    state["cookies"].extend(_normalize_browser_cookies(cookies, url=url))
+    for origin in _normalize_browser_origin_storage(local_storage, default_origin=default_origin, storage_key="localStorage"):
+        state["origins"].append(origin)
+    for origin in _normalize_browser_origin_storage(session_storage, default_origin=default_origin, storage_key="sessionStorage"):
+        state["origins"].append(origin)
+    return _merge_browser_storage_states(state)
+
+
+def _load_browser_storage_state(value: Any) -> Dict[str, Any]:
+    if not value:
+        return {}
+    if isinstance(value, Mapping):
+        return copy.deepcopy(dict(value))
+    if hasattr(value, "model_dump"):
+        return _load_browser_storage_state(value.model_dump())
+    if hasattr(value, "dict"):
+        return _load_browser_storage_state(value.dict())
+    if isinstance(value, (str, os.PathLike)):
+        text = os.fspath(value)
+        stripped = text.strip()
+        if stripped.startswith(("{", "[")):
+            parsed = _parse_framework_trace_export_text(stripped)
+            if isinstance(parsed, Mapping):
+                return copy.deepcopy(dict(parsed))
+            return {}
+        if stripped.startswith("file://"):
+            text = urlparse(stripped).path
+        if not stripped.startswith(("http://", "https://")):
+            try:
+                with open(text, "r", encoding="utf-8") as handle:
+                    parsed = json.load(handle)
+                return copy.deepcopy(dict(parsed)) if isinstance(parsed, Mapping) else {}
+            except (OSError, json.JSONDecodeError):
+                return {}
+    return {}
+
+
+def _normalize_browser_cookies(
+    cookies: Any,
+    *,
+    url: Optional[Any] = None,
+) -> List[Dict[str, Any]]:
+    if not cookies:
+        return []
+    default_domain = urlparse(str(url)).hostname if url else None
+    if isinstance(cookies, Mapping) and not {"name", "value"}.intersection(cookies.keys()):
+        return [
+            _normalize_browser_cookie({"name": name, "value": value}, default_domain=default_domain)
+            for name, value in cookies.items()
+        ]
+    return [
+        cookie
+        for cookie in (
+            _normalize_browser_cookie(raw, default_domain=default_domain)
+            for raw in _as_iterable(cookies)
+        )
+        if cookie
+    ]
+
+
+def _normalize_browser_cookie(raw: Any, *, default_domain: Optional[str]) -> Dict[str, Any]:
+    item = copy.deepcopy(dict(raw)) if isinstance(raw, Mapping) else {"name": str(raw), "value": ""}
+    if not item.get("name"):
+        return {}
+    item["name"] = str(item["name"])
+    item["value"] = str(item.get("value", ""))
+    if default_domain:
+        item.setdefault("domain", default_domain)
+    item.setdefault("path", "/")
+    for key in ("httpOnly", "secure"):
+        if key in item:
+            item[key] = bool(item[key])
+    if "sameSite" in item:
+        item["sameSite"] = str(item["sameSite"])
+    return {key: value for key, value in item.items() if value not in (None, {}, [])}
+
+
+def _normalize_browser_origin_storage(
+    storage: Any,
+    *,
+    default_origin: Optional[str],
+    storage_key: str,
+) -> List[Dict[str, Any]]:
+    if not storage:
+        return []
+    if isinstance(storage, Mapping):
+        if storage.get("origin") or storage.get("localStorage") or storage.get("sessionStorage"):
+            return [_normalize_browser_storage_origin(storage, default_origin=default_origin)]
+        origins = []
+        for origin, values in storage.items():
+            origins.append(
+                _normalize_browser_storage_origin(
+                    {"origin": origin, storage_key: values},
+                    default_origin=default_origin,
+                )
+            )
+        return [origin for origin in origins if origin]
+    origins_by_name: Dict[str, Dict[str, Any]] = {}
+    for raw in _as_iterable(storage):
+        item = copy.deepcopy(dict(raw)) if isinstance(raw, Mapping) else {"name": str(raw), "value": ""}
+        origin = str(item.get("origin") or default_origin or "")
+        if not origin:
+            continue
+        origin_item = origins_by_name.setdefault(origin, {"origin": origin, storage_key: []})
+        if item.get(storage_key):
+            origin_item[storage_key].extend(_normalize_browser_storage_entries(item.get(storage_key)))
+        else:
+            entry = _normalize_browser_storage_entry(item)
+            if entry:
+                origin_item[storage_key].append(entry)
+    return [origin for origin in origins_by_name.values() if origin.get(storage_key)]
+
+
+def _normalize_browser_storage_origin(
+    origin: Any,
+    *,
+    default_origin: Optional[str],
+) -> Dict[str, Any]:
+    item = copy.deepcopy(dict(origin)) if isinstance(origin, Mapping) else {"origin": str(origin)}
+    origin_name = str(item.get("origin") or item.get("url") or default_origin or "")
+    if not origin_name:
+        return {}
+    normalized: Dict[str, Any] = {"origin": origin_name}
+    local = _normalize_browser_storage_entries(
+        item.get("localStorage", item.get("local_storage", item.get("local")))
+    )
+    session = _normalize_browser_storage_entries(
+        item.get("sessionStorage", item.get("session_storage", item.get("session")))
+    )
+    indexed_db = _as_iterable(item.get("indexedDB", item.get("indexed_db", [])))
+    if local:
+        normalized["localStorage"] = local
+    if session:
+        normalized["sessionStorage"] = session
+    if indexed_db:
+        normalized["indexedDB"] = [copy.deepcopy(dict(value)) if isinstance(value, Mapping) else {"value": value} for value in indexed_db]
+    return normalized
+
+
+def _normalize_browser_storage_entries(entries: Any) -> List[Dict[str, Any]]:
+    if not entries:
+        return []
+    if isinstance(entries, Mapping):
+        if entries.get("name") is not None:
+            entries = [entries]
+        else:
+            entries = [{"name": name, "value": value} for name, value in entries.items()]
+    normalized: List[Dict[str, Any]] = []
+    for raw in _as_iterable(entries):
+        entry = _normalize_browser_storage_entry(raw)
+        if entry:
+            normalized.append(entry)
+    return normalized
+
+
+def _normalize_browser_storage_entry(raw: Any) -> Dict[str, Any]:
+    item = copy.deepcopy(dict(raw)) if isinstance(raw, Mapping) else {"name": str(raw), "value": ""}
+    if item.get("name") is None and item.get("key") is not None:
+        item["name"] = item["key"]
+    if item.get("name") is None:
+        return {}
+    return {"name": str(item["name"]), "value": str(item.get("value", ""))}
+
+
+def _merge_browser_storage_states(*states: Any) -> Dict[str, Any]:
+    cookies: Dict[tuple[str, str, str], Dict[str, Any]] = {}
+    origins: Dict[str, Dict[str, Any]] = {}
+    for state in states:
+        raw = _load_browser_storage_state(state)
+        if not raw and isinstance(state, Mapping):
+            raw = copy.deepcopy(dict(state))
+        for cookie in _normalize_browser_cookies(raw.get("cookies", [])):
+            signature = (
+                str(cookie.get("name", "")),
+                str(cookie.get("domain", "")),
+                str(cookie.get("path", "")),
+            )
+            cookies[signature] = cookie
+        for origin in _as_iterable(raw.get("origins", [])):
+            origin_dict = _normalize_browser_storage_origin(origin, default_origin=None)
+            origin_name = str(origin_dict.get("origin") or "")
+            if not origin_name:
+                continue
+            merged = origins.setdefault(origin_name, {"origin": origin_name})
+            for key in ("localStorage", "sessionStorage", "indexedDB"):
+                values = _as_iterable(origin_dict.get(key, []))
+                if not values:
+                    continue
+                if key == "indexedDB":
+                    merged[key] = _dedupe_dicts([*merged.get(key, []), *values])
+                    continue
+                by_name = {
+                    str(item.get("name")): copy.deepcopy(dict(item))
+                    for item in _as_iterable(merged.get(key, []))
+                    if isinstance(item, Mapping) and item.get("name") is not None
+                }
+                for item in values:
+                    item_dict = _normalize_browser_storage_entry(item)
+                    if item_dict:
+                        by_name[str(item_dict["name"])] = item_dict
+                merged[key] = list(by_name.values())
+    return {
+        "cookies": list(cookies.values()),
+        "origins": [origin for origin in origins.values() if any(origin.get(key) for key in ("localStorage", "sessionStorage", "indexedDB"))],
+    }
+
+
+def _browser_apply_storage_effect(
+    storage_state: Dict[str, Any],
+    effect: Mapping[str, Any],
+    *,
+    url: Optional[Any],
+) -> Dict[str, Any]:
+    if effect.get("clear_storage"):
+        storage_state.clear()
+        storage_state.update({"cookies": [], "origins": []})
+    updates = _normalize_browser_storage_state(
+        effect.get("storage_state", effect.get("storageState")),
+        url=url,
+        cookies=effect.get("cookies", effect.get("cookie")),
+        local_storage=effect.get("local_storage", effect.get("localStorage")),
+        session_storage=effect.get("session_storage", effect.get("sessionStorage")),
+    )
+    if not _browser_storage_state_has_data(updates) and not effect.get("clear_storage"):
+        return {}
+    merged = _merge_browser_storage_states(storage_state, updates)
+    storage_state.clear()
+    storage_state.update(merged)
+    return {"storage_state": copy.deepcopy(storage_state), "updated": copy.deepcopy(updates)}
+
+
+def _browser_storage_state_has_data(storage_state: Mapping[str, Any]) -> bool:
+    return bool(_as_iterable(storage_state.get("cookies", [])) or _as_iterable(storage_state.get("origins", [])))
+
+
+def _browser_origin_from_url(url: Optional[Any]) -> Optional[str]:
+    if not url:
+        return None
+    parsed = urlparse(str(url))
+    if parsed.scheme and parsed.netloc:
+        return f"{parsed.scheme}://{parsed.netloc}"
+    return None
+
+
+def _normalize_browser_runtime_event(item: str | Mapping[str, Any]) -> Dict[str, Any]:
+    event = copy.deepcopy(dict(item)) if isinstance(item, Mapping) else {"message": str(item)}
+    event_type = str(event.get("type") or event.get("event") or event.get("kind") or "").lower().replace("-", "_")
+    level = str(event.get("level") or event.get("severity") or "").lower()
+    message = event.get("message") or event.get("text") or event.get("error") or event.get("exception")
+    if not event_type:
+        if "page" in level and "error" in level:
+            event_type = "page_error"
+        elif "error" in level or event.get("error") or event.get("exception"):
+            event_type = "runtime_error"
+        else:
+            event_type = "runtime_event"
+    event["type"] = event_type
+    if level:
+        event["level"] = level
+    if message is not None:
+        event["message"] = str(message)
+    return event
+
+
+def _normalize_browser_performance_entry(item: Mapping[str, Any]) -> Dict[str, Any]:
+    entry = copy.deepcopy(dict(item)) if isinstance(item, Mapping) else {"name": str(item)}
+    entry_type = entry.get("entry_type", entry.get("entryType", entry.get("type", entry.get("initiatorType"))))
+    if entry_type is not None:
+        entry["entry_type"] = str(entry_type)
+    duration = _as_number(entry.get("duration_ms", entry.get("duration", entry.get("time_ms", entry.get("time")))))
+    if duration is not None:
+        entry["duration_ms"] = duration
+    start_time = _as_number(entry.get("start_time_ms", entry.get("startTime", entry.get("start_time"))))
+    if start_time is not None:
+        entry["start_time_ms"] = start_time
+    if "name" in entry:
+        entry["name"] = str(entry["name"])
+    return {key: value for key, value in entry.items() if value not in (None, "", {}, [])}
+
+
+def _browser_runtime_summary(
+    runtime_events: Iterable[Mapping[str, Any]],
+    performance_entries: Iterable[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    events = [dict(item) for item in runtime_events]
+    entries = [dict(item) for item in performance_entries]
+    error_events = [
+        item
+        for item in events
+        if "error" in str(item.get("type", "")).lower() or str(item.get("level", "")).lower() == "error"
+    ]
+    warning_events = [
+        item
+        for item in events
+        if str(item.get("level", "")).lower() in {"warn", "warning"}
+    ]
+    durations = [
+        value
+        for value in (_as_number(item.get("duration_ms", item.get("duration"))) for item in entries)
+        if value is not None
+    ]
+    return {
+        "runtime_event_count": len(events),
+        "error_count": len(error_events),
+        "warning_count": len(warning_events),
+        "performance_entry_count": len(entries),
+        "max_duration_ms": max(durations) if durations else 0.0,
+        "long_task_count": sum(1 for value in durations if value >= 50),
+    }
+
+
+def _browser_storage_state_from_record(record: Mapping[str, Any]) -> Dict[str, Any]:
+    browser_state = _coerce_plain_dict(record.get("browser_state") or record.get("state"))
+    return _normalize_browser_storage_state(
+        record.get("storage_state", record.get("storageState", browser_state.get("storage_state", browser_state.get("storageState")))),
+        url=record.get("current_url") or record.get("url") or browser_state.get("url"),
+        cookies=record.get("cookies", browser_state.get("cookies")),
+        local_storage=record.get("local_storage", record.get("localStorage", browser_state.get("localStorage"))),
+        session_storage=record.get("session_storage", record.get("sessionStorage", browser_state.get("sessionStorage"))),
+    )
+
+
+def _browser_runtime_events_from_record(record: Mapping[str, Any], *, index: int) -> List[Dict[str, Any]]:
+    events = [
+        _normalize_browser_runtime_event(item)
+        for item in _as_iterable(record.get("runtime_events", record.get("runtime", [])))
+    ]
+    text = " ".join(str(record.get(key, "")) for key in ("type", "event", "kind", "method", "apiName", "name")).lower()
+    if "pageerror" in text or "page_error" in text or "weberror" in text or "web_error" in text:
+        event = _normalize_browser_runtime_event(
+            {
+                "id": record.get("id") or f"browser_runtime_event_{index + 1}",
+                "type": "page_error" if "page" in text else "web_error",
+                "message": record.get("message") or record.get("text") or record.get("error"),
+                "source": _browser_record_source(record),
+            }
+        )
+        events.append(event)
+    elif record.get("error") or record.get("exception"):
+        events.append(
+            _normalize_browser_runtime_event(
+                {
+                    "id": record.get("id") or f"browser_runtime_event_{index + 1}",
+                    "type": "runtime_error",
+                    "message": record.get("error") or record.get("exception"),
+                    "source": _browser_record_source(record),
+                }
+            )
+        )
+    if "serviceworker" in text or "service_worker" in text:
+        events.append(
+            _normalize_browser_runtime_event(
+                {
+                    "id": record.get("id") or f"service_worker_{index + 1}",
+                    "type": "service_worker",
+                    "url": record.get("url"),
+                    "source": _browser_record_source(record),
+                }
+            )
+        )
+    return _dedupe_dicts(events)
+
+
+def _browser_performance_entries_from_record(record: Mapping[str, Any], *, index: int) -> List[Dict[str, Any]]:
+    entries = [
+        _normalize_browser_performance_entry(item)
+        for item in _as_iterable(record.get("performance_entries", record.get("performance", [])))
+    ]
+    text = " ".join(str(record.get(key, "")) for key in ("type", "event", "kind", "method", "apiName", "name")).lower()
+    if any(token in text for token in ("performance", "navigation_timing", "resource_timing", "paint")):
+        entry = _normalize_browser_performance_entry(
+            {
+                "id": record.get("id") or f"browser_performance_entry_{index + 1}",
+                "name": record.get("name") or record.get("url") or record.get("apiName"),
+                "entry_type": record.get("entry_type") or record.get("entryType") or record.get("type"),
+                "duration_ms": record.get("duration_ms", record.get("duration", record.get("time"))),
+                "start_time_ms": record.get("start_time_ms", record.get("startTime")),
+                "source": _browser_record_source(record),
+            }
+        )
+        if entry:
+            entries.append(entry)
+    return _dedupe_dicts(entries)
 
 
 def _browser_action_selector(arguments: Mapping[str, Any]) -> Optional[str]:
