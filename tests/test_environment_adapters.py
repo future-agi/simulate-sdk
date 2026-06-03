@@ -12,6 +12,7 @@ from fi.simulate import (
     AgentResponse,
     AutonomyLoopEnvironment,
     BrowserEnvironment,
+    DomainPackageEnvironment,
     FileEnvironment,
     FrameworkTraceEnvironment,
     ImageEnvironment,
@@ -2789,6 +2790,74 @@ async def test_structured_artifact_environment_exposes_json_artifacts_and_tools(
         for event in result.events
     )
     assert result.metadata["environment_state"]["structured_artifacts"]["last_inspected"] == "receipt_123"
+
+
+@pytest.mark.asyncio
+async def test_domain_package_environment_exposes_workflow_packages_and_tools():
+    seen_tools = []
+
+    async def agent(input):
+        seen_tools.extend(tool["name"] for tool in input.tools)
+        return AgentResponse(
+            content="Ticket TCK-123 is resolved by Priya and ledger LED-9 is balanced.",
+            tool_calls=[
+                {"id": "list", "name": "list_domain_packages", "arguments": {}},
+                {
+                    "id": "inspect",
+                    "name": "inspect_domain_package",
+                    "arguments": {"id": "support_ticket_123"},
+                },
+            ],
+        )
+
+    report = await LocalTextEngine().run(
+        scenario=_scenario(),
+        agent_callback=agent,
+        environment=DomainPackageEnvironment(
+            {
+                "support_ticket_123": {
+                    "domain": "support",
+                    "package_type": "support_ticket",
+                    "description": "Refund support ticket package.",
+                    "data": {
+                        "ticket_id": "TCK-123",
+                        "status": "resolved",
+                        "assignee": {"id": "agent_priya", "name": "Priya"},
+                        "sla": {"met": True},
+                    },
+                },
+                "ledger_9": {
+                    "domain": "finance",
+                    "package_type": "ledger",
+                    "data": {
+                        "ledger_id": "LED-9",
+                        "entries": [
+                            {"account": "refunds", "debit": 42.0, "credit": 0.0},
+                            {"account": "cash", "debit": 0.0, "credit": 42.0},
+                        ],
+                    },
+                },
+            },
+            default_domain="support",
+        ),
+        max_turns=1,
+        min_turns=1,
+    )
+
+    result = report.results[0]
+    assert {"list_domain_packages", "inspect_domain_package"} <= set(seen_tools)
+    assert any(
+        artifact.type == "json"
+        and artifact.metadata["id"] == "support_ticket_123"
+        and artifact.metadata["kind"] == "domain_package"
+        and artifact.metadata["package_type"] == "support_ticket"
+        for artifact in result.artifacts
+    )
+    assert any(
+        event.type == "domain_package" and event.name == "inspect_domain_package"
+        for event in result.events
+    )
+    assert result.metadata["environment_state"]["domain_packages"]["last_inspected"] == "support_ticket_123"
 
 
 @pytest.mark.asyncio

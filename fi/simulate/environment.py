@@ -3949,6 +3949,162 @@ class StructuredArtifactEnvironment(EnvironmentAdapter):
         }
 
 
+class DomainPackageEnvironment(EnvironmentAdapter):
+    """
+    Local domain package fixtures for workflow-level agent tests.
+
+    Use this for support tickets, ledgers, calendars, email threads, intake
+    packets, claim files, or other packages where correctness depends on
+    domain invariants across multiple structured objects.
+    """
+
+    name = "domain_packages"
+
+    def __init__(
+        self,
+        packages: Mapping[str, Any] | Iterable[Any],
+        *,
+        default_domain: str = "generic",
+        state: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        self.default_domain = str(default_domain)
+        self.initial_state = copy.deepcopy(dict(state or {}))
+        self.state = copy.deepcopy(self.initial_state)
+        if isinstance(packages, Mapping):
+            items = packages.items()
+        else:
+            items = ((f"package_{index + 1}", value) for index, value in enumerate(packages))
+        self.packages = {
+            str(package_id): _normalize_domain_package_fixture(
+                str(package_id),
+                value,
+                default_domain=self.default_domain,
+            )
+            for package_id, value in items
+        }
+
+    def reset(self, **context: Any) -> EnvironmentSnapshot:
+        self.state = copy.deepcopy(self.initial_state)
+        return EnvironmentSnapshot(
+            tools=self._tool_specs(),
+            artifacts=[
+                _domain_package_artifact_from_fixture(fixture)
+                for fixture in self.packages.values()
+            ],
+            state={"domain_packages": self._state_payload()},
+            events=[
+                SimulationEvent(
+                    type="domain_package",
+                    name="domain_packages_ready",
+                    payload={
+                        "ids": sorted(self.packages.keys()),
+                        "domains": sorted({fixture.get("domain", self.default_domain) for fixture in self.packages.values()}),
+                        "package_types": sorted({fixture.get("package_type", "generic") for fixture in self.packages.values()}),
+                    },
+                )
+            ],
+        )
+
+    def handle_tool_call(
+        self,
+        tool_call: Mapping[str, Any],
+        **context: Any,
+    ) -> Optional[ToolExecutionResult]:
+        name = _tool_name(tool_call)
+        if name not in {"list_domain_packages", "inspect_domain_package"}:
+            return None
+        arguments = _tool_arguments(tool_call)
+        call_id = _tool_call_id(tool_call)
+
+        if name == "list_domain_packages":
+            result = {
+                "ids": sorted(self.packages.keys()),
+                "packages": [
+                    {
+                        "id": fixture["id"],
+                        "domain": fixture.get("domain"),
+                        "package_type": fixture.get("package_type"),
+                        "schema": fixture.get("schema"),
+                        "description": fixture.get("description"),
+                    }
+                    for fixture in self.packages.values()
+                ],
+            }
+            return ToolExecutionResult(
+                tool_call_id=call_id,
+                tool_name=name,
+                content=json.dumps(result, default=str),
+                result=result,
+                state_updates={"domain_packages": self._state_payload()},
+                artifacts=[
+                    _domain_package_artifact_from_fixture(fixture)
+                    for fixture in self.packages.values()
+                ],
+                events=[
+                    SimulationEvent(
+                        type="domain_package",
+                        name="list_domain_packages",
+                        payload=result,
+                    )
+                ],
+            )
+
+        package_id = str(arguments.get("id") or arguments.get("package_id") or "")
+        if not package_id and self.packages:
+            package_id = sorted(self.packages.keys())[0]
+        fixture = self.packages.get(package_id)
+        if fixture is None:
+            return ToolExecutionResult(
+                tool_call_id=call_id,
+                tool_name=name,
+                content=f"Domain package not found: {package_id}",
+                success=False,
+                error="domain_package_not_found",
+            )
+        self.state["last_inspected"] = package_id
+        result = copy.deepcopy(fixture)
+        return ToolExecutionResult(
+            tool_call_id=call_id,
+            tool_name=name,
+            content=json.dumps(result, default=str),
+            result=result,
+            state_updates={"domain_packages": self._state_payload()},
+            artifacts=[_domain_package_artifact_from_fixture(fixture)],
+            events=[
+                SimulationEvent(
+                    type="domain_package",
+                    name="inspect_domain_package",
+                    payload=result,
+                )
+            ],
+        )
+
+    def _tool_specs(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                "name": "list_domain_packages",
+                "description": "List domain packages available in the simulated environment.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            {
+                "name": "inspect_domain_package",
+                "description": "Inspect a domain package fixture by id.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"id": {"type": "string"}, "package_id": {"type": "string"}},
+                },
+            },
+        ]
+
+    def _state_payload(self) -> Dict[str, Any]:
+        return {
+            "ids": sorted(self.packages.keys()),
+            "domains": sorted({fixture.get("domain", self.default_domain) for fixture in self.packages.values()}),
+            "package_types": sorted({fixture.get("package_type", "generic") for fixture in self.packages.values()}),
+            **copy.deepcopy(self.state),
+        }
+
+
 class MultiAgentRoomEnvironment(EnvironmentAdapter):
     """Multi-agent room with handoff, review, reconciliation, and trace evidence."""
 
@@ -15863,6 +16019,64 @@ def _structured_artifact_from_fixture(fixture: Mapping[str, Any]) -> SimulationA
     return SimulationArtifact(
         type="json",
         data=copy.deepcopy(fixture.get("data", {})),
+        mime_type=str(fixture.get("mime_type", "application/json")),
+        role=str(fixture.get("role", "environment")),
+        metadata=metadata,
+    )
+
+
+def _normalize_domain_package_fixture(
+    package_id: str,
+    value: Any,
+    *,
+    default_domain: str,
+) -> Dict[str, Any]:
+    if isinstance(value, SimulationArtifact):
+        fixture = value.model_dump() if hasattr(value, "model_dump") else value.dict()
+    elif isinstance(value, Mapping):
+        fixture = copy.deepcopy(dict(value))
+    else:
+        fixture = {"data": value}
+    fixture.setdefault("id", package_id)
+    fixture.setdefault("domain", default_domain)
+    package_type = (
+        fixture.get("package_type")
+        or fixture.get("domain_package_type")
+        or fixture.get("schema")
+        or fixture.get("domain", default_domain)
+    )
+    fixture["package_type"] = str(package_type)
+    fixture.setdefault("schema", fixture["package_type"])
+    fixture.setdefault("metadata", {})
+    fixture.setdefault("data", {})
+    metadata = copy.deepcopy(dict(fixture.get("metadata", {})))
+    metadata.setdefault("kind", "domain_package")
+    metadata.setdefault("id", fixture.get("id"))
+    metadata.setdefault("domain", fixture.get("domain"))
+    metadata.setdefault("package_type", fixture.get("package_type"))
+    metadata.setdefault("schema", fixture.get("schema"))
+    fixture["metadata"] = metadata
+    return fixture
+
+
+def _domain_package_artifact_from_fixture(fixture: Mapping[str, Any]) -> SimulationArtifact:
+    metadata = copy.deepcopy(dict(fixture.get("metadata", {})))
+    metadata.setdefault("id", fixture.get("id"))
+    metadata.setdefault("kind", "domain_package")
+    metadata.setdefault("domain", fixture.get("domain"))
+    metadata.setdefault("package_type", fixture.get("package_type"))
+    metadata.setdefault("schema", fixture.get("schema"))
+    if fixture.get("description") is not None:
+        metadata.setdefault("description", fixture.get("description"))
+    data = copy.deepcopy(fixture.get("data", {}))
+    if isinstance(data, Mapping):
+        data = dict(data)
+        data.setdefault("id", fixture.get("id"))
+        data.setdefault("domain", fixture.get("domain"))
+        data.setdefault("package_type", fixture.get("package_type"))
+    return SimulationArtifact(
+        type="json",
+        data=data,
         mime_type=str(fixture.get("mime_type", "application/json")),
         role=str(fixture.get("role", "environment")),
         metadata=metadata,
