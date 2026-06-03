@@ -15,6 +15,7 @@ from fi.simulate import (
     ImageEnvironment,
     MultiAgentRoomEnvironment,
     RetrievalMemoryEnvironment,
+    StructuredArtifactEnvironment,
     ToolFaultInjectionEnvironment,
     ToolMockEnvironment,
     VoiceEnvironment,
@@ -1596,6 +1597,60 @@ async def test_voice_and_image_environments_expose_media_and_execute_tools():
     assert any(event.type == "voice" and event.name == "tts_output" for event in result.events)
     assert result.metadata["environment_state"]["images"]["last_inspected"] == "receipt"
     assert result.metadata["environment_state"]["voice"]["interruptions_handled"] == 1
+
+
+@pytest.mark.asyncio
+async def test_structured_artifact_environment_exposes_json_artifacts_and_tools():
+    seen_tools = []
+
+    async def agent(input):
+        seen_tools.extend(tool["name"] for tool in input.tools)
+        return AgentResponse(
+            content="Receipt rcpt_123 from Northwind totals $42.00.",
+            tool_calls=[
+                {"id": "list", "name": "list_structured_artifacts", "arguments": {}},
+                {
+                    "id": "inspect",
+                    "name": "inspect_structured_artifact",
+                    "arguments": {"id": "receipt_123"},
+                },
+            ],
+        )
+
+    report = await LocalTextEngine().run(
+        scenario=_scenario(),
+        agent_callback=agent,
+        environment=StructuredArtifactEnvironment(
+            {
+                "receipt_123": {
+                    "domain": "receipt",
+                    "schema": "receipt_v1",
+                    "description": "Receipt for order 123.",
+                    "data": {
+                        "receipt_id": "rcpt_123",
+                        "merchant": "Northwind",
+                        "total": {"amount": 42.0, "currency": "USD"},
+                    },
+                }
+            }
+        ),
+        max_turns=1,
+        min_turns=1,
+    )
+
+    result = report.results[0]
+    assert {"list_structured_artifacts", "inspect_structured_artifact"} <= set(seen_tools)
+    assert any(
+        artifact.type == "json"
+        and artifact.metadata["id"] == "receipt_123"
+        and artifact.metadata["domain"] == "receipt"
+        for artifact in result.artifacts
+    )
+    assert any(
+        event.type == "structured_artifact" and event.name == "inspect_structured_artifact"
+        for event in result.events
+    )
+    assert result.metadata["environment_state"]["structured_artifacts"]["last_inspected"] == "receipt_123"
 
 
 @pytest.mark.asyncio

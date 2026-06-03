@@ -2399,6 +2399,160 @@ class FileEnvironment(EnvironmentAdapter):
         )
 
 
+class StructuredArtifactEnvironment(EnvironmentAdapter):
+    """
+    Local structured artifact fixtures for domain-specific agent tests.
+
+    Use this for receipts, forms, tables, logs, code-review findings, invoices,
+    medical summaries, or any other small structured evidence object. Fixtures
+    are emitted as `json` simulation artifacts and can be inspected through
+    deterministic tools.
+    """
+
+    name = "structured_artifacts"
+
+    def __init__(
+        self,
+        artifacts: Mapping[str, Any] | Iterable[Any],
+        *,
+        default_domain: str = "generic",
+        state: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        self.default_domain = str(default_domain)
+        self.initial_state = copy.deepcopy(dict(state or {}))
+        self.state = copy.deepcopy(self.initial_state)
+        if isinstance(artifacts, Mapping):
+            items = artifacts.items()
+        else:
+            items = ((f"artifact_{index + 1}", value) for index, value in enumerate(artifacts))
+        self.artifacts = {
+            str(artifact_id): _normalize_structured_artifact_fixture(
+                str(artifact_id),
+                value,
+                default_domain=self.default_domain,
+            )
+            for artifact_id, value in items
+        }
+
+    def reset(self, **context: Any) -> EnvironmentSnapshot:
+        self.state = copy.deepcopy(self.initial_state)
+        return EnvironmentSnapshot(
+            tools=self._tool_specs(),
+            artifacts=[
+                _structured_artifact_from_fixture(fixture)
+                for fixture in self.artifacts.values()
+            ],
+            state={"structured_artifacts": self._state_payload()},
+            events=[
+                SimulationEvent(
+                    type="structured_artifact",
+                    name="structured_artifacts_ready",
+                    payload={
+                        "ids": sorted(self.artifacts.keys()),
+                        "domains": sorted({fixture.get("domain", self.default_domain) for fixture in self.artifacts.values()}),
+                    },
+                )
+            ],
+        )
+
+    def handle_tool_call(
+        self,
+        tool_call: Mapping[str, Any],
+        **context: Any,
+    ) -> Optional[ToolExecutionResult]:
+        name = _tool_name(tool_call)
+        if name not in {"list_structured_artifacts", "inspect_structured_artifact"}:
+            return None
+        arguments = _tool_arguments(tool_call)
+        call_id = _tool_call_id(tool_call)
+
+        if name == "list_structured_artifacts":
+            result = {
+                "ids": sorted(self.artifacts.keys()),
+                "artifacts": [
+                    {
+                        "id": fixture["id"],
+                        "domain": fixture.get("domain"),
+                        "schema": fixture.get("schema"),
+                        "description": fixture.get("description"),
+                    }
+                    for fixture in self.artifacts.values()
+                ],
+            }
+            return ToolExecutionResult(
+                tool_call_id=call_id,
+                tool_name=name,
+                content=json.dumps(result, default=str),
+                result=result,
+                state_updates={"structured_artifacts": self._state_payload()},
+                artifacts=[
+                    _structured_artifact_from_fixture(fixture)
+                    for fixture in self.artifacts.values()
+                ],
+                events=[
+                    SimulationEvent(
+                        type="structured_artifact",
+                        name="list_structured_artifacts",
+                        payload=result,
+                    )
+                ],
+            )
+
+        artifact_id = str(arguments.get("id") or arguments.get("artifact_id") or "")
+        if not artifact_id and self.artifacts:
+            artifact_id = sorted(self.artifacts.keys())[0]
+        fixture = self.artifacts.get(artifact_id)
+        if fixture is None:
+            return ToolExecutionResult(
+                tool_call_id=call_id,
+                tool_name=name,
+                content=f"Structured artifact not found: {artifact_id}",
+                success=False,
+                error="structured_artifact_not_found",
+            )
+        self.state["last_inspected"] = artifact_id
+        result = copy.deepcopy(fixture)
+        return ToolExecutionResult(
+            tool_call_id=call_id,
+            tool_name=name,
+            content=json.dumps(result, default=str),
+            result=result,
+            state_updates={"structured_artifacts": self._state_payload()},
+            artifacts=[_structured_artifact_from_fixture(fixture)],
+            events=[
+                SimulationEvent(
+                    type="structured_artifact",
+                    name="inspect_structured_artifact",
+                    payload=result,
+                )
+            ],
+        )
+
+    def _tool_specs(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                "name": "list_structured_artifacts",
+                "description": "List structured artifact fixtures available in the simulated environment.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            {
+                "name": "inspect_structured_artifact",
+                "description": "Inspect a structured artifact fixture by id.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"id": {"type": "string"}, "artifact_id": {"type": "string"}},
+                },
+            },
+        ]
+
+    def _state_payload(self) -> Dict[str, Any]:
+        return {
+            "ids": sorted(self.artifacts.keys()),
+            "domains": sorted({fixture.get("domain", self.default_domain) for fixture in self.artifacts.values()}),
+            **copy.deepcopy(self.state),
+        }
+
+
 class MultiAgentRoomEnvironment(EnvironmentAdapter):
     """Multi-agent room with handoff, review, reconciliation, and trace evidence."""
 
@@ -8467,6 +8621,43 @@ def _image_artifact_from_fixture(fixture: Mapping[str, Any]) -> SimulationArtifa
         path=str(fixture["path"]) if fixture.get("path") is not None else None,
         data=fixture.get("data"),
         mime_type=str(fixture.get("mime_type", "image/png")),
+        role=str(fixture.get("role", "environment")),
+        metadata=metadata,
+    )
+
+
+def _normalize_structured_artifact_fixture(
+    artifact_id: str,
+    value: Any,
+    *,
+    default_domain: str,
+) -> Dict[str, Any]:
+    if isinstance(value, SimulationArtifact):
+        fixture = value.model_dump() if hasattr(value, "model_dump") else value.dict()
+    elif isinstance(value, Mapping):
+        fixture = copy.deepcopy(dict(value))
+    else:
+        fixture = {"data": value}
+    fixture.setdefault("id", artifact_id)
+    fixture.setdefault("domain", default_domain)
+    fixture.setdefault("schema", fixture.get("domain", default_domain))
+    fixture.setdefault("metadata", {})
+    fixture.setdefault("data", {})
+    return fixture
+
+
+def _structured_artifact_from_fixture(fixture: Mapping[str, Any]) -> SimulationArtifact:
+    metadata = copy.deepcopy(dict(fixture.get("metadata", {})))
+    metadata.setdefault("id", fixture.get("id"))
+    metadata.setdefault("kind", "structured_artifact")
+    metadata.setdefault("domain", fixture.get("domain"))
+    metadata.setdefault("schema", fixture.get("schema"))
+    if fixture.get("description") is not None:
+        metadata.setdefault("description", fixture.get("description"))
+    return SimulationArtifact(
+        type="json",
+        data=copy.deepcopy(fixture.get("data", {})),
+        mime_type=str(fixture.get("mime_type", "application/json")),
         role=str(fixture.get("role", "environment")),
         metadata=metadata,
     )
