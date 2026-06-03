@@ -39,11 +39,13 @@ from fi.simulate import (
     load_openai_responses_trace,
     load_langchain_event_stream,
     load_langgraph_event_stream,
+    load_mcp_tool_session_export,
     normalize_orchestration_trace_export,
     normalize_streaming_trace_export,
     normalize_adversarial_attack_pack,
     normalize_framework_trace_events,
     normalize_framework_trace_export,
+    normalize_mcp_tool_session_export,
     normalize_openai_responses_trace,
     normalize_browser_mutation_pack,
     normalize_browser_trace_export,
@@ -2515,6 +2517,104 @@ def test_framework_trace_environment_replays_paginated_authenticated_export():
     assert export_metadata["auth_enabled"] is True
     assert export_metadata["export_source"] == "inline_paginated_export"
     assert {"agent", "model", "tool", "cost"} <= set(trace_state["signals"])
+
+
+def test_normalize_mcp_tool_session_export_preserves_schema_results_and_errors():
+    export = {
+        "server": {"name": "support-tools"},
+        "session_id": "session_1",
+        "tools": [
+            {
+                "name": "search_order",
+                "description": "Look up an order.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"order_id": {"type": "string"}},
+                    "required": ["order_id"],
+                    "additionalProperties": False,
+                },
+            }
+        ],
+        "calls": [
+            {
+                "id": "call_search",
+                "name": "search_order",
+                "arguments": {"order_id": "ord_123"},
+                "result": {"status": "found", "resolved": True},
+                "latency_ms": 42,
+            },
+            {
+                "id": "call_missing",
+                "name": "search_order",
+                "arguments": {"order_id": "ord_missing"},
+                "error": {"message": "not found"},
+            },
+        ],
+    }
+
+    normalized = normalize_mcp_tool_session_export(export)
+    signals = {signal for span in normalized for signal in span["signals"]}
+    schema_span = next(span for span in normalized if span["type"] == "mcp_tool_schema")
+    result_span = next(span for span in normalized if span["type"] == "mcp_tool_result")
+    error_span = next(span for span in normalized if span["type"] == "mcp_tool_error")
+
+    assert {"tool", "mcp_tool_schema", "mcp_tool_call", "mcp_tool_result", "mcp_tool_error"} <= signals
+    assert schema_span["tool_name"] == "search_order"
+    assert schema_span["attributes"]["mcp.tool.input_schema"]["required"] == ["order_id"]
+    assert result_span["input"] == {"order_id": "ord_123"}
+    assert result_span["output"] == {"status": "found", "resolved": True}
+    assert result_span["latency_ms"] == 42
+    assert error_span["error"] == "not found"
+
+
+def test_mcp_tool_session_environment_replays_jsonrpc_tools_and_results():
+    export = [
+        {
+            "jsonrpc": "2.0",
+            "id": "list_1",
+            "result": {
+                "tools": [
+                    {
+                        "name": "search_order",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {"order_id": {"type": "string"}},
+                            "required": ["order_id"],
+                        },
+                    }
+                ]
+            },
+        },
+        {
+            "jsonrpc": "2.0",
+            "id": "call_1",
+            "method": "tools/call",
+            "params": {"name": "search_order", "arguments": {"order_id": "ord_123"}},
+        },
+        {
+            "jsonrpc": "2.0",
+            "id": "call_1",
+            "result": {"structuredContent": {"resolved": True, "status": "found"}},
+        },
+    ]
+
+    environment = load_mcp_tool_session_export(export, server_name="support-tools")
+    snapshot = environment.reset()
+    trace_state = snapshot.state["framework_trace"]
+    listed = environment.handle_tool_call(
+        {"id": "schemas", "name": "list_framework_spans", "arguments": {"signal": "mcp_tool_schema"}}
+    )
+
+    assert trace_state["framework"] == "mcp"
+    assert trace_state["metadata"]["mcp_tool_session"]["tool_names"] == ["search_order"]
+    assert trace_state["metadata"]["mcp_tool_session"]["result_count"] == 1
+    assert {"mcp_tool_schema", "mcp_tool_call", "mcp_tool_result"} <= set(trace_state["signals"])
+    assert listed is not None
+    assert listed.result["spans"][0]["tool_name"] == "search_order"
+    assert any(
+        event.type == "framework_span" and event.payload["type"] == "mcp_tool_result"
+        for event in snapshot.events
+    )
 
 
 @pytest.mark.asyncio

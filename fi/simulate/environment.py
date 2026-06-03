@@ -4514,6 +4514,73 @@ def load_framework_trace_export(
     )
 
 
+def normalize_mcp_tool_session_export(
+    session_export: Any,
+    *,
+    framework: str = "mcp",
+    server_name: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Normalize MCP tools/list and tools/call session exports into framework spans.
+
+    Accepted shapes include MCP JSON-RPC records, `{tools, calls}` fixture
+    payloads, session wrappers, and Future AGI-style exported payloads. The
+    returned spans retain tool schemas, call arguments, results, and errors so
+    agent-report evaluators can score trace coverage, schema conformance, and
+    tool outcomes without calling the MCP server again.
+    """
+
+    records = _mcp_tool_session_export_records(session_export, server_name=server_name)
+    return normalize_framework_trace_events(framework, records, category="span")
+
+
+def load_mcp_tool_session_export(
+    source: str | os.PathLike[str] | Mapping[str, Any] | Iterable[Any],
+    *,
+    framework: str = "mcp",
+    server_name: Optional[str] = None,
+    headers: Optional[Mapping[str, str]] = None,
+    auth: Optional[Mapping[str, Any]] = None,
+    pagination: Optional[Mapping[str, Any]] = None,
+    max_pages: int = 20,
+    timeout: float = 30.0,
+    state: Optional[Mapping[str, Any]] = None,
+    metadata: Optional[Mapping[str, Any]] = None,
+) -> FrameworkTraceEnvironment:
+    """Load a local/HTTP MCP tool session export and return a replay environment."""
+
+    source_metadata: Dict[str, Any] = {}
+    if isinstance(source, (str, os.PathLike)) or _is_export_source_spec(source):
+        loaded, source_metadata = _load_framework_trace_export_source_with_metadata(
+            source,
+            headers=headers,
+            auth=auth,
+            pagination=pagination,
+            max_pages=max_pages,
+            timeout=timeout,
+        )
+    else:
+        loaded = source
+
+    spans = normalize_mcp_tool_session_export(
+        loaded,
+        framework=framework,
+        server_name=server_name,
+    )
+    combined_metadata = copy.deepcopy(dict(metadata or {}))
+    combined_metadata.setdefault("mcp_tool_session", {}).update(
+        _mcp_tool_session_metadata(spans, source_metadata)
+    )
+    if source_metadata:
+        combined_metadata.setdefault("trace_export", {}).update(source_metadata)
+    return FrameworkTraceEnvironment(
+        framework=framework,
+        spans=spans,
+        state=state,
+        metadata=combined_metadata,
+    )
+
+
 def load_langchain_event_stream(
     source: str | os.PathLike[str] | Mapping[str, Any] | Iterable[Any],
     *,
@@ -6519,6 +6586,592 @@ def _looks_like_framework_export_record(export: Mapping[str, Any]) -> bool:
     return False
 
 
+def _mcp_tool_session_export_records(
+    session_export: Any,
+    *,
+    server_name: Optional[str] = None,
+    session_id: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    if session_export is None:
+        return []
+    if isinstance(session_export, str):
+        text = session_export.strip()
+        if not text:
+            return []
+        if text.startswith(("{", "[")) or "\n" in text:
+            return _mcp_tool_session_export_records(
+                _parse_framework_trace_export_text(text),
+                server_name=server_name,
+                session_id=session_id,
+            )
+        return [_mcp_server_record(str(server_name or text), {}, session_id=session_id)]
+    if hasattr(session_export, "model_dump"):
+        return _mcp_tool_session_export_records(
+            session_export.model_dump(),
+            server_name=server_name,
+            session_id=session_id,
+        )
+    if hasattr(session_export, "dict"):
+        return _mcp_tool_session_export_records(
+            session_export.dict(),
+            server_name=server_name,
+            session_id=session_id,
+        )
+    if isinstance(session_export, Mapping):
+        payload = copy.deepcopy(dict(session_export))
+        server = _mcp_server_name(payload, default=server_name)
+        current_session_id = str(
+            payload.get("session_id")
+            or payload.get("sessionId")
+            or payload.get("session")
+            or session_id
+            or ""
+        )
+        records: List[Dict[str, Any]] = []
+        if server:
+            records.append(_mcp_server_record(server, payload, session_id=current_session_id))
+
+        for nested_key in ("sessions", "runs"):
+            for nested in _as_iterable(payload.get(nested_key)):
+                records.extend(
+                    _mcp_tool_session_export_records(
+                        nested,
+                        server_name=server,
+                        session_id=current_session_id,
+                    )
+                )
+
+        for spec in _mcp_tool_specs_from_payload(payload):
+            record = _mcp_tool_schema_record(spec, server_name=server, session_id=current_session_id)
+            if record:
+                records.append(record)
+
+        for index, call in enumerate(_mcp_direct_tool_calls_from_payload(payload), start=1):
+            record = _mcp_tool_call_record(
+                call,
+                server_name=server,
+                session_id=current_session_id,
+                index=index,
+            )
+            if record:
+                records.append(record)
+
+        for event_key in ("events", "records", "messages", "requests", "responses", "items"):
+            events = _as_iterable(payload.get(event_key))
+            if events:
+                records.extend(
+                    _mcp_records_from_event_sequence(
+                        events,
+                        server_name=server,
+                        session_id=current_session_id,
+                    )
+                )
+
+        for resource in _mcp_resources_from_payload(payload):
+            records.append(_mcp_resource_record(resource, server_name=server, session_id=current_session_id))
+
+        if _looks_like_mcp_jsonrpc_record(payload):
+            records.extend(
+                _mcp_records_from_event_sequence(
+                    [payload],
+                    server_name=server,
+                    session_id=current_session_id,
+                )
+            )
+        return _dedupe_mcp_records(records)
+    if isinstance(session_export, Iterable):
+        return _mcp_records_from_event_sequence(
+            list(session_export),
+            server_name=server_name or "mcp",
+            session_id=session_id,
+        )
+    return []
+
+
+def _mcp_records_from_event_sequence(
+    events: Sequence[Any],
+    *,
+    server_name: Optional[str],
+    session_id: Optional[str],
+) -> List[Dict[str, Any]]:
+    records: List[Dict[str, Any]] = []
+    pending_calls: Dict[str, Dict[str, Any]] = {}
+    for index, raw_event in enumerate(events, start=1):
+        event = _coerce_plain_dict(raw_event)
+        if not event:
+            continue
+        server = _mcp_server_name(event, default=server_name)
+        current_session_id = str(
+            event.get("session_id")
+            or event.get("sessionId")
+            or event.get("session")
+            or session_id
+            or ""
+        )
+        for spec in _mcp_tool_specs_from_payload(event):
+            record = _mcp_tool_schema_record(spec, server_name=server, session_id=current_session_id)
+            if record:
+                records.append(record)
+        call = _mcp_tool_call_payload(event)
+        if call:
+            call_id = str(call.get("call_id") or "")
+            if call_id:
+                pending_calls[call_id] = copy.deepcopy(call)
+            record = _mcp_tool_call_record(
+                call,
+                server_name=server,
+                session_id=current_session_id,
+                index=index,
+            )
+            if record:
+                records.append(record)
+            continue
+        result = _mcp_tool_result_payload(event, pending_calls)
+        if result:
+            record = _mcp_tool_call_record(
+                result,
+                server_name=server,
+                session_id=current_session_id,
+                index=index,
+            )
+            if record:
+                records.append(record)
+            continue
+        if _is_mcp_session_wrapper(event):
+            records.extend(
+                _mcp_tool_session_export_records(
+                    event,
+                    server_name=server,
+                    session_id=current_session_id,
+                )
+            )
+    return _dedupe_mcp_records(records)
+
+
+def _mcp_tool_specs_from_payload(payload: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    specs: List[Dict[str, Any]] = []
+    sources = [
+        payload,
+        _coerce_plain_dict(payload.get("result")),
+        _coerce_plain_dict(payload.get("payload")),
+        _coerce_plain_dict(payload.get("data")),
+        _coerce_plain_dict(payload.get("response")),
+        _coerce_plain_dict(payload.get("body")),
+    ]
+    for source in sources:
+        if not source:
+            continue
+        for key in ("tools", "tool_specs", "toolSchemas", "tool_schemas", "schemas", "available_tools"):
+            if key not in source:
+                continue
+            for spec in _mcp_tool_specs_from_value(source.get(key)):
+                if spec:
+                    specs.append(spec)
+    return _dedupe_mcp_specs(specs)
+
+
+def _mcp_tool_specs_from_value(value: Any) -> List[Dict[str, Any]]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [{"name": value}]
+    if isinstance(value, Mapping):
+        if _mcp_tool_spec_name(value):
+            return [copy.deepcopy(dict(value))]
+        specs: List[Dict[str, Any]] = []
+        for name, raw_spec in value.items():
+            spec = _coerce_plain_dict(raw_spec)
+            if not spec and isinstance(raw_spec, str):
+                spec = {"description": raw_spec}
+            spec.setdefault("name", name)
+            specs.append(spec)
+        return specs
+    specs: List[Dict[str, Any]] = []
+    for item in _as_iterable(value):
+        specs.extend(_mcp_tool_specs_from_value(item))
+    return specs
+
+
+def _mcp_direct_tool_calls_from_payload(payload: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    calls: List[Dict[str, Any]] = []
+    sources = [
+        payload,
+        _coerce_plain_dict(payload.get("result")),
+        _coerce_plain_dict(payload.get("payload")),
+        _coerce_plain_dict(payload.get("data")),
+        _coerce_plain_dict(payload.get("response")),
+        _coerce_plain_dict(payload.get("body")),
+    ]
+    for source in sources:
+        for key in ("tool_calls", "calls", "invocations", "executions", "tool_invocations"):
+            for item in _as_iterable(source.get(key)):
+                call = _mcp_tool_call_payload(item) or _coerce_plain_dict(item)
+                if _mcp_tool_name_from_call(call):
+                    calls.append(call)
+    return calls
+
+
+def _mcp_resources_from_payload(payload: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    resources: List[Dict[str, Any]] = []
+    for source in (payload, _coerce_plain_dict(payload.get("result")), _coerce_plain_dict(payload.get("payload"))):
+        for key in ("resources", "resource_templates"):
+            for item in _as_iterable(source.get(key)):
+                item_dict = _coerce_plain_dict(item)
+                if item_dict:
+                    resources.append(item_dict)
+    return resources
+
+
+def _mcp_server_name(payload: Mapping[str, Any], *, default: Optional[str]) -> str:
+    nested = _coerce_plain_dict(payload.get("server"))
+    value = payload.get("server_name") or payload.get("serverName") or payload.get("server")
+    if not value and str(payload.get("type") or "").lower() in {"server", "mcp_server"}:
+        value = payload.get("name")
+    if isinstance(value, Mapping):
+        value = value.get("name")
+    return str(value or nested.get("name") or default or "mcp")
+
+
+def _mcp_server_record(
+    server_name: str,
+    payload: Mapping[str, Any],
+    *,
+    session_id: Optional[str],
+) -> Dict[str, Any]:
+    attributes = {
+        "mcp.server.name": server_name,
+        "mcp.session.id": session_id,
+    }
+    if payload.get("protocol_version") or payload.get("protocolVersion"):
+        attributes["mcp.protocol.version"] = payload.get("protocol_version") or payload.get("protocolVersion")
+    return {
+        "id": f"mcp_server_{_safe_trace_id(server_name)}",
+        "span_id": f"mcp_server_{_safe_trace_id(server_name)}",
+        "name": f"MCP server {server_name}",
+        "type": "mcp_server",
+        "framework": "mcp",
+        "signals": ["framework", "mcp", "mcp_server"],
+        "attributes": {key: value for key, value in attributes.items() if value not in (None, "", [], {})},
+    }
+
+
+def _mcp_tool_schema_record(
+    raw_spec: Mapping[str, Any],
+    *,
+    server_name: str,
+    session_id: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    spec = copy.deepcopy(dict(raw_spec))
+    name = _mcp_tool_spec_name(spec)
+    if not name:
+        return None
+    schema = _mcp_tool_schema_from_spec(spec)
+    description = spec.get("description") or _coerce_plain_dict(spec.get("function")).get("description")
+    attributes = {
+        "mcp.server.name": server_name,
+        "mcp.session.id": session_id,
+        "mcp.tool.name": name,
+        "mcp.tool.description": description,
+        "mcp.tool.input_schema": schema,
+        "parameters": schema,
+    }
+    return {
+        "id": f"mcp_schema_{_safe_trace_id(name)}",
+        "span_id": f"mcp_schema_{_safe_trace_id(name)}",
+        "name": f"MCP tool schema {name}",
+        "type": "mcp_tool_schema",
+        "framework": "mcp",
+        "tool_name": name,
+        "input": schema,
+        "signals": ["mcp", "mcp_tool_schema", "tool", "tool_schema"],
+        "attributes": {key: copy.deepcopy(value) for key, value in attributes.items() if value not in (None, "", [], {})},
+    }
+
+
+def _mcp_resource_record(
+    raw_resource: Mapping[str, Any],
+    *,
+    server_name: str,
+    session_id: Optional[str],
+) -> Dict[str, Any]:
+    name = str(raw_resource.get("name") or raw_resource.get("uri") or raw_resource.get("template") or "resource")
+    attributes = {
+        "mcp.server.name": server_name,
+        "mcp.session.id": session_id,
+        "mcp.resource.name": name,
+        "mcp.resource.uri": raw_resource.get("uri"),
+        "mcp.resource.mime_type": raw_resource.get("mimeType") or raw_resource.get("mime_type"),
+    }
+    return {
+        "id": f"mcp_resource_{_safe_trace_id(name)}",
+        "span_id": f"mcp_resource_{_safe_trace_id(name)}",
+        "name": f"MCP resource {name}",
+        "type": "mcp_resource",
+        "framework": "mcp",
+        "signals": ["mcp", "mcp_resource", "retrieval"],
+        "attributes": {key: copy.deepcopy(value) for key, value in attributes.items() if value not in (None, "", [], {})},
+    }
+
+
+def _mcp_tool_call_payload(raw: Any) -> Dict[str, Any]:
+    event = _coerce_plain_dict(raw)
+    if not event:
+        return {}
+    method = str(event.get("method") or "").lower()
+    params = _coerce_plain_dict(event.get("params"))
+    function = _coerce_plain_dict(event.get("function"))
+    if method and "tools/call" not in method and method not in {"tool_call", "call_tool"}:
+        return {}
+    if _mcp_tool_spec_name(event) and _mcp_tool_schema_from_spec(event) and not any(
+        key in event for key in ("arguments", "args", "input", "result", "output", "content", "error")
+    ):
+        return {}
+    name = (
+        event.get("tool_name")
+        or event.get("tool")
+        or event.get("name")
+        or params.get("name")
+        or function.get("name")
+    )
+    if not name:
+        return {}
+    arguments = (
+        event.get("arguments")
+        if "arguments" in event
+        else event.get("args", event.get("input", params.get("arguments", params.get("input", function.get("arguments", {})))))
+    )
+    return {
+        "call_id": event.get("id") or event.get("call_id") or event.get("tool_call_id") or params.get("id"),
+        "name": str(name),
+        "arguments": _mcp_parse_arguments(arguments),
+        "result": event.get("result", event.get("output", event.get("content"))),
+        "error": event.get("error") or event.get("exception"),
+        "status": event.get("status"),
+        "latency_ms": event.get("latency_ms") or event.get("duration_ms") or event.get("elapsed_ms"),
+        "state_updates": event.get("state_updates") or event.get("stateUpdates"),
+    }
+
+
+def _mcp_tool_result_payload(
+    raw: Any,
+    pending_calls: Mapping[str, Mapping[str, Any]],
+) -> Dict[str, Any]:
+    event = _coerce_plain_dict(raw)
+    if not event:
+        return {}
+    call_id = str(event.get("id") or event.get("call_id") or event.get("tool_call_id") or "")
+    if not call_id or call_id not in pending_calls:
+        return {}
+    if "result" not in event and "error" not in event and "output" not in event and "content" not in event:
+        return {}
+    result = copy.deepcopy(dict(pending_calls[call_id]))
+    result["result"] = event.get("result", event.get("output", event.get("content")))
+    result["error"] = event.get("error") or event.get("exception")
+    result["status"] = event.get("status")
+    result["latency_ms"] = event.get("latency_ms") or event.get("duration_ms") or event.get("elapsed_ms")
+    return result
+
+
+def _mcp_tool_call_record(
+    call: Mapping[str, Any],
+    *,
+    server_name: str,
+    session_id: Optional[str],
+    index: int,
+) -> Optional[Dict[str, Any]]:
+    tool_name = _mcp_tool_name_from_call(call)
+    if not tool_name:
+        return None
+    arguments = _mcp_parse_arguments(call.get("arguments", {}))
+    error = _mcp_error_value(call.get("error"))
+    output = _mcp_result_value(call.get("result"))
+    status = str(call.get("status") or "").lower()
+    if status in {"error", "failed", "failure", "exception"} and error is None:
+        error = status
+    record_type = "mcp_tool_error" if error else "mcp_tool_result" if output is not None else "mcp_tool_call"
+    signals = ["mcp", "mcp_tool_call", "tool"]
+    if output is not None:
+        signals.extend(["mcp_tool_result", "tool_result"])
+    if error:
+        signals.extend(["error", "mcp_tool_error", "tool_error"])
+    call_id = call.get("call_id") or f"{tool_name}_{index}"
+    attributes = {
+        "mcp.server.name": server_name,
+        "mcp.session.id": session_id,
+        "mcp.tool.name": tool_name,
+        "mcp.request.id": call_id,
+        "arguments": arguments,
+        "mcp.tool.arguments": arguments,
+        "result": output,
+        "mcp.tool.result": output,
+        "success": not bool(error),
+        "state_updates": call.get("state_updates"),
+    }
+    record = {
+        "id": f"mcp_call_{_safe_trace_id(call_id)}",
+        "span_id": f"mcp_call_{_safe_trace_id(call_id)}",
+        "name": f"MCP tool {'error' if error else 'result' if output is not None else 'call'} {tool_name}",
+        "type": record_type,
+        "framework": "mcp",
+        "tool_name": tool_name,
+        "input": arguments,
+        "output": output,
+        "error": error,
+        "latency_ms": _voice_int(call.get("latency_ms")),
+        "signals": signals,
+        "attributes": {key: copy.deepcopy(value) for key, value in attributes.items() if value not in (None, "", [], {})},
+    }
+    return {key: copy.deepcopy(value) for key, value in record.items() if value not in (None, "", [], {})}
+
+
+def _mcp_tool_spec_name(spec: Mapping[str, Any]) -> str:
+    function = _coerce_plain_dict(spec.get("function"))
+    return str(spec.get("name") or spec.get("tool_name") or spec.get("tool") or function.get("name") or "")
+
+
+def _mcp_tool_schema_from_spec(spec: Mapping[str, Any]) -> Dict[str, Any]:
+    function = _coerce_plain_dict(spec.get("function"))
+    schema = (
+        spec.get("inputSchema")
+        or spec.get("input_schema")
+        or spec.get("parameters")
+        or spec.get("schema")
+        or function.get("parameters")
+    )
+    if isinstance(schema, str):
+        try:
+            parsed = json.loads(schema)
+            return _coerce_plain_dict(parsed)
+        except json.JSONDecodeError:
+            return {}
+    return _coerce_plain_dict(schema)
+
+
+def _mcp_tool_name_from_call(call: Mapping[str, Any]) -> str:
+    return str(call.get("name") or call.get("tool_name") or call.get("tool") or "")
+
+
+def _mcp_parse_arguments(value: Any) -> Dict[str, Any]:
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return {"value": value}
+        return _coerce_plain_dict(parsed)
+    if isinstance(value, Mapping):
+        return copy.deepcopy(dict(value))
+    return _coerce_plain_dict(value)
+
+
+def _mcp_result_value(value: Any) -> Any:
+    result = _coerce_plain_dict(value)
+    if result:
+        if result.get("structuredContent") is not None:
+            return copy.deepcopy(result.get("structuredContent"))
+        if result.get("structured_content") is not None:
+            return copy.deepcopy(result.get("structured_content"))
+        content = _as_iterable(result.get("content"))
+        if content:
+            return _mcp_content_value(content)
+        return result
+    return copy.deepcopy(value)
+
+
+def _mcp_content_value(content: Sequence[Any]) -> Any:
+    parsed_items: List[Any] = []
+    for item in content:
+        item_dict = _coerce_plain_dict(item)
+        if item_dict.get("json") is not None:
+            parsed_items.append(copy.deepcopy(item_dict["json"]))
+            continue
+        text = item_dict.get("text")
+        if isinstance(text, str):
+            try:
+                parsed_items.append(json.loads(text))
+            except json.JSONDecodeError:
+                parsed_items.append(text)
+            continue
+        parsed_items.append(copy.deepcopy(item))
+    if len(parsed_items) == 1:
+        return parsed_items[0]
+    return parsed_items
+
+
+def _mcp_error_value(value: Any) -> Any:
+    error = _coerce_plain_dict(value)
+    if error:
+        return error.get("message") or error.get("code") or error
+    return value
+
+
+def _looks_like_mcp_jsonrpc_record(value: Mapping[str, Any]) -> bool:
+    method = str(value.get("method") or "").lower()
+    params = _coerce_plain_dict(value.get("params"))
+    result = _coerce_plain_dict(value.get("result"))
+    return (
+        method.startswith("tools/")
+        or bool(params.get("name") and "arguments" in params)
+        or bool(result.get("tools"))
+        or bool(value.get("jsonrpc") and ("result" in value or "error" in value))
+    )
+
+
+def _is_mcp_session_wrapper(value: Mapping[str, Any]) -> bool:
+    return any(key in value for key in ("sessions", "tools", "calls", "tool_calls", "resources"))
+
+
+def _mcp_tool_session_metadata(
+    spans: Sequence[Mapping[str, Any]],
+    source_metadata: Mapping[str, Any],
+) -> Dict[str, Any]:
+    tool_names = sorted({str(span.get("tool_name")) for span in spans if span.get("tool_name")})
+    signals = {str(signal) for span in spans for signal in _as_iterable(span.get("signals"))}
+    metadata = {
+        "span_count": len(spans),
+        "tool_count": len(tool_names),
+        "tool_names": tool_names,
+        "schema_count": sum(1 for span in spans if "mcp_tool_schema" in _as_iterable(span.get("signals"))),
+        "call_count": sum(1 for span in spans if "mcp_tool_call" in _as_iterable(span.get("signals"))),
+        "result_count": sum(1 for span in spans if "mcp_tool_result" in _as_iterable(span.get("signals"))),
+        "error_count": sum(1 for span in spans if "mcp_tool_error" in _as_iterable(span.get("signals"))),
+        "signals": sorted(signals),
+    }
+    if source_metadata:
+        metadata["source"] = copy.deepcopy(dict(source_metadata))
+    return metadata
+
+
+def _dedupe_mcp_specs(specs: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+    deduped: List[Dict[str, Any]] = []
+    seen = set()
+    for spec in specs:
+        name = _mcp_tool_spec_name(spec)
+        signature = json.dumps({"name": name, "schema": _mcp_tool_schema_from_spec(spec)}, sort_keys=True, default=str)
+        if signature in seen:
+            continue
+        seen.add(signature)
+        deduped.append(copy.deepcopy(dict(spec)))
+    return deduped
+
+
+def _dedupe_mcp_records(records: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+    deduped: List[Dict[str, Any]] = []
+    seen = set()
+    for record in records:
+        signature = json.dumps(record, sort_keys=True, default=str)
+        if signature in seen:
+            continue
+        seen.add(signature)
+        deduped.append(copy.deepcopy(dict(record)))
+    return deduped
+
+
+def _safe_trace_id(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    cleaned = [character if character.isalnum() else "_" for character in text]
+    return "_".join("".join(cleaned).split("_")) or "item"
+
+
 def _load_framework_event_stream_records(
     source: str | os.PathLike[str] | Mapping[str, Any] | Iterable[Any],
     *,
@@ -7149,6 +7802,14 @@ FRAMEWORK_TRACE_ALIASES = {
     "function_call": "tool",
     "function_tool": "tool",
     "tool_call": "tool",
+    "tool_schema": "tool_schema",
+    "tool_result": "tool_result",
+    "tool_output": "tool_result",
+    "tool_error": "tool_error",
+    "mcp_tool_schema": "mcp_tool_schema",
+    "mcp_tool_call": "mcp_tool_call",
+    "mcp_tool_result": "mcp_tool_result",
+    "mcp_tool_error": "mcp_tool_error",
     "handoffs": "handoff",
     "delegation": "handoff",
     "transfer": "handoff",
@@ -7863,6 +8524,10 @@ def _framework_signals(
         ]
     ).lower()
     signals = {"span"}
+    for source in (raw, data, payload, attributes):
+        for signal in _as_iterable(source.get("signals")):
+            if signal not in (None, "", [], {}):
+                signals.add(str(signal))
     if raw.get("framework"):
         signals.add("framework")
     keyword_signals = {

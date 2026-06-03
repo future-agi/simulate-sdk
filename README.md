@@ -342,6 +342,7 @@ from fi.simulate import (
     load_browser_mutation_pack,
     load_browser_trace_export,
     load_framework_trace_export,
+    load_mcp_tool_session_export,
     load_orchestration_trace_export,
     load_pipecat_frame_log,
     load_streaming_trace_export,
@@ -360,6 +361,7 @@ from fi.simulate import (
     normalize_voice_timing_distribution,
     normalize_world_contract,
     normalize_framework_trace_events,
+    normalize_mcp_tool_session_export,
     normalize_browser_trace_export,
 )
 
@@ -517,6 +519,9 @@ environment = FrameworkTraceEnvironment(framework="traceai", events=trace_record
 # Direct export replay also works for OTLP JSON, JSONL, and exported payloads:
 environment = load_framework_trace_export("traceai-export.jsonl", framework="traceai")
 environment = FrameworkTraceEnvironment.from_export(framework="traceai", export=otlp_payload)
+
+# MCP tools/list and tools/call session replay:
+environment = load_mcp_tool_session_export("mcp-session.jsonl", server_name="support-tools")
 
 # LangChain/LangGraph stream_events replay:
 environment = load_langgraph_event_stream({"events": langgraph_stream_events})
