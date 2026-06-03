@@ -16,6 +16,7 @@ from fi.simulate import (
     FileEnvironment,
     FrameworkCapabilityEnvironment,
     FrameworkLifecycleEnvironment,
+    FrameworkProbeEnvironment,
     FrameworkTraceEnvironment,
     ImageEnvironment,
     MultiAgentRoomEnvironment,
@@ -55,6 +56,7 @@ from fi.simulate import (
     normalize_adversarial_attack_pack,
     normalize_framework_capability_matrix,
     normalize_framework_lifecycle_trace,
+    normalize_framework_probe_suite,
     normalize_framework_trace_events,
     normalize_framework_adapter_conformance,
     normalize_observability_replay_pack,
@@ -2084,6 +2086,117 @@ async def test_framework_capability_environment_replays_capability_matrix():
     metrics = evaluation.summary["metric_averages"]
     assert metrics["framework_capability_coverage"] == 1.0
     assert metrics["framework_capability_quality"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_framework_probe_environment_replays_probe_suite():
+    suite = normalize_framework_probe_suite(
+        name="langgraph-probes",
+        framework="langgraph",
+        version="1.0",
+        probes=[
+            {"id": "invoke", "operation": "invoke", "category": "runtime", "status": "passed", "evidence": ["ainvoke dry run"], "latency_ms": 18},
+            {"id": "list_tools", "operation": "list_tools", "category": "tools", "status": "passed", "evidence": ["tools/list"]},
+            {"id": "tool_call", "operation": "tool_call", "category": "tools", "status": "passed", "evidence": ["lookup_policy result"]},
+            {"id": "write_memory", "operation": "write_memory", "category": "memory", "status": "passed", "evidence": ["memory write"]},
+            {"id": "read_memory", "operation": "read_memory", "category": "memory", "status": "passed", "evidence": ["memory read"]},
+            {"id": "stream", "operation": "stream", "category": "streaming", "status": "passed", "evidence": ["stream chunk"]},
+            {"id": "checkpoint_save", "operation": "checkpoint_save", "category": "lifecycle", "status": "passed", "evidence": ["checkpoint"]},
+            {"id": "checkpoint_resume", "operation": "checkpoint_resume", "category": "lifecycle", "status": "passed", "evidence": ["resume"]},
+            {"id": "handoff", "operation": "handoff", "category": "orchestration", "status": "passed", "evidence": ["handoff contract"]},
+            {"id": "guardrail", "operation": "guardrail", "category": "security", "status": "passed", "evidence": ["policy gate"]},
+            {"id": "trace_export", "operation": "trace_export", "category": "observability", "status": "passed", "evidence": ["OTel span"]},
+            {"id": "export", "operation": "export", "category": "exports", "status": "passed", "evidence": ["Future AGI dataset row"]},
+            {"id": "voice_turn", "operation": "voice_turn", "category": "voice", "status": "skipped", "required": False, "evidence": ["not needed for this task"]},
+        ],
+    )
+    assert suite["summary"]["probe_count"] == 13
+    assert suite["summary"]["required_pass_rate"] == 1.0
+    assert suite["summary"]["has_memory"] is True
+
+    async def agent(input):
+        return AgentResponse(
+            content="Framework adapter probes passed for invoke, tools, memory, streaming, lifecycle, orchestration, security, observability, and exports.",
+            tool_calls=[
+                {"id": "status", "name": "framework_probe_status", "arguments": {}},
+                {"id": "tools", "name": "list_framework_probes", "arguments": {"category": "tools", "status": "passed"}},
+                {"id": "inspect", "name": "inspect_framework_probe", "arguments": {"id": "checkpoint_resume"}},
+                {"id": "failures", "name": "list_framework_probe_failures", "arguments": {}},
+            ],
+        )
+
+    report = await LocalTextEngine().run(
+        scenario=_scenario(),
+        agent_callback=agent,
+        environment=FrameworkProbeEnvironment(suite),
+        max_turns=1,
+        min_turns=1,
+    )
+
+    result = report.results[0]
+    state = result.metadata["environment_state"]["framework_probe_suite"]
+    assert state["summary"]["passed_count"] == 12
+    assert state["summary"]["failed_count"] == 0
+    assert any(
+        artifact.metadata.get("kind") == "framework_probe_suite"
+        for artifact in result.artifacts
+    )
+
+    evaluation = evaluate_agent_report(
+        report,
+        config={
+            "required_framework_probes": [
+                "framework_probe",
+                "invoke",
+                "list_tools",
+                "tool_call",
+                "write_memory",
+                "read_memory",
+                "stream",
+                "checkpoint_save",
+                "checkpoint_resume",
+                "handoff",
+                "guardrail",
+                "trace_export",
+                "export",
+            ],
+            "framework_probe_quality": {
+                "framework": "langgraph",
+                "required_operations": [
+                    "invoke",
+                    "list_tools",
+                    "tool_call",
+                    "write_memory",
+                    "read_memory",
+                    "stream",
+                    "checkpoint_save",
+                    "checkpoint_resume",
+                    "handoff",
+                    "guardrail",
+                    "trace_export",
+                    "export",
+                ],
+                "required_categories": ["tools", "memory", "streaming", "lifecycle", "orchestration", "security", "observability", "exports"],
+                "min_passed_probes": 12,
+                "min_required_pass_rate": 1.0,
+                "max_failed_probes": 0,
+                "max_blocked_probes": 0,
+                "require_evidence": True,
+                "require_tools": True,
+                "require_memory": True,
+                "require_streaming": True,
+                "require_lifecycle": True,
+                "require_orchestration": True,
+                "require_security": True,
+                "require_observability": True,
+                "require_exports": True,
+            },
+        },
+        threshold=0.9,
+    )
+    metrics = evaluation.summary["metric_averages"]
+    assert metrics["framework_probe_coverage"] == 1.0
+    assert metrics["framework_probe_quality"] == 1.0
 
 
 @pytest.mark.asyncio

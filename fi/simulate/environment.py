@@ -5583,6 +5583,200 @@ class FrameworkCapabilityEnvironment(EnvironmentAdapter):
         )
 
 
+class FrameworkProbeEnvironment(EnvironmentAdapter):
+    """
+    Replay framework adapter smoke probes as certification evidence.
+
+    Use this when capability claims need proof that adapter operations actually
+    work: invoke, stream, list tools, call tools, memory read/write,
+    checkpoint/resume, handoff, guardrail, trace export, or custom probes.
+    """
+
+    name = "framework_probe"
+
+    def __init__(
+        self,
+        suite: Any = None,
+        *,
+        name: str = "framework-probe-suite",
+        framework: str = "custom",
+        version: Optional[str] = None,
+        probes: Optional[Iterable[Any]] = None,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        self.suite = normalize_framework_probe_suite(
+            suite,
+            name=name,
+            framework=framework,
+            version=version,
+            probes=probes,
+            metadata=metadata,
+        )
+
+    def reset(self, **context: Any) -> EnvironmentSnapshot:
+        return EnvironmentSnapshot(
+            tools=self._tool_specs(),
+            artifacts=[self._probe_artifact()],
+            events=[
+                SimulationEvent(
+                    type="framework_probe",
+                    name="framework_probe_suite_ready",
+                    payload={
+                        "framework": self.suite["framework"],
+                        "probe_count": self.suite["summary"]["probe_count"],
+                        "pass_rate": self.suite["summary"]["pass_rate"],
+                        "signals": copy.deepcopy(self.suite["signals"]),
+                    },
+                ),
+                *[
+                    SimulationEvent(
+                        type="framework_probe",
+                        name="framework_probe_record",
+                        payload=copy.deepcopy(probe),
+                    )
+                    for probe in self.suite["probes"]
+                ],
+            ],
+            state={"framework_probe_suite": copy.deepcopy(self.suite)},
+            metadata={"framework_probe_suite": copy.deepcopy(self.suite)},
+        )
+
+    def observe(self, **context: Any) -> EnvironmentSnapshot:
+        return EnvironmentSnapshot(
+            artifacts=[self._probe_artifact()],
+            state={"framework_probe_suite": copy.deepcopy(self.suite)},
+            metadata={"framework_probe_suite": copy.deepcopy(self.suite)},
+        )
+
+    def handle_tool_call(
+        self,
+        tool_call: Mapping[str, Any],
+        **context: Any,
+    ) -> Optional[ToolExecutionResult]:
+        name = _tool_name(tool_call)
+        if name not in {
+            "framework_probe_status",
+            "list_framework_probes",
+            "inspect_framework_probe",
+            "list_framework_probe_failures",
+        }:
+            return None
+        arguments = _tool_arguments(tool_call)
+        call_id = _tool_call_id(tool_call)
+
+        if name == "framework_probe_status":
+            result = copy.deepcopy(self.suite)
+            event_name = "framework_probe_status"
+            content = f"{self.suite['framework']} framework probe suite status recorded."
+            success = True
+            error = None
+        elif name == "list_framework_probe_failures":
+            failures = [
+                copy.deepcopy(probe)
+                for probe in self.suite["probes"]
+                if probe.get("status") in {"failed", "blocked"}
+            ]
+            result = {"framework": self.suite["framework"], "probes": failures}
+            event_name = "framework_probe_failures_listed"
+            content = f"Listed {len(failures)} failed or blocked framework probe(s)."
+            success = True
+            error = None
+        elif name == "list_framework_probes":
+            category = _normalize_framework_probe_key(arguments.get("category") or "")
+            operation = _normalize_framework_probe_operation(arguments.get("operation") or "")
+            status = _normalize_framework_probe_status(arguments.get("status") or "")
+            required = arguments.get("required")
+            probes = copy.deepcopy(self.suite["probes"])
+            if category:
+                probes = [probe for probe in probes if probe.get("category") == category]
+            if operation:
+                probes = [probe for probe in probes if probe.get("operation") == operation]
+            if status:
+                probes = [probe for probe in probes if probe.get("status") == status]
+            if required is not None:
+                probes = [probe for probe in probes if bool(probe.get("required")) is bool(required)]
+            result = {
+                "framework": self.suite["framework"],
+                "probes": probes,
+                "filters": {
+                    "category": category,
+                    "operation": operation,
+                    "status": status,
+                    "required": required,
+                },
+            }
+            event_name = "framework_probes_listed"
+            content = f"Listed {len(probes)} framework probe(s)."
+            success = True
+            error = None
+        else:
+            probe_id = str(arguments.get("id") or arguments.get("name") or arguments.get("operation") or "")
+            probe = _find_framework_probe(self.suite["probes"], probe_id)
+            success = probe is not None
+            result = {"framework": self.suite["framework"], "probe": copy.deepcopy(probe), "query": probe_id}
+            event_name = "framework_probe_inspected" if success else "framework_probe_missing"
+            content = f"Inspected framework probe {probe_id}." if success else f"Framework probe not found: {probe_id}"
+            error = None if success else "probe_not_found"
+
+        return ToolExecutionResult(
+            tool_call_id=call_id,
+            tool_name=name,
+            content=content,
+            result=result,
+            success=success,
+            error=error,
+            state_updates={"framework_probe_suite": copy.deepcopy(self.suite)},
+            artifacts=[self._probe_artifact()],
+            events=[
+                SimulationEvent(
+                    type="framework_probe",
+                    name=event_name,
+                    payload=result,
+                )
+            ],
+        )
+
+    def _tool_specs(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                "name": "framework_probe_status",
+                "description": "Return normalized framework probe suite state and summary.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            {
+                "name": "list_framework_probes",
+                "description": "List framework probes filtered by category, operation, status, or required flag.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "category": {"type": "string"},
+                        "operation": {"type": "string"},
+                        "status": {"type": "string"},
+                        "required": {"type": "boolean"},
+                    },
+                },
+            },
+            {
+                "name": "inspect_framework_probe",
+                "description": "Inspect one framework probe by id, name, or operation.",
+                "parameters": {"type": "object", "properties": {"id": {"type": "string"}}},
+            },
+            {
+                "name": "list_framework_probe_failures",
+                "description": "List failed or blocked framework probes.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        ]
+
+    def _probe_artifact(self) -> SimulationArtifact:
+        return SimulationArtifact(
+            type="trace",
+            role="environment",
+            data=copy.deepcopy(self.suite),
+            metadata={"kind": "framework_probe_suite", "framework": self.suite["framework"]},
+        )
+
+
 class ObservabilityReplayEnvironment(EnvironmentAdapter):
     """
     Replay production observability/regression cases as local simulation evidence.
@@ -7385,6 +7579,315 @@ def _normalize_framework_capability_key(value: Any) -> str:
         "guardrails": "security",
     }
     return aliases.get(normalized, normalized)
+
+
+def normalize_framework_probe_suite(
+    suite: Any = None,
+    *,
+    name: str = "framework-probe-suite",
+    framework: str = "custom",
+    version: Optional[str] = None,
+    probes: Optional[Iterable[Any]] = None,
+    metadata: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Normalize framework adapter smoke-test results into replayable evidence.
+
+    Probe records can come from local dry runs, adapter smoke tests, MCP
+    tools/list/call sessions, TraceAI/OpenTelemetry exports, or manual fixtures.
+    """
+
+    source = _coerce_plain_dict(suite)
+    suite_name = str(source.get("name") or source.get("id") or name)
+    suite_framework = str(source.get("framework") or framework)
+    suite_version = source.get("version") or source.get("framework_version") or version
+    raw_probes = (
+        probes
+        if probes is not None
+        else source.get("probes")
+        or source.get("checks")
+        or source.get("smoke_tests")
+        or source.get("tests")
+        or []
+    )
+    normalized_probes = [
+        _normalize_framework_probe(probe)
+        for probe in _as_iterable(raw_probes)
+    ]
+    normalized_probes = [probe for probe in normalized_probes if probe.get("operation")]
+    suite_metadata = {**_coerce_plain_dict(source.get("metadata")), **copy.deepcopy(dict(metadata or {}))}
+    summary = _framework_probe_summary(normalized_probes)
+    signals = _framework_probe_signals(normalized_probes, source.get("signals"))
+    return {
+        "kind": "framework_probe_suite",
+        "name": suite_name,
+        "framework": suite_framework,
+        "version": str(suite_version or ""),
+        "probes": normalized_probes,
+        "summary": summary,
+        "signals": signals,
+        "metadata": suite_metadata,
+    }
+
+
+def _normalize_framework_probe(value: Any) -> Dict[str, Any]:
+    if isinstance(value, str):
+        raw = {"operation": value, "status": "passed", "required": True}
+    else:
+        raw = _coerce_plain_dict(value)
+    operation = _normalize_framework_probe_operation(
+        raw.get("operation")
+        or raw.get("name")
+        or raw.get("id")
+        or raw.get("probe")
+        or raw.get("check")
+    )
+    category = _framework_probe_category(raw, operation)
+    status = _framework_probe_status_from_record(raw)
+    evidence = [
+        _normalize_framework_evidence(item)
+        for item in _as_iterable(raw.get("evidence") or raw.get("proof") or raw.get("result"))
+    ]
+    signals = {
+        "framework_probe",
+        "probe",
+        operation,
+        category,
+        status,
+        *[
+            _normalize_framework_probe_key(signal)
+            for signal in _as_iterable(raw.get("signals"))
+            if _normalize_framework_probe_key(signal)
+        ],
+    }
+    error = str(raw.get("error") or raw.get("failure") or "")
+    if error:
+        signals.add("error")
+    return {
+        "id": str(raw.get("id") or operation),
+        "name": str(raw.get("name") or operation),
+        "operation": operation,
+        "category": category,
+        "status": status,
+        "required": bool(raw.get("required", True)),
+        "capability": _normalize_framework_probe_key(raw.get("capability") or raw.get("feature") or operation),
+        "latency_ms": _as_float_or_none(raw.get("latency_ms") or raw.get("duration_ms")),
+        "error": error,
+        "evidence": evidence,
+        "signals": sorted(signal for signal in signals if signal),
+        "metadata": _coerce_plain_dict(raw.get("metadata")),
+    }
+
+
+def _framework_probe_summary(probes: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+    probe_count = len(probes)
+    passed = [probe for probe in probes if probe.get("status") == "passed"]
+    failed = [probe for probe in probes if probe.get("status") == "failed"]
+    skipped = [probe for probe in probes if probe.get("status") == "skipped"]
+    blocked = [probe for probe in probes if probe.get("status") == "blocked"]
+    required = [probe for probe in probes if probe.get("required")]
+    required_passed = [probe for probe in required if probe.get("status") == "passed"]
+    categories = sorted({_normalize_framework_probe_key(probe.get("category")) for probe in probes if probe.get("category")})
+    passed_categories = sorted({_normalize_framework_probe_key(probe.get("category")) for probe in passed if probe.get("category")})
+    operations = sorted({_normalize_framework_probe_operation(probe.get("operation")) for probe in probes if probe.get("operation")})
+    passed_operations = sorted({_normalize_framework_probe_operation(probe.get("operation")) for probe in passed if probe.get("operation")})
+    failed_operations = sorted({_normalize_framework_probe_operation(probe.get("operation")) for probe in [*failed, *blocked] if probe.get("operation")})
+    evidence_count = sum(len(_as_iterable(probe.get("evidence"))) for probe in probes)
+    error_count = sum(1 for probe in probes if probe.get("error") or probe.get("status") in {"failed", "blocked"})
+    latency_values = [
+        float(probe.get("latency_ms"))
+        for probe in probes
+        if isinstance(probe.get("latency_ms"), (int, float))
+    ]
+    passed_category_set = set(passed_categories)
+    return {
+        "probe_count": probe_count,
+        "passed_count": len(passed),
+        "failed_count": len(failed),
+        "skipped_count": len(skipped),
+        "blocked_count": len(blocked),
+        "pass_rate": round(len(passed) / probe_count, 4) if probe_count else 1.0,
+        "required_count": len(required),
+        "required_passed_count": len(required_passed),
+        "required_pass_rate": round(len(required_passed) / len(required), 4) if required else 1.0,
+        "evidence_count": evidence_count,
+        "error_count": error_count,
+        "categories": categories,
+        "passed_categories": passed_categories,
+        "operations": operations,
+        "passed_operations": passed_operations,
+        "failed_operations": failed_operations,
+        "max_latency_ms": max(latency_values) if latency_values else None,
+        "avg_latency_ms": round(sum(latency_values) / len(latency_values), 4) if latency_values else None,
+        "has_tools": "tools" in passed_category_set,
+        "has_memory": "memory" in passed_category_set,
+        "has_streaming": "streaming" in passed_category_set,
+        "has_lifecycle": "lifecycle" in passed_category_set,
+        "has_orchestration": "orchestration" in passed_category_set,
+        "has_security": "security" in passed_category_set,
+        "has_observability": "observability" in passed_category_set,
+        "has_exports": "exports" in passed_category_set,
+    }
+
+
+def _framework_probe_signals(probes: Sequence[Mapping[str, Any]], raw_signals: Any = None) -> List[str]:
+    signals = {"framework_probe", "probe_suite", "probe"}
+    for signal in _as_iterable(raw_signals):
+        normalized = _normalize_framework_probe_key(signal)
+        if normalized:
+            signals.add(normalized)
+    for probe in probes:
+        for signal in _as_iterable(probe.get("signals")):
+            normalized = _normalize_framework_probe_key(signal)
+            if normalized:
+                signals.add(normalized)
+        for key in ("operation", "category", "status", "capability"):
+            normalized = _normalize_framework_probe_key(probe.get(key))
+            if normalized:
+                signals.add(normalized)
+    return sorted(signals)
+
+
+def _framework_probe_category(raw: Mapping[str, Any], operation: str) -> str:
+    category = _normalize_framework_probe_key(
+        raw.get("category")
+        or raw.get("domain")
+        or raw.get("surface")
+        or raw.get("group")
+        or ""
+    )
+    aliases = {
+        "tool": "tools",
+        "function": "tools",
+        "function_calling": "tools",
+        "mcp": "tools",
+        "state": "memory",
+        "checkpoint": "lifecycle",
+        "session": "lifecycle",
+        "trace": "observability",
+        "telemetry": "observability",
+        "log": "observability",
+        "export": "exports",
+        "artifact": "exports",
+        "workflow": "orchestration",
+        "graph": "orchestration",
+        "policy": "security",
+        "guardrail": "security",
+    }
+    if category:
+        return aliases.get(category, category)
+    inference = (
+        ("tools", ("tool", "function", "mcp", "schema")),
+        ("memory", ("memory", "state", "retrieval", "vector")),
+        ("streaming", ("stream", "chunk", "delta")),
+        ("lifecycle", ("lifecycle", "session", "checkpoint", "retry", "resume", "cleanup")),
+        ("orchestration", ("orchestration", "workflow", "graph", "handoff", "multi_agent")),
+        ("security", ("security", "guardrail", "policy", "attack", "adversarial", "permission")),
+        ("observability", ("trace", "telemetry", "span", "log", "metric")),
+        ("exports", ("export", "artifact", "dataset")),
+    )
+    for inferred, tokens in inference:
+        if any(token in operation for token in tokens):
+            return inferred
+    return "runtime"
+
+
+def _framework_probe_status_from_record(raw: Mapping[str, Any]) -> str:
+    status = raw.get("status")
+    if status in (None, ""):
+        if raw.get("blocked") is True:
+            status = "blocked"
+        elif raw.get("skipped") is True:
+            status = "skipped"
+        elif raw.get("passed") is False or raw.get("success") is False:
+            status = "failed"
+        elif raw.get("passed") is True or raw.get("success") is True:
+            status = "passed"
+        elif raw.get("error") or raw.get("failure"):
+            status = "failed"
+        else:
+            status = "passed"
+    return _normalize_framework_probe_status(status) or "passed"
+
+
+def _find_framework_probe(
+    probes: Iterable[Mapping[str, Any]],
+    probe_id: str,
+) -> Optional[Dict[str, Any]]:
+    query = _normalize_framework_probe_operation(probe_id)
+    if not query:
+        return None
+    for probe in probes:
+        probe_dict = copy.deepcopy(dict(probe))
+        aliases = {
+            _normalize_framework_probe_operation(probe_dict.get("id")),
+            _normalize_framework_probe_operation(probe_dict.get("name")),
+            _normalize_framework_probe_operation(probe_dict.get("operation")),
+        }
+        if query in aliases:
+            return probe_dict
+    return None
+
+
+def _normalize_framework_probe_status(value: Any) -> str:
+    normalized = _normalize_framework_probe_key(value)
+    aliases = {
+        "pass": "passed",
+        "passes": "passed",
+        "success": "passed",
+        "succeeded": "passed",
+        "ok": "passed",
+        "true": "passed",
+        "fail": "failed",
+        "failure": "failed",
+        "error": "failed",
+        "false": "failed",
+        "blocked_by_policy": "blocked",
+        "unsupported": "blocked",
+        "skip": "skipped",
+    }
+    normalized = aliases.get(normalized, normalized)
+    return normalized if normalized in {"passed", "failed", "skipped", "blocked"} else ""
+
+
+def _normalize_framework_probe_operation(value: Any) -> str:
+    normalized = _normalize_framework_probe_key(value)
+    aliases = {
+        "ainvoke": "invoke",
+        "run": "invoke",
+        "call": "invoke",
+        "stream_events": "stream",
+        "astream": "stream",
+        "tools": "list_tools",
+        "tools_list": "list_tools",
+        "tool_schema": "list_tools",
+        "tools_call": "tool_call",
+        "call_tool": "tool_call",
+        "memory_write": "write_memory",
+        "memory_read": "read_memory",
+        "checkpoint_write": "checkpoint_save",
+        "checkpoint_read": "checkpoint_resume",
+        "resume": "checkpoint_resume",
+        "guardrails": "guardrail",
+        "policy_gate": "guardrail",
+        "trace": "trace_export",
+        "otel_export": "trace_export",
+        "futureagi_export": "export",
+    }
+    return aliases.get(normalized, normalized)
+
+
+def _normalize_framework_probe_key(value: Any) -> str:
+    return str(value or "").strip().lower().replace("-", "_").replace(" ", "_").replace(".", "_").replace("/", "_")
+
+
+def _as_float_or_none(value: Any) -> Optional[float]:
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _framework_adapter_required_mappings(value: Any) -> Dict[str, List[str]]:
