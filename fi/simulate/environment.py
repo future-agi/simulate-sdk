@@ -6263,6 +6263,253 @@ class AgentTrustBoundaryEnvironment(EnvironmentAdapter):
         )
 
 
+class AgentControlPlaneEnvironment(EnvironmentAdapter):
+    """
+    Replay a runtime agency-control certificate for autonomous agents.
+
+    Use this after trust-boundary inventory to prove live controls: risk
+    scoring, action policy, approvals, rollback/reversibility, kill switches,
+    circuit breakers, rate limits, budgets, audit, containment, and drift
+    detection.
+    """
+
+    name = "agent_control_plane"
+
+    def __init__(
+        self,
+        plane: Any = None,
+        *,
+        name: str = "agent-control-plane",
+        framework: str = "custom",
+        version: Optional[str] = None,
+        actions: Optional[Iterable[Any]] = None,
+        controls: Optional[Iterable[Any]] = None,
+        budgets: Optional[Iterable[Any]] = None,
+        escalations: Optional[Iterable[Any]] = None,
+        incidents: Optional[Iterable[Any]] = None,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        self.plane = normalize_agent_control_plane(
+            plane,
+            name=name,
+            framework=framework,
+            version=version,
+            actions=actions,
+            controls=controls,
+            budgets=budgets,
+            escalations=escalations,
+            incidents=incidents,
+            metadata=metadata,
+        )
+
+    def reset(self, **context: Any) -> EnvironmentSnapshot:
+        return EnvironmentSnapshot(
+            tools=self._tool_specs(),
+            artifacts=[self._plane_artifact()],
+            events=[
+                SimulationEvent(
+                    type="agent_control_plane",
+                    name="agent_control_plane_ready",
+                    payload={
+                        "framework": self.plane["framework"],
+                        "control_rate": self.plane["summary"]["control_rate"],
+                        "required_control_rate": self.plane["summary"]["required_control_rate"],
+                        "high_risk_uncontained_count": self.plane["summary"]["high_risk_uncontained_count"],
+                        "signals": copy.deepcopy(self.plane["signals"]),
+                    },
+                ),
+                *[
+                    SimulationEvent(
+                        type="agent_control_plane",
+                        name="agent_control_action",
+                        payload=copy.deepcopy(action),
+                    )
+                    for action in self.plane["actions"]
+                ],
+                *[
+                    SimulationEvent(
+                        type="agent_control_plane",
+                        name="agent_control_incident",
+                        payload=copy.deepcopy(incident),
+                    )
+                    for incident in self.plane["incidents"]
+                ],
+            ],
+            state={"agent_control_plane": copy.deepcopy(self.plane)},
+            metadata={"agent_control_plane": copy.deepcopy(self.plane)},
+        )
+
+    def observe(self, **context: Any) -> EnvironmentSnapshot:
+        return EnvironmentSnapshot(
+            artifacts=[self._plane_artifact()],
+            state={"agent_control_plane": copy.deepcopy(self.plane)},
+            metadata={"agent_control_plane": copy.deepcopy(self.plane)},
+        )
+
+    def handle_tool_call(
+        self,
+        tool_call: Mapping[str, Any],
+        **context: Any,
+    ) -> Optional[ToolExecutionResult]:
+        name = _tool_name(tool_call)
+        if name not in {
+            "agent_control_plane_status",
+            "list_agent_control_actions",
+            "inspect_agent_control_action",
+            "list_agent_control_controls",
+            "list_agent_control_budgets",
+            "list_agent_control_incidents",
+            "list_agent_control_gaps",
+        }:
+            return None
+        arguments = _tool_arguments(tool_call)
+        call_id = _tool_call_id(tool_call)
+        success = True
+        error = None
+
+        if name == "agent_control_plane_status":
+            result = copy.deepcopy(self.plane)
+            event_name = "agent_control_plane_status"
+            content = f"{self.plane['framework']} agent control-plane status recorded."
+        elif name == "list_agent_control_actions":
+            risk_level = _normalize_agent_control_risk(arguments.get("risk_level") or arguments.get("risk") or "")
+            status = _normalize_agent_control_action_status(arguments.get("status") or "")
+            actions = copy.deepcopy(self.plane["actions"])
+            if risk_level:
+                actions = [action for action in actions if action.get("risk_level") == risk_level]
+            if status:
+                actions = [action for action in actions if action.get("status") == status]
+            result = {"framework": self.plane["framework"], "actions": actions, "filters": {"risk_level": risk_level, "status": status}}
+            event_name = "agent_control_actions_listed"
+            content = f"Listed {len(actions)} agent control action(s)."
+        elif name == "inspect_agent_control_action":
+            action_id = str(arguments.get("id") or arguments.get("name") or arguments.get("action") or "")
+            action = _find_agent_control_record(self.plane["actions"], action_id)
+            success = action is not None
+            result = {"framework": self.plane["framework"], "action": copy.deepcopy(action), "query": action_id}
+            event_name = "agent_control_action_inspected" if success else "agent_control_action_missing"
+            content = f"Inspected agent control action {action_id}." if success else f"Agent control action not found: {action_id}"
+            error = None if success else "action_not_found"
+        elif name == "list_agent_control_controls":
+            category = _normalize_agent_control_category(arguments.get("category") or "")
+            status = _normalize_agent_control_status(arguments.get("status") or "")
+            controls = copy.deepcopy(self.plane["controls"])
+            if category:
+                controls = [control for control in controls if control.get("category") == category]
+            if status:
+                controls = [control for control in controls if control.get("status") == status]
+            result = {"framework": self.plane["framework"], "controls": controls, "filters": {"category": category, "status": status}}
+            event_name = "agent_control_controls_listed"
+            content = f"Listed {len(controls)} agent control(s)."
+        elif name == "list_agent_control_budgets":
+            status = _normalize_agent_control_budget_status(arguments.get("status") or "")
+            budgets = copy.deepcopy(self.plane["budgets"])
+            if status:
+                budgets = [budget for budget in budgets if budget.get("status") == status]
+            result = {"framework": self.plane["framework"], "budgets": budgets, "filters": {"status": status}}
+            event_name = "agent_control_budgets_listed"
+            content = f"Listed {len(budgets)} agent control budget(s)."
+        elif name == "list_agent_control_incidents":
+            status = _normalize_agent_control_incident_status(arguments.get("status") or "")
+            incidents = copy.deepcopy(self.plane["incidents"])
+            if status:
+                incidents = [incident for incident in incidents if incident.get("status") == status]
+            result = {"framework": self.plane["framework"], "incidents": incidents, "filters": {"status": status}}
+            event_name = "agent_control_incidents_listed"
+            content = f"Listed {len(incidents)} agent control incident(s)."
+        else:
+            result = {
+                "framework": self.plane["framework"],
+                "controls": [
+                    copy.deepcopy(control)
+                    for control in self.plane["controls"]
+                    if control.get("status") in {"partial", "missing", "blocked"}
+                ],
+                "budgets": [
+                    copy.deepcopy(budget)
+                    for budget in self.plane["budgets"]
+                    if budget.get("status") in {"exceeded", "missing", "blocked"}
+                ],
+                "incidents": [
+                    copy.deepcopy(incident)
+                    for incident in self.plane["incidents"]
+                    if incident.get("status") in {"open", "uncontained"}
+                ],
+                "summary": copy.deepcopy(self.plane["summary"]),
+            }
+            event_name = "agent_control_gaps_listed"
+            content = (
+                f"Listed {len(result['controls'])} control gap(s), "
+                f"{len(result['budgets'])} budget gap(s), and "
+                f"{len(result['incidents'])} incident gap(s)."
+            )
+
+        return ToolExecutionResult(
+            tool_call_id=call_id,
+            tool_name=name,
+            content=content,
+            result=result,
+            success=success,
+            error=error,
+            state_updates={"agent_control_plane": copy.deepcopy(self.plane)},
+            artifacts=[self._plane_artifact()],
+            events=[
+                SimulationEvent(
+                    type="agent_control_plane",
+                    name=event_name,
+                    payload=result,
+                )
+            ],
+        )
+
+    def _tool_specs(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                "name": "agent_control_plane_status",
+                "description": "Return normalized agent control-plane state and summary.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            {
+                "name": "list_agent_control_actions",
+                "description": "List runtime agent actions filtered by risk level or status.",
+                "parameters": {"type": "object", "properties": {"risk_level": {"type": "string"}, "status": {"type": "string"}}},
+            },
+            {
+                "name": "inspect_agent_control_action",
+                "description": "Inspect one runtime agent action by id or name.",
+                "parameters": {"type": "object", "properties": {"id": {"type": "string"}}},
+            },
+            {
+                "name": "list_agent_control_controls",
+                "description": "List runtime controls filtered by category or status.",
+                "parameters": {"type": "object", "properties": {"category": {"type": "string"}, "status": {"type": "string"}}},
+            },
+            {
+                "name": "list_agent_control_budgets",
+                "description": "List risk, action, time, cost, or tool budgets filtered by status.",
+                "parameters": {"type": "object", "properties": {"status": {"type": "string"}}},
+            },
+            {
+                "name": "list_agent_control_incidents",
+                "description": "List contained, open, rolled-back, or uncontained incidents.",
+                "parameters": {"type": "object", "properties": {"status": {"type": "string"}}},
+            },
+            {
+                "name": "list_agent_control_gaps",
+                "description": "List missing controls, exceeded budgets, and uncontained incidents.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        ]
+
+    def _plane_artifact(self) -> SimulationArtifact:
+        return SimulationArtifact(
+            type="trace",
+            role="environment",
+            data=copy.deepcopy(self.plane),
+            metadata={"kind": "agent_control_plane", "framework": self.plane["framework"]},
+        )
+
+
 class ObservabilityReplayEnvironment(EnvironmentAdapter):
     """
     Replay production observability/regression cases as local simulation evidence.
@@ -9476,6 +9723,572 @@ def _normalize_agent_trust_boundary_key(value: Any) -> str:
         "allow_list": "allowlist",
         "deny_list": "denylist",
         "api_key": "api_key",
+    }
+    return aliases.get(normalized, normalized)
+
+
+def normalize_agent_control_plane(
+    plane: Any = None,
+    *,
+    name: str = "agent-control-plane",
+    framework: str = "custom",
+    version: Optional[str] = None,
+    actions: Optional[Iterable[Any]] = None,
+    controls: Optional[Iterable[Any]] = None,
+    budgets: Optional[Iterable[Any]] = None,
+    escalations: Optional[Iterable[Any]] = None,
+    incidents: Optional[Iterable[Any]] = None,
+    metadata: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Normalize runtime agency-control evidence into replayable form."""
+
+    source = _coerce_plain_dict(plane)
+    plane_name = str(source.get("name") or source.get("id") or name)
+    framework_name = str(source.get("framework") or source.get("runtime") or framework)
+    plane_version = source.get("version") or source.get("framework_version") or version
+    normalized_actions = [
+        _normalize_agent_control_action(item)
+        for item in _as_iterable(actions if actions is not None else source.get("actions") or source.get("agent_actions") or [])
+    ]
+    normalized_controls = [
+        _normalize_agent_control_control(item)
+        for item in _as_iterable(controls if controls is not None else source.get("controls") or source.get("runtime_controls") or [])
+    ]
+    normalized_budgets = [
+        _normalize_agent_control_budget(item)
+        for item in _as_iterable(budgets if budgets is not None else source.get("budgets") or source.get("risk_budgets") or [])
+    ]
+    normalized_escalations = [
+        _normalize_agent_control_escalation(item)
+        for item in _as_iterable(escalations if escalations is not None else source.get("escalations") or source.get("approvals") or [])
+    ]
+    normalized_incidents = [
+        _normalize_agent_control_incident(item)
+        for item in _as_iterable(incidents if incidents is not None else source.get("incidents") or source.get("containment_events") or [])
+    ]
+    normalized_actions = [item for item in normalized_actions if item.get("id")]
+    normalized_controls = [item for item in normalized_controls if item.get("id")]
+    normalized_budgets = [item for item in normalized_budgets if item.get("id")]
+    normalized_escalations = [item for item in normalized_escalations if item.get("id")]
+    normalized_incidents = [item for item in normalized_incidents if item.get("id")]
+    plane_metadata = {**_coerce_plain_dict(source.get("metadata")), **copy.deepcopy(dict(metadata or {}))}
+    summary = _agent_control_plane_summary(
+        normalized_actions,
+        normalized_controls,
+        normalized_budgets,
+        normalized_escalations,
+        normalized_incidents,
+    )
+    signals = _agent_control_plane_signals(
+        normalized_actions,
+        normalized_controls,
+        normalized_budgets,
+        normalized_escalations,
+        normalized_incidents,
+        source.get("signals"),
+    )
+    return {
+        "kind": "agent_control_plane",
+        "name": plane_name,
+        "framework": framework_name,
+        "version": str(plane_version or ""),
+        "actions": normalized_actions,
+        "controls": normalized_controls,
+        "budgets": normalized_budgets,
+        "escalations": normalized_escalations,
+        "incidents": normalized_incidents,
+        "summary": summary,
+        "signals": signals,
+        "metadata": plane_metadata,
+    }
+
+
+def _normalize_agent_control_action(value: Any) -> Dict[str, Any]:
+    raw = {"id": value, "name": value} if isinstance(value, str) else _coerce_plain_dict(value)
+    action_id = _normalize_agent_control_key(raw.get("id") or raw.get("name") or raw.get("action") or raw.get("tool") or "")
+    risk_level = _normalize_agent_control_risk(raw.get("risk_level") or raw.get("risk") or raw.get("severity") or "medium")
+    status = _normalize_agent_control_action_status(raw.get("status") or raw.get("state"))
+    if not status:
+        if raw.get("blocked") is True:
+            status = "blocked"
+        elif raw.get("approved") is True:
+            status = "approved"
+        elif raw.get("rolled_back") is True:
+            status = "rolled_back"
+        else:
+            status = "allowed"
+    controls = [
+        _normalize_agent_control_category(item)
+        for item in _as_iterable(raw.get("controls") or raw.get("gates"))
+        if _normalize_agent_control_category(item)
+    ]
+    evidence = _normalize_framework_evidence_items(raw)
+    signals = {"agent_control_plane", "action", action_id, risk_level, status, *controls}
+    return {
+        "id": str(raw.get("id") or action_id),
+        "name": str(raw.get("name") or raw.get("action") or action_id),
+        "category": _normalize_agent_control_key(raw.get("category") or raw.get("type") or "tool"),
+        "tool": _normalize_agent_control_key(raw.get("tool") or ""),
+        "risk_level": risk_level,
+        "status": status,
+        "reversible": bool(raw.get("reversible", False)),
+        "requires_approval": bool(raw.get("requires_approval") or raw.get("approval_required")),
+        "approved_by": str(raw.get("approved_by") or ""),
+        "controls": sorted(set(controls)),
+        "evidence": evidence,
+        "signals": sorted(signal for signal in signals if signal),
+        "metadata": _coerce_plain_dict(raw.get("metadata")),
+    }
+
+
+def _normalize_agent_control_control(value: Any) -> Dict[str, Any]:
+    raw = {"id": value, "name": value, "status": "present"} if isinstance(value, str) else _coerce_plain_dict(value)
+    control_id = _normalize_agent_control_key(raw.get("id") or raw.get("name") or raw.get("control") or raw.get("category") or "")
+    category = _agent_control_category_from_record(raw, control_id)
+    status = _agent_control_status_from_record(raw)
+    evidence = _normalize_framework_evidence_items(raw)
+    signals = {"agent_control_plane", "control", control_id, category, status}
+    return {
+        "id": str(raw.get("id") or control_id),
+        "name": str(raw.get("name") or raw.get("control") or control_id),
+        "category": category,
+        "status": status,
+        "required": bool(raw.get("required", True)),
+        "evidence": evidence,
+        "signals": sorted(signal for signal in signals if signal),
+        "notes": str(raw.get("notes") or raw.get("reason") or ""),
+        "metadata": _coerce_plain_dict(raw.get("metadata")),
+    }
+
+
+def _normalize_agent_control_budget(value: Any) -> Dict[str, Any]:
+    raw = {"id": value, "name": value} if isinstance(value, str) else _coerce_plain_dict(value)
+    budget_id = _normalize_agent_control_key(raw.get("id") or raw.get("name") or raw.get("budget") or raw.get("category") or "")
+    status = _normalize_agent_control_budget_status(raw.get("status") or raw.get("state"))
+    limit = _as_float_or_none(raw.get("limit") or raw.get("max") or raw.get("budget"))
+    used = _as_float_or_none(raw.get("used") or raw.get("current") or raw.get("value"))
+    remaining = _as_float_or_none(raw.get("remaining"))
+    if not status:
+        if raw.get("blocked") is True:
+            status = "blocked"
+        elif limit is not None and used is not None and used > limit:
+            status = "exceeded"
+        elif raw.get("missing") is True:
+            status = "missing"
+        else:
+            status = "within"
+    evidence = _normalize_framework_evidence_items(raw)
+    category = _normalize_agent_control_key(raw.get("category") or raw.get("type") or budget_id)
+    signals = {"agent_control_plane", "budget", budget_id, category, status}
+    return {
+        "id": str(raw.get("id") or budget_id),
+        "name": str(raw.get("name") or raw.get("budget") or budget_id),
+        "category": category,
+        "status": status,
+        "limit": limit,
+        "used": used,
+        "remaining": remaining,
+        "evidence": evidence,
+        "signals": sorted(signal for signal in signals if signal),
+        "metadata": _coerce_plain_dict(raw.get("metadata")),
+    }
+
+
+def _normalize_agent_control_escalation(value: Any) -> Dict[str, Any]:
+    raw = {"id": value, "name": value} if isinstance(value, str) else _coerce_plain_dict(value)
+    escalation_id = _normalize_agent_control_key(raw.get("id") or raw.get("name") or raw.get("action") or "")
+    status = _normalize_agent_control_escalation_status(raw.get("status") or raw.get("state"))
+    if not status:
+        status = "approved" if raw.get("approved") is True else "missing"
+    evidence = _normalize_framework_evidence_items(raw)
+    signals = {"agent_control_plane", "escalation", escalation_id, status}
+    return {
+        "id": str(raw.get("id") or escalation_id),
+        "name": str(raw.get("name") or escalation_id),
+        "action": _normalize_agent_control_key(raw.get("action") or raw.get("action_id") or ""),
+        "status": status,
+        "reviewer": str(raw.get("reviewer") or raw.get("approved_by") or ""),
+        "evidence": evidence,
+        "signals": sorted(signal for signal in signals if signal),
+        "metadata": _coerce_plain_dict(raw.get("metadata")),
+    }
+
+
+def _normalize_agent_control_incident(value: Any) -> Dict[str, Any]:
+    raw = {"id": value, "name": value} if isinstance(value, str) else _coerce_plain_dict(value)
+    incident_id = _normalize_agent_control_key(raw.get("id") or raw.get("name") or raw.get("incident") or raw.get("action") or "")
+    status = _normalize_agent_control_incident_status(raw.get("status") or raw.get("state"))
+    if not status:
+        status = "contained" if raw.get("contained") is True else "open"
+    severity = _normalize_agent_control_risk(raw.get("severity") or raw.get("risk") or "medium")
+    controls = [
+        _normalize_agent_control_category(item)
+        for item in _as_iterable(raw.get("controls") or raw.get("responses"))
+        if _normalize_agent_control_category(item)
+    ]
+    evidence = _normalize_framework_evidence_items(raw)
+    signals = {"agent_control_plane", "incident", incident_id, severity, status, *controls}
+    return {
+        "id": str(raw.get("id") or incident_id),
+        "name": str(raw.get("name") or raw.get("incident") or incident_id),
+        "action": _normalize_agent_control_key(raw.get("action") or raw.get("action_id") or ""),
+        "severity": severity,
+        "status": status,
+        "controls": sorted(set(controls)),
+        "evidence": evidence,
+        "signals": sorted(signal for signal in signals if signal),
+        "metadata": _coerce_plain_dict(raw.get("metadata")),
+    }
+
+
+def _agent_control_plane_summary(
+    actions: Sequence[Mapping[str, Any]],
+    controls: Sequence[Mapping[str, Any]],
+    budgets: Sequence[Mapping[str, Any]],
+    escalations: Sequence[Mapping[str, Any]],
+    incidents: Sequence[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    present = [control for control in controls if control.get("status") == "present"]
+    partial = [control for control in controls if control.get("status") == "partial"]
+    missing = [control for control in controls if control.get("status") == "missing"]
+    blocked = [control for control in controls if control.get("status") == "blocked"]
+    required = [control for control in controls if control.get("required")]
+    required_present = [control for control in required if control.get("status") == "present"]
+    categories = sorted({_normalize_agent_control_category(control.get("category")) for control in controls if control.get("category")})
+    present_categories = sorted({_normalize_agent_control_category(control.get("category")) for control in present if control.get("category")})
+    missing_categories = sorted({_normalize_agent_control_category(control.get("category")) for control in [*partial, *missing, *blocked] if control.get("category")})
+    high_risk_actions = [action for action in actions if action.get("risk_level") in {"high", "critical"}]
+    blocked_actions = [action for action in actions if action.get("status") == "blocked"]
+    approved_actions = [action for action in actions if action.get("status") == "approved"]
+    rolled_back_actions = [action for action in actions if action.get("status") == "rolled_back"]
+    reversible_actions = [action for action in actions if action.get("reversible")]
+    approval_required_actions = [action for action in actions if action.get("requires_approval")]
+    within_budgets = [budget for budget in budgets if budget.get("status") == "within"]
+    exceeded_budgets = [budget for budget in budgets if budget.get("status") == "exceeded"]
+    missing_budgets = [budget for budget in budgets if budget.get("status") in {"missing", "blocked"}]
+    approved_escalations = [item for item in escalations if item.get("status") == "approved"]
+    missing_escalations = [item for item in escalations if item.get("status") in {"missing", "pending"}]
+    contained_incidents = [incident for incident in incidents if incident.get("status") in {"contained", "rolled_back", "escalated"}]
+    uncontained_incidents = [incident for incident in incidents if incident.get("status") in {"open", "uncontained"}]
+    high_risk_uncontained = [
+        incident
+        for incident in uncontained_incidents
+        if incident.get("severity") in {"high", "critical"}
+    ]
+    evidence_count = sum(
+        len(_as_iterable(record.get("evidence")))
+        for collection in (actions, controls, budgets, escalations, incidents)
+        for record in collection
+    )
+    present_category_set = set(present_categories)
+    gap_controls = sorted(control.get("id") or control.get("name") for control in [*partial, *missing, *blocked] if control.get("id") or control.get("name"))
+    gap_budgets = sorted(budget.get("id") or budget.get("name") for budget in [*exceeded_budgets, *missing_budgets] if budget.get("id") or budget.get("name"))
+    gap_incidents = sorted(incident.get("id") or incident.get("name") for incident in uncontained_incidents if incident.get("id") or incident.get("name"))
+    return {
+        "action_count": len(actions),
+        "high_risk_action_count": len(high_risk_actions),
+        "blocked_action_count": len(blocked_actions),
+        "approved_action_count": len(approved_actions),
+        "rolled_back_action_count": len(rolled_back_actions),
+        "reversible_action_count": len(reversible_actions),
+        "approval_required_action_count": len(approval_required_actions),
+        "control_count": len(controls),
+        "present_control_count": len(present),
+        "partial_control_count": len(partial),
+        "missing_control_count": len(missing),
+        "blocked_control_count": len(blocked),
+        "required_control_count": len(required),
+        "required_present_control_count": len(required_present),
+        "control_rate": round(len(present) / len(controls), 4) if controls else 1.0,
+        "required_control_rate": round(len(required_present) / len(required), 4) if required else 1.0,
+        "budget_count": len(budgets),
+        "within_budget_count": len(within_budgets),
+        "exceeded_budget_count": len(exceeded_budgets),
+        "missing_budget_count": len(missing_budgets),
+        "escalation_count": len(escalations),
+        "approved_escalation_count": len(approved_escalations),
+        "missing_escalation_count": len(missing_escalations),
+        "incident_count": len(incidents),
+        "contained_incident_count": len(contained_incidents),
+        "uncontained_incident_count": len(uncontained_incidents),
+        "high_risk_uncontained_count": len(high_risk_uncontained),
+        "evidence_count": evidence_count,
+        "categories": categories,
+        "present_categories": present_categories,
+        "missing_categories": missing_categories,
+        "controls": sorted(control.get("id") or control.get("name") for control in controls if control.get("id") or control.get("name")),
+        "present_controls": sorted(control.get("id") or control.get("name") for control in present if control.get("id") or control.get("name")),
+        "partial_controls": sorted(control.get("id") or control.get("name") for control in partial if control.get("id") or control.get("name")),
+        "missing_controls": sorted(control.get("id") or control.get("name") for control in missing if control.get("id") or control.get("name")),
+        "blocked_controls": sorted(control.get("id") or control.get("name") for control in blocked if control.get("id") or control.get("name")),
+        "actions": sorted(action.get("id") or action.get("name") for action in actions if action.get("id") or action.get("name")),
+        "high_risk_actions": sorted(action.get("id") or action.get("name") for action in high_risk_actions if action.get("id") or action.get("name")),
+        "budgets": sorted(budget.get("id") or budget.get("name") for budget in budgets if budget.get("id") or budget.get("name")),
+        "incidents": sorted(incident.get("id") or incident.get("name") for incident in incidents if incident.get("id") or incident.get("name")),
+        "uncontained_incidents": gap_incidents,
+        "gaps": sorted({*gap_controls, *gap_budgets, *gap_incidents}),
+        "has_risk_scoring": "risk_scoring" in present_category_set,
+        "has_action_policy": "action_policy" in present_category_set,
+        "has_approval_gates": "approval" in present_category_set,
+        "has_rollback": "rollback" in present_category_set,
+        "has_kill_switch": "kill_switch" in present_category_set,
+        "has_circuit_breakers": "circuit_breaker" in present_category_set,
+        "has_rate_limits": "rate_limit" in present_category_set,
+        "has_budgets": "budget" in present_category_set or bool(within_budgets),
+        "has_audit": "audit" in present_category_set,
+        "has_containment": "containment" in present_category_set,
+        "has_drift_detection": "drift_detection" in present_category_set,
+    }
+
+
+def _agent_control_plane_signals(
+    actions: Sequence[Mapping[str, Any]],
+    controls: Sequence[Mapping[str, Any]],
+    budgets: Sequence[Mapping[str, Any]],
+    escalations: Sequence[Mapping[str, Any]],
+    incidents: Sequence[Mapping[str, Any]],
+    raw_signals: Any = None,
+) -> List[str]:
+    signals = {"agent_control_plane", "control_plane", "runtime_governance", "agency_control"}
+    for signal in _as_iterable(raw_signals):
+        normalized = _normalize_agent_control_key(signal)
+        if normalized:
+            signals.add(normalized)
+    for collection in (actions, controls, budgets, escalations, incidents):
+        for record in collection:
+            for signal in _as_iterable(record.get("signals")):
+                normalized = _normalize_agent_control_key(signal)
+                if normalized:
+                    signals.add(normalized)
+            for key in ("id", "name", "category", "status", "risk_level", "severity"):
+                normalized = _normalize_agent_control_key(record.get(key))
+                if normalized:
+                    signals.add(normalized)
+    return sorted(signals)
+
+
+def _normalize_framework_evidence_items(raw: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    return [
+        _normalize_framework_evidence(item)
+        for item in _as_iterable(raw.get("evidence") or raw.get("proof") or raw.get("examples"))
+    ]
+
+
+def _find_agent_control_record(
+    records: Iterable[Mapping[str, Any]],
+    record_id: str,
+) -> Optional[Dict[str, Any]]:
+    query = _normalize_agent_control_key(record_id)
+    if not query:
+        return None
+    for record in records:
+        record_dict = copy.deepcopy(dict(record))
+        aliases = {
+            _normalize_agent_control_key(record_dict.get("id")),
+            _normalize_agent_control_key(record_dict.get("name")),
+            _normalize_agent_control_key(record_dict.get("action")),
+            _normalize_agent_control_key(record_dict.get("tool")),
+        }
+        if query in aliases:
+            return record_dict
+    return None
+
+
+def _agent_control_category_from_record(raw: Mapping[str, Any], control_id: str) -> str:
+    category = _normalize_agent_control_category(raw.get("category") or raw.get("control") or raw.get("group") or "")
+    if category and category != "general":
+        return category
+    probe = " ".join(str(item or "").lower() for item in (control_id, raw.get("name"), raw.get("notes"), raw.get("reason")))
+    inference = (
+        ("risk_scoring", ("risk", "score", "agency index")),
+        ("action_policy", ("action policy", "policy gate", "conformance", "fsm")),
+        ("approval", ("approval", "human", "hitl", "escalation")),
+        ("rollback", ("rollback", "reversible", "undo")),
+        ("kill_switch", ("kill", "shutdown", "stop switch")),
+        ("circuit_breaker", ("circuit", "breaker", "trip")),
+        ("rate_limit", ("rate", "limit", "throttle")),
+        ("budget", ("budget", "quota", "cost")),
+        ("audit", ("audit", "log", "trace", "telemetry")),
+        ("containment", ("contain", "sandbox", "blast radius")),
+        ("drift_detection", ("drift", "goal drift", "semantic drift")),
+    )
+    for inferred, tokens in inference:
+        if any(token in probe for token in tokens):
+            return inferred
+    return category or "general"
+
+
+def _agent_control_status_from_record(raw: Mapping[str, Any]) -> str:
+    status = raw.get("status")
+    if status in (None, ""):
+        if raw.get("blocked") is True:
+            status = "blocked"
+        elif raw.get("present") is False or raw.get("implemented") is False:
+            status = "missing"
+        elif raw.get("partial") is True:
+            status = "partial"
+        else:
+            status = "present"
+    return _normalize_agent_control_status(status) or "present"
+
+
+def _normalize_agent_control_status(value: Any) -> str:
+    normalized = _normalize_agent_control_key(value)
+    aliases = {
+        "yes": "present",
+        "true": "present",
+        "enabled": "present",
+        "implemented": "present",
+        "available": "present",
+        "pass": "present",
+        "limited": "partial",
+        "planned": "partial",
+        "no": "missing",
+        "false": "missing",
+        "absent": "missing",
+        "failed": "missing",
+        "denied": "blocked",
+        "forbidden": "blocked",
+        "policy_blocked": "blocked",
+    }
+    normalized = aliases.get(normalized, normalized)
+    return normalized if normalized in {"present", "partial", "missing", "blocked"} else ""
+
+
+def _normalize_agent_control_action_status(value: Any) -> str:
+    normalized = _normalize_agent_control_key(value)
+    aliases = {
+        "allow": "allowed",
+        "permitted": "allowed",
+        "pass": "allowed",
+        "deny": "blocked",
+        "denied": "blocked",
+        "prevented": "blocked",
+        "needs_approval": "escalated",
+        "approval_required": "escalated",
+        "undo": "rolled_back",
+        "reverted": "rolled_back",
+    }
+    normalized = aliases.get(normalized, normalized)
+    return normalized if normalized in {"allowed", "blocked", "approved", "escalated", "rolled_back", "failed"} else ""
+
+
+def _normalize_agent_control_budget_status(value: Any) -> str:
+    normalized = _normalize_agent_control_key(value)
+    aliases = {
+        "ok": "within",
+        "pass": "within",
+        "under": "within",
+        "over": "exceeded",
+        "breached": "exceeded",
+        "absent": "missing",
+        "denied": "blocked",
+    }
+    normalized = aliases.get(normalized, normalized)
+    return normalized if normalized in {"within", "exceeded", "missing", "blocked"} else ""
+
+
+def _normalize_agent_control_escalation_status(value: Any) -> str:
+    normalized = _normalize_agent_control_key(value)
+    aliases = {
+        "allow": "approved",
+        "accepted": "approved",
+        "deny": "rejected",
+        "denied": "rejected",
+        "absent": "missing",
+    }
+    normalized = aliases.get(normalized, normalized)
+    return normalized if normalized in {"approved", "pending", "rejected", "missing"} else ""
+
+
+def _normalize_agent_control_incident_status(value: Any) -> str:
+    normalized = _normalize_agent_control_key(value)
+    aliases = {
+        "resolved": "contained",
+        "closed": "contained",
+        "mitigated": "contained",
+        "reverted": "rolled_back",
+        "rollback": "rolled_back",
+        "needs_review": "escalated",
+        "unresolved": "open",
+        "escaped": "uncontained",
+    }
+    normalized = aliases.get(normalized, normalized)
+    return normalized if normalized in {"contained", "open", "rolled_back", "escalated", "uncontained"} else ""
+
+
+def _normalize_agent_control_risk(value: Any) -> str:
+    normalized = _normalize_agent_control_key(value)
+    aliases = {
+        "sev1": "critical",
+        "p0": "critical",
+        "blocker": "critical",
+        "sev2": "high",
+        "p1": "high",
+        "important": "high",
+        "sev3": "medium",
+        "p2": "medium",
+        "moderate": "medium",
+        "sev4": "low",
+        "p3": "low",
+        "minor": "low",
+    }
+    normalized = aliases.get(normalized, normalized)
+    return normalized if normalized in {"low", "medium", "high", "critical"} else ""
+
+
+def _normalize_agent_control_category(value: Any) -> str:
+    normalized = _normalize_agent_control_key(value)
+    aliases = {
+        "risk": "risk_scoring",
+        "risk_score": "risk_scoring",
+        "agency_risk": "risk_scoring",
+        "agency_risk_index": "risk_scoring",
+        "policy": "action_policy",
+        "policy_gate": "action_policy",
+        "fsm": "action_policy",
+        "conformance": "action_policy",
+        "human_approval": "approval",
+        "hitl": "approval",
+        "escalation": "approval",
+        "reversibility": "rollback",
+        "undo": "rollback",
+        "shutdown": "kill_switch",
+        "stop": "kill_switch",
+        "breaker": "circuit_breaker",
+        "throttle": "rate_limit",
+        "quota": "budget",
+        "logging": "audit",
+        "trace": "audit",
+        "telemetry": "audit",
+        "sandbox": "containment",
+        "isolation": "containment",
+        "drift": "drift_detection",
+        "goal_drift": "drift_detection",
+    }
+    return aliases.get(normalized, normalized or "general")
+
+
+def _normalize_agent_control_key(value: Any) -> str:
+    normalized = (
+        str(value or "")
+        .strip()
+        .lower()
+        .replace("-", "_")
+        .replace(" ", "_")
+        .replace(".", "_")
+        .replace("/", "_")
+        .replace(":", "_")
+    )
+    aliases = {
+        "controlplane": "control_plane",
+        "agent_governance": "runtime_governance",
+        "human_in_the_loop": "approval",
+        "kill_switches": "kill_switch",
+        "circuit_breakers": "circuit_breaker",
+        "rate_limits": "rate_limit",
+        "budgets": "budget",
+        "rollbacks": "rollback",
     }
     return aliases.get(normalized, normalized)
 

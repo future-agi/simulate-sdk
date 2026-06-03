@@ -26,6 +26,7 @@ from .agent import (
 )
 from .environment import (
     AdversarialEnvironmentPack,
+    AgentControlPlaneEnvironment,
     AgentTrustBoundaryEnvironment,
     AutonomyLoopEnvironment,
     BrowserEnvironment,
@@ -82,6 +83,7 @@ from .environment import (
     normalize_streaming_trace_export,
     normalize_framework_lifecycle_trace,
     normalize_framework_capability_matrix,
+    normalize_agent_control_plane,
     normalize_agent_trust_boundary_model,
     normalize_framework_portability_matrix,
     normalize_framework_trace_events,
@@ -145,6 +147,7 @@ __all__ = [
     "GeminiAgentWrapper",
     "AnthropicAgentWrapper",
     "AdversarialEnvironmentPack",
+    "AgentControlPlaneEnvironment",
     "AgentTrustBoundaryEnvironment",
     "AutonomyLoopEnvironment",
     "BrowserEnvironment",
@@ -201,6 +204,7 @@ __all__ = [
     "normalize_streaming_trace_export",
     "normalize_framework_lifecycle_trace",
     "normalize_framework_capability_matrix",
+    "normalize_agent_control_plane",
     "normalize_agent_trust_boundary_model",
     "normalize_framework_portability_matrix",
     "normalize_framework_trace_events",
