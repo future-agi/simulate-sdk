@@ -268,6 +268,460 @@ class ToolFaultInjectionEnvironment(EnvironmentAdapter):
         return data
 
 
+class WorldContractEnvironment(EnvironmentAdapter):
+    """
+    Local state-machine world contract for arbitrary agent tasks.
+
+    A world contract defines the actors, resources, allowed transitions,
+    invariants, success conditions, policy gates, and adversarial surfaces that
+    make a task valid. Use it when the important question is not which framework
+    ran, but whether the agent moved the simulated world through the right
+    states without violating domain rules.
+    """
+
+    name = "world_contract"
+
+    def __init__(
+        self,
+        *,
+        name: str = "world",
+        actors: Optional[Iterable[str | Mapping[str, Any]]] = None,
+        resources: Optional[Iterable[str | Mapping[str, Any]]] = None,
+        transitions: Optional[Iterable[str | Mapping[str, Any]]] = None,
+        invariants: Optional[Iterable[str | Mapping[str, Any]]] = None,
+        success_conditions: Optional[Iterable[str | Mapping[str, Any]]] = None,
+        policy_gates: Optional[Iterable[str | Mapping[str, Any]]] = None,
+        adversarial_surfaces: Optional[Iterable[str | Mapping[str, Any]]] = None,
+        initial_state: Optional[Mapping[str, Any]] = None,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        self.contract = normalize_world_contract(
+            name=name,
+            actors=actors or [],
+            resources=resources or [],
+            transitions=transitions or [],
+            invariants=invariants or [],
+            success_conditions=success_conditions or [],
+            policy_gates=policy_gates or [],
+            adversarial_surfaces=adversarial_surfaces or [],
+            initial_state=initial_state or {},
+            metadata=metadata or {},
+        )
+        self.initial_state = copy.deepcopy(self.contract["initial_state"])
+        self.state: Dict[str, Any] = {}
+        self.transition_log: List[Dict[str, Any]] = []
+        self.invariant_results: List[Dict[str, Any]] = []
+        self.success_results: List[Dict[str, Any]] = []
+
+    def reset(self, **context: Any) -> EnvironmentSnapshot:
+        self.state = copy.deepcopy(self.initial_state)
+        self.transition_log = []
+        self.invariant_results = _world_contract_check_conditions(
+            self.contract.get("invariants", []),
+            self.state,
+            condition_type="invariant",
+        )
+        self.success_results = _world_contract_check_conditions(
+            self.contract.get("success_conditions", []),
+            self.state,
+            condition_type="success_condition",
+        )
+        return EnvironmentSnapshot(
+            tools=self._tool_specs(),
+            artifacts=[self._contract_artifact()],
+            events=[
+                SimulationEvent(
+                    type="world_contract",
+                    name="world_contract_ready",
+                    payload={
+                        "name": self.contract["name"],
+                        "signals": sorted(self._observed_signals()),
+                        "summary": self._summary(),
+                    },
+                )
+            ],
+            state={"world_contract": self._state_payload()},
+            metadata={"world_contract": self._state_payload()},
+        )
+
+    def handle_tool_call(
+        self,
+        tool_call: Mapping[str, Any],
+        **context: Any,
+    ) -> Optional[ToolExecutionResult]:
+        name = _tool_name(tool_call)
+        if name not in {
+            "world_contract_status",
+            "list_world_transitions",
+            "inspect_world_invariant",
+            "apply_world_transition",
+        }:
+            return None
+        arguments = _tool_arguments(tool_call)
+        call_id = _tool_call_id(tool_call)
+
+        if name == "world_contract_status":
+            result = self._state_payload()
+            event_name = "world_contract_status"
+            content = f"World contract {self.contract['name']} status recorded."
+            success = True
+            error = None
+        elif name == "list_world_transitions":
+            transitions = self._filtered_transitions(arguments)
+            result = {
+                "name": self.contract["name"],
+                "transitions": copy.deepcopy(transitions),
+            }
+            event_name = "world_transitions_listed"
+            content = f"Listed {len(transitions)} world transition(s)."
+            success = True
+            error = None
+        elif name == "inspect_world_invariant":
+            invariant_id = str(arguments.get("id") or arguments.get("name") or "")
+            invariant = _world_contract_find_condition(
+                self.contract.get("invariants", []),
+                invariant_id,
+            )
+            result = {
+                "name": self.contract["name"],
+                "invariant": copy.deepcopy(invariant),
+                "result": copy.deepcopy(_world_contract_find_condition_result(self.invariant_results, invariant_id)),
+                "query": invariant_id,
+            }
+            event_name = "world_invariant_inspected" if invariant else "world_invariant_missing"
+            success = invariant is not None
+            error = None if success else "invariant_not_found"
+            content = f"Inspected invariant {invariant_id}." if success else f"World invariant not found: {invariant_id}"
+        else:
+            transition_result = self._apply_transition(arguments)
+            result = transition_result
+            event_name = "world_transition_applied"
+            success = transition_result["status"] == "success"
+            error = None if success else transition_result["status"]
+            content = (
+                f"Applied world transition {transition_result['id']}."
+                if success
+                else f"World transition {transition_result['id']} failed: {transition_result['status']}."
+            )
+
+        return ToolExecutionResult(
+            tool_call_id=call_id,
+            tool_name=name,
+            content=content,
+            result=result,
+            success=success,
+            error=error,
+            state_updates={"world_contract": self._state_payload()},
+            artifacts=[self._contract_artifact()],
+            events=[
+                SimulationEvent(
+                    type="world_contract",
+                    name=event_name,
+                    payload=copy.deepcopy(result),
+                )
+            ],
+        )
+
+    def _tool_specs(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                "name": "world_contract_status",
+                "description": "Return the world contract, current state, transition log, invariant checks, success checks, and summary.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            {
+                "name": "list_world_transitions",
+                "description": "List available world transitions, optionally filtered by actor, resource, action, signal, or required flag.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "actor": {"type": "string"},
+                        "resource": {"type": "string"},
+                        "action": {"type": "string"},
+                        "signal": {"type": "string"},
+                        "required": {"type": "boolean"},
+                    },
+                },
+            },
+            {
+                "name": "inspect_world_invariant",
+                "description": "Inspect one world invariant by id or name.",
+                "parameters": {"type": "object", "properties": {"id": {"type": "string"}}},
+            },
+            {
+                "name": "apply_world_transition",
+                "description": "Apply an allowed world transition by id/name/action and update contract state.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string"},
+                        "transition": {"type": "string"},
+                        "action": {"type": "string"},
+                    },
+                },
+            },
+        ]
+
+    def _apply_transition(self, arguments: Mapping[str, Any]) -> Dict[str, Any]:
+        transition_id = str(
+            arguments.get("id")
+            or arguments.get("transition")
+            or arguments.get("action")
+            or ""
+        )
+        transition = _world_contract_find_transition(self.contract.get("transitions", []), transition_id)
+        if transition is None:
+            record = {
+                "id": transition_id or "unknown",
+                "status": "missing_transition",
+                "arguments": copy.deepcopy(dict(arguments)),
+            }
+            self.transition_log.append(record)
+            return record
+
+        state_before = copy.deepcopy(self.state)
+        violations: List[Dict[str, Any]] = []
+        status = "success"
+        if transition.get("forbidden") is True:
+            status = "forbidden_transition"
+            violations.append({"type": "forbidden_transition", "transition": transition["id"]})
+        elif not _world_contract_condition_matches(self.state, _as_mapping(transition.get("preconditions"))):
+            status = "precondition_failed"
+            violations.append(
+                {
+                    "type": "precondition_failed",
+                    "transition": transition["id"],
+                    "expected": copy.deepcopy(_as_mapping(transition.get("preconditions"))),
+                }
+            )
+
+        if status == "success":
+            _deep_merge(self.state, _world_contract_effects(transition))
+            if not _world_contract_condition_matches(self.state, _as_mapping(transition.get("postconditions"))):
+                status = "postcondition_failed"
+                violations.append(
+                    {
+                        "type": "postcondition_failed",
+                        "transition": transition["id"],
+                        "expected": copy.deepcopy(_as_mapping(transition.get("postconditions"))),
+                    }
+                )
+
+        self.invariant_results = _world_contract_check_conditions(
+            self.contract.get("invariants", []),
+            self.state,
+            condition_type="invariant",
+        )
+        self.success_results = _world_contract_check_conditions(
+            self.contract.get("success_conditions", []),
+            self.state,
+            condition_type="success_condition",
+        )
+        for invariant in self.invariant_results:
+            if invariant.get("pass") is False:
+                violations.append({"type": "invariant_violation", **copy.deepcopy(invariant)})
+        record = {
+            "id": transition["id"],
+            "name": transition.get("name"),
+            "actor": transition.get("actor"),
+            "action": transition.get("action"),
+            "resource": transition.get("resource"),
+            "required": bool(transition.get("required")),
+            "status": status,
+            "signals": copy.deepcopy(transition.get("signals", [])),
+            "arguments": copy.deepcopy(dict(arguments)),
+            "state_before": state_before,
+            "state_after": copy.deepcopy(self.state),
+            "violations": violations,
+        }
+        self.transition_log.append(record)
+        return record
+
+    def _filtered_transitions(self, arguments: Mapping[str, Any]) -> List[Dict[str, Any]]:
+        transitions = [copy.deepcopy(transition) for transition in self.contract.get("transitions", [])]
+        for field in ("actor", "resource", "action"):
+            value = str(arguments.get(field) or "").strip().lower()
+            if value:
+                transitions = [
+                    transition for transition in transitions if value == str(transition.get(field) or "").lower()
+                ]
+        signal = str(arguments.get("signal") or "").strip().lower()
+        if signal:
+            transitions = [
+                transition
+                for transition in transitions
+                if signal in {str(item).lower() for item in transition.get("signals", [])}
+            ]
+        if arguments.get("required") is not None:
+            required = bool(arguments.get("required"))
+            transitions = [transition for transition in transitions if bool(transition.get("required")) is required]
+        return transitions
+
+    def _contract_artifact(self) -> SimulationArtifact:
+        return SimulationArtifact(
+            type="trace",
+            role="environment",
+            data=self._state_payload(),
+            metadata={"kind": "world_contract", "name": self.contract["name"]},
+        )
+
+    def _state_payload(self) -> Dict[str, Any]:
+        return {
+            "kind": "world_contract",
+            "name": self.contract["name"],
+            "actors": copy.deepcopy(self.contract.get("actors", [])),
+            "resources": copy.deepcopy(self.contract.get("resources", [])),
+            "transitions": copy.deepcopy(self.contract.get("transitions", [])),
+            "invariants": copy.deepcopy(self.contract.get("invariants", [])),
+            "success_conditions": copy.deepcopy(self.contract.get("success_conditions", [])),
+            "policy_gates": copy.deepcopy(self.contract.get("policy_gates", [])),
+            "adversarial_surfaces": copy.deepcopy(self.contract.get("adversarial_surfaces", [])),
+            "state": copy.deepcopy(self.state),
+            "transition_log": copy.deepcopy(self.transition_log),
+            "invariant_results": copy.deepcopy(self.invariant_results),
+            "success_results": copy.deepcopy(self.success_results),
+            "signals": sorted(self._observed_signals()),
+            "summary": self._summary(),
+            "metadata": copy.deepcopy(self.contract.get("metadata", {})),
+        }
+
+    def _observed_signals(self) -> set[str]:
+        signals = {"contract", "state"}
+        if self.contract.get("actors"):
+            signals.add("actor")
+        if self.contract.get("resources"):
+            signals.add("resource")
+        if self.contract.get("transitions"):
+            signals.add("transition")
+        if self.contract.get("invariants"):
+            signals.add("invariant")
+        if self.contract.get("success_conditions"):
+            signals.add("success_condition")
+        if self.contract.get("policy_gates"):
+            signals.add("policy")
+        if self.contract.get("adversarial_surfaces"):
+            signals.add("adversarial_surface")
+        for transition in self.contract.get("transitions", []):
+            signals.update(transition.get("signals", []))
+        for record in self.transition_log:
+            signals.add("transition_log")
+            if record.get("status") == "success":
+                signals.add("completed_transition")
+            if record.get("status") == "forbidden_transition":
+                signals.add("forbidden_transition")
+            if record.get("violations"):
+                signals.add("violation")
+        if any(result.get("pass") is False for result in self.invariant_results):
+            signals.add("invariant_violation")
+        if all(result.get("pass") is True for result in self.success_results) and self.success_results:
+            signals.add("success")
+        return {_normalize_world_contract_key(signal) for signal in signals if signal}
+
+    def _summary(self) -> Dict[str, Any]:
+        completed = [record for record in self.transition_log if record.get("status") == "success"]
+        forbidden = [record for record in self.transition_log if record.get("status") == "forbidden_transition"]
+        violations = [violation for record in self.transition_log for violation in record.get("violations", [])]
+        invariant_failures = [result for result in self.invariant_results if result.get("pass") is False]
+        success_passed = [result for result in self.success_results if result.get("pass") is True]
+        return {
+            "actor_count": len(self.contract.get("actors", [])),
+            "resource_count": len(self.contract.get("resources", [])),
+            "transition_count": len(self.contract.get("transitions", [])),
+            "completed_transition_count": len(completed),
+            "required_transition_count": sum(1 for transition in self.contract.get("transitions", []) if transition.get("required")),
+            "completed_required_transition_count": len(
+                {
+                    record.get("id")
+                    for record in completed
+                    if _world_contract_find_transition(self.contract.get("transitions", []), str(record.get("id"))) and _world_contract_find_transition(self.contract.get("transitions", []), str(record.get("id"))).get("required")
+                }
+            ),
+            "forbidden_transition_count": len(forbidden),
+            "violation_count": len(violations),
+            "invariant_count": len(self.invariant_results),
+            "invariant_violation_count": len(invariant_failures),
+            "success_condition_count": len(self.success_results),
+            "success_condition_pass_count": len(success_passed),
+            "terminal_status": "success" if self.success_results and len(success_passed) == len(self.success_results) and not invariant_failures else "incomplete",
+        }
+
+
+def normalize_world_contract(
+    *,
+    name: str = "world",
+    actors: Iterable[str | Mapping[str, Any]] = (),
+    resources: Iterable[str | Mapping[str, Any]] = (),
+    transitions: Iterable[str | Mapping[str, Any]] = (),
+    invariants: Iterable[str | Mapping[str, Any]] = (),
+    success_conditions: Iterable[str | Mapping[str, Any]] = (),
+    policy_gates: Iterable[str | Mapping[str, Any]] = (),
+    adversarial_surfaces: Iterable[str | Mapping[str, Any]] = (),
+    initial_state: Optional[Mapping[str, Any]] = None,
+    metadata: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Normalize a portable world/task state contract into a serializable shape."""
+
+    return {
+        "kind": "world_contract",
+        "name": str(name),
+        "actors": [_world_contract_entity(actor, prefix="actor") for actor in actors],
+        "resources": [_world_contract_entity(resource, prefix="resource") for resource in resources],
+        "transitions": [
+            _world_contract_transition(transition, index=index + 1)
+            for index, transition in enumerate(transitions)
+        ],
+        "invariants": [
+            _world_contract_condition(invariant, prefix="invariant", index=index + 1)
+            for index, invariant in enumerate(invariants)
+        ],
+        "success_conditions": [
+            _world_contract_condition(condition, prefix="success", index=index + 1)
+            for index, condition in enumerate(success_conditions)
+        ],
+        "policy_gates": [
+            _world_contract_condition(gate, prefix="policy", index=index + 1)
+            for index, gate in enumerate(policy_gates)
+        ],
+        "adversarial_surfaces": [
+            _world_contract_entity(surface, prefix="surface")
+            for surface in adversarial_surfaces
+        ],
+        "initial_state": copy.deepcopy(dict(initial_state or {})),
+        "metadata": copy.deepcopy(dict(metadata or {})),
+    }
+
+
+def load_world_contract(
+    source: str | os.PathLike[str] | Mapping[str, Any],
+    *,
+    headers: Optional[Mapping[str, str]] = None,
+    timeout: float = 30.0,
+) -> WorldContractEnvironment:
+    """Load a local/HTTP/inline world contract and return a replay environment."""
+
+    if isinstance(source, (str, os.PathLike)):
+        loaded = _load_framework_trace_export_source(
+            source,
+            headers=headers,
+            timeout=timeout,
+        )
+    else:
+        loaded = source
+    data = _coerce_plain_dict(loaded)
+    return WorldContractEnvironment(
+        name=str(data.get("name") or data.get("id") or "world"),
+        actors=_as_iterable(data.get("actors")),
+        resources=_as_iterable(data.get("resources")),
+        transitions=_as_iterable(data.get("transitions")),
+        invariants=_as_iterable(data.get("invariants")),
+        success_conditions=_as_iterable(data.get("success_conditions") or data.get("success")),
+        policy_gates=_as_iterable(data.get("policy_gates") or data.get("policies")),
+        adversarial_surfaces=_as_iterable(data.get("adversarial_surfaces") or data.get("surfaces")),
+        initial_state=_coerce_plain_dict(data.get("initial_state") or data.get("state")),
+        metadata=_coerce_plain_dict(data.get("metadata")),
+    )
+
+
 class BrowserEnvironment(EnvironmentAdapter):
     """Local browser/CUA environment with snapshots, replay, and domain policy."""
 
@@ -11908,6 +12362,279 @@ def _structured_artifact_from_fixture(fixture: Mapping[str, Any]) -> SimulationA
         role=str(fixture.get("role", "environment")),
         metadata=metadata,
     )
+
+
+def _world_contract_entity(value: str | Mapping[str, Any], *, prefix: str) -> Dict[str, Any]:
+    if isinstance(value, str):
+        entity = {"id": value, "name": value}
+    else:
+        entity = copy.deepcopy(dict(value))
+    entity_id = str(entity.get("id") or entity.get("name") or f"{prefix}_{abs(hash(str(entity))) % 10000}")
+    entity.setdefault("id", entity_id)
+    entity.setdefault("name", entity_id)
+    return entity
+
+
+def _world_contract_transition(value: str | Mapping[str, Any], *, index: int) -> Dict[str, Any]:
+    if isinstance(value, str):
+        transition = {"id": value, "name": value, "action": value}
+    else:
+        transition = copy.deepcopy(dict(value))
+    transition_id = str(
+        transition.get("id")
+        or transition.get("name")
+        or transition.get("action")
+        or f"transition_{index}"
+    )
+    action = str(transition.get("action") or transition.get("name") or transition_id)
+    transition.setdefault("id", transition_id)
+    transition.setdefault("name", action)
+    transition.setdefault("action", action)
+    transition["preconditions"] = _world_contract_flat_mapping(transition.get("preconditions") or transition.get("requires"))
+    transition["postconditions"] = _world_contract_flat_mapping(transition.get("postconditions") or transition.get("ensures"))
+    transition["effects"] = _world_contract_patch_mapping(
+        transition.get("effects")
+        or transition.get("state_updates")
+        or transition.get("state")
+        or transition.get("to")
+    )
+    transition["signals"] = sorted(
+        {
+            _normalize_world_contract_key(signal)
+            for signal in [
+                *_as_iterable(transition.get("signals")),
+                transition.get("actor"),
+                transition.get("resource"),
+                transition.get("action"),
+                "transition",
+            ]
+            if signal
+        }
+    )
+    transition["required"] = bool(transition.get("required", transition.get("must_run", False)))
+    transition["forbidden"] = bool(transition.get("forbidden", False))
+    return transition
+
+
+def _world_contract_condition(
+    value: str | Mapping[str, Any],
+    *,
+    prefix: str,
+    index: int,
+) -> Dict[str, Any]:
+    if isinstance(value, str):
+        condition = {"id": value, "name": value}
+    else:
+        condition = copy.deepcopy(dict(value))
+    condition_id = str(condition.get("id") or condition.get("name") or f"{prefix}_{index}")
+    condition.setdefault("id", condition_id)
+    condition.setdefault("name", condition_id)
+    condition["when"] = _world_contract_flat_mapping(condition.get("when"))
+    condition["must"] = _world_contract_flat_mapping(
+        condition.get("must")
+        or condition.get("expect")
+        or condition.get("expected")
+        or condition.get("state")
+    )
+    condition["forbidden"] = _world_contract_flat_mapping(condition.get("forbidden"))
+    condition["signals"] = sorted(
+        {
+            _normalize_world_contract_key(signal)
+            for signal in [*_as_iterable(condition.get("signals")), prefix]
+            if signal
+        }
+    )
+    return condition
+
+
+def _world_contract_patch_mapping(value: Any) -> Dict[str, Any]:
+    mapping = _as_mapping(value)
+    if not mapping:
+        return {}
+    patch: Dict[str, Any] = {}
+    for path, item in mapping.items():
+        if "." in str(path):
+            _world_contract_set_path(patch, str(path), item)
+        elif isinstance(item, Mapping):
+            patch[str(path)] = _world_contract_patch_mapping(item)
+        else:
+            patch[str(path)] = copy.deepcopy(item)
+    return patch
+
+
+def _world_contract_flat_mapping(value: Any, prefix: str = "") -> Dict[str, Any]:
+    mapping = _as_mapping(value)
+    flattened: Dict[str, Any] = {}
+    for key, item in mapping.items():
+        path = f"{prefix}.{key}" if prefix else str(key)
+        if isinstance(item, Mapping):
+            flattened.update(_world_contract_flat_mapping(item, path))
+        else:
+            flattened[path] = copy.deepcopy(item)
+    return flattened
+
+
+def _world_contract_effects(transition: Mapping[str, Any]) -> Dict[str, Any]:
+    return _world_contract_patch_mapping(transition.get("effects"))
+
+
+def _world_contract_check_conditions(
+    conditions: Iterable[Mapping[str, Any]],
+    state: Mapping[str, Any],
+    *,
+    condition_type: str,
+) -> List[Dict[str, Any]]:
+    results: List[Dict[str, Any]] = []
+    for condition in conditions:
+        condition_dict = _as_mapping(condition)
+        when = _as_mapping(condition_dict.get("when"))
+        applies = not when or _world_contract_condition_matches(state, when)
+        must = _as_mapping(condition_dict.get("must"))
+        forbidden = _as_mapping(condition_dict.get("forbidden"))
+        must_match = True if not must else _world_contract_condition_matches(state, must)
+        forbidden_match = False if not forbidden else _world_contract_condition_matches(state, forbidden)
+        passed = (not applies) or (must_match and not forbidden_match)
+        result = {
+            "id": condition_dict.get("id"),
+            "name": condition_dict.get("name"),
+            "type": condition_type,
+            "applies": applies,
+            "pass": passed,
+            "expected": copy.deepcopy(must),
+            "forbidden": copy.deepcopy(forbidden),
+            "actual": {
+                path: _world_contract_get_path(state, path)
+                for path in sorted({*must.keys(), *forbidden.keys()})
+            },
+            "signals": copy.deepcopy(condition_dict.get("signals", [])),
+        }
+        results.append(result)
+    return results
+
+
+def _world_contract_condition_matches(state: Mapping[str, Any], expected: Mapping[str, Any]) -> bool:
+    for path, value in expected.items():
+        if _world_contract_get_path(state, str(path)) != value:
+            return False
+    return True
+
+
+def _world_contract_get_path(value: Mapping[str, Any], path: str) -> Any:
+    current: Any = value
+    for part in path.split("."):
+        if isinstance(current, Mapping) and part in current:
+            current = current.get(part)
+        else:
+            return None
+    return current
+
+
+def _world_contract_set_path(target: Dict[str, Any], path: str, value: Any) -> None:
+    current: Dict[str, Any] = target
+    parts = path.split(".")
+    for part in parts[:-1]:
+        existing = current.get(part)
+        if not isinstance(existing, dict):
+            existing = {}
+            current[part] = existing
+        current = existing
+    current[parts[-1]] = copy.deepcopy(value)
+
+
+def _world_contract_find_transition(
+    transitions: Iterable[Mapping[str, Any]],
+    transition_id: str,
+) -> Optional[Dict[str, Any]]:
+    query = str(transition_id or "").strip().lower()
+    if not query:
+        return None
+    for transition in transitions:
+        transition_dict = _as_mapping(transition)
+        candidates = {
+            str(transition_dict.get("id") or "").lower(),
+            str(transition_dict.get("name") or "").lower(),
+            str(transition_dict.get("action") or "").lower(),
+        }
+        if query in candidates:
+            return copy.deepcopy(transition_dict)
+    return None
+
+
+def _world_contract_find_condition(
+    conditions: Iterable[Mapping[str, Any]],
+    condition_id: str,
+) -> Optional[Dict[str, Any]]:
+    query = str(condition_id or "").strip().lower()
+    if not query:
+        return None
+    for condition in conditions:
+        condition_dict = _as_mapping(condition)
+        if query in {str(condition_dict.get("id") or "").lower(), str(condition_dict.get("name") or "").lower()}:
+            return copy.deepcopy(condition_dict)
+    return None
+
+
+def _world_contract_find_condition_result(
+    results: Iterable[Mapping[str, Any]],
+    condition_id: str,
+) -> Optional[Dict[str, Any]]:
+    query = str(condition_id or "").strip().lower()
+    if not query:
+        return None
+    for result in results:
+        result_dict = _as_mapping(result)
+        if query in {str(result_dict.get("id") or "").lower(), str(result_dict.get("name") or "").lower()}:
+            return copy.deepcopy(result_dict)
+    return None
+
+
+def _normalize_world_contract_key(value: Any) -> str:
+    normalized = str(value or "").strip().lower().replace("-", "_").replace(" ", "_").replace(".", "_")
+    aliases = {
+        "world_contract": "contract",
+        "world_contract_status": "contract",
+        "list_world_transitions": "transition",
+        "apply_world_transition": "transition",
+        "inspect_world_invariant": "invariant",
+        "actors": "actor",
+        "actor": "actor",
+        "resources": "resource",
+        "resource": "resource",
+        "transitions": "transition",
+        "transition": "transition",
+        "transition_log": "transition_log",
+        "completed_transition": "completed_transition",
+        "required_transition": "required_transition",
+        "forbidden_transition": "forbidden_transition",
+        "invariants": "invariant",
+        "invariant": "invariant",
+        "invariant_violation": "invariant_violation",
+        "success": "success",
+        "success_condition": "success_condition",
+        "success_conditions": "success_condition",
+        "policy_gate": "policy",
+        "policy_gates": "policy",
+        "policy": "policy",
+        "adversarial_surface": "adversarial_surface",
+        "adversarial_surfaces": "adversarial_surface",
+        "violation": "violation",
+        "state_update": "state",
+        "state": "state",
+        "milestone": "milestone",
+        "tool": "tool",
+        "browser": "browser",
+        "voice": "voice",
+        "memory": "memory",
+    }
+    return aliases.get(normalized, normalized)
+
+
+def _as_mapping(value: Any) -> Dict[str, Any]:
+    if value is None:
+        return {}
+    if isinstance(value, Mapping):
+        return copy.deepcopy(dict(value))
+    return {}
 
 
 def _deep_merge(target: Dict[str, Any], updates: Mapping[str, Any]) -> None:

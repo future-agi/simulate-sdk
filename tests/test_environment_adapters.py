@@ -23,8 +23,10 @@ from fi.simulate import (
     ToolFaultInjectionEnvironment,
     ToolMockEnvironment,
     VoiceEnvironment,
+    WorldContractEnvironment,
     load_browser_trace_export,
     load_voice_export,
+    load_world_contract,
     load_playwright_trace_export,
     load_framework_trace_export,
     load_streaming_trace_export,
@@ -39,6 +41,7 @@ from fi.simulate import (
     normalize_framework_trace_export,
     normalize_browser_trace_export,
     normalize_voice_export,
+    normalize_world_contract,
     normalize_playwright_trace_export,
 )
 from fi.simulate.simulation.engines.local_text import LocalTextEngine
@@ -223,6 +226,162 @@ async def test_tool_fault_injection_fails_then_allows_retry():
     assert executions[1].payload["tool_call_id"] == "call_order_1"
     assert any(event.type == "tool_fault" for event in result.events)
     assert result.metadata["environment_state"]["order"]["status"] == "resolved"
+
+
+@pytest.mark.asyncio
+async def test_world_contract_environment_applies_state_machine_transitions():
+    seen_tools = []
+
+    async def agent(input):
+        seen_tools.extend(tool["name"] for tool in input.tools)
+        return AgentResponse(
+            content="I verified identity, checked policy, issued the refund, and inspected the contract.",
+            tool_calls=[
+                {"id": "status", "name": "world_contract_status", "arguments": {}},
+                {"id": "list", "name": "list_world_transitions", "arguments": {"required": True}},
+                {"id": "identity", "name": "apply_world_transition", "arguments": {"id": "verify_identity"}},
+                {"id": "policy", "name": "apply_world_transition", "arguments": {"id": "check_policy"}},
+                {"id": "refund", "name": "apply_world_transition", "arguments": {"id": "issue_refund"}},
+                {"id": "invariant", "name": "inspect_world_invariant", "arguments": {"id": "refund_requires_identity"}},
+            ],
+        )
+
+    environment = WorldContractEnvironment(
+        name="refund_world",
+        actors=[{"id": "support_agent", "role": "agent"}, {"id": "customer", "role": "user"}],
+        resources=[{"id": "case"}, {"id": "refund_policy"}],
+        initial_state={
+            "case": {
+                "status": "open",
+                "identity_verified": False,
+                "policy_checked": False,
+                "refund_issued": False,
+            }
+        },
+        transitions=[
+            {
+                "id": "verify_identity",
+                "actor": "support_agent",
+                "resource": "case",
+                "action": "verify_identity",
+                "required": True,
+                "effects": {"case.identity_verified": True},
+                "postconditions": {"case.identity_verified": True},
+                "signals": ["identity", "milestone"],
+            },
+            {
+                "id": "check_policy",
+                "actor": "support_agent",
+                "resource": "refund_policy",
+                "action": "check_policy",
+                "required": True,
+                "preconditions": {"case.identity_verified": True},
+                "effects": {"case.policy_checked": True},
+                "postconditions": {"case.policy_checked": True},
+                "signals": ["policy", "milestone"],
+            },
+            {
+                "id": "issue_refund",
+                "actor": "support_agent",
+                "resource": "case",
+                "action": "issue_refund",
+                "required": True,
+                "preconditions": {"case.identity_verified": True, "case.policy_checked": True},
+                "effects": {"case.refund_issued": True, "case.status": "resolved"},
+                "postconditions": {"case.refund_issued": True, "case.status": "resolved"},
+                "signals": ["tool", "milestone"],
+            },
+            {
+                "id": "refund_without_identity",
+                "actor": "support_agent",
+                "resource": "case",
+                "action": "issue_refund",
+                "forbidden": True,
+                "signals": ["policy"],
+            },
+        ],
+        invariants=[
+            {
+                "id": "refund_requires_identity",
+                "when": {"case.refund_issued": True},
+                "must": {"case.identity_verified": True},
+            },
+            {
+                "id": "refund_requires_policy",
+                "when": {"case.refund_issued": True},
+                "must": {"case.policy_checked": True},
+            },
+        ],
+        success_conditions=[
+            {
+                "id": "refund_resolved",
+                "must": {"case.status": "resolved", "case.refund_issued": True},
+            }
+        ],
+        policy_gates=[{"id": "identity_gate", "must": {"case.identity_verified": True}}],
+        adversarial_surfaces=[{"id": "user_message", "type": "prompt_injection"}],
+    )
+
+    report = await LocalTextEngine().run(
+        scenario=_scenario(),
+        agent_callback=agent,
+        environment=environment,
+        max_turns=1,
+        min_turns=1,
+    )
+
+    result = report.results[0]
+    world_state = result.metadata["environment_state"]["world_contract"]
+    trace_artifacts = [
+        artifact.data
+        for artifact in result.artifacts
+        if artifact.type == "trace" and artifact.metadata.get("kind") == "world_contract"
+    ]
+
+    assert {
+        "world_contract_status",
+        "list_world_transitions",
+        "apply_world_transition",
+        "inspect_world_invariant",
+    } <= set(seen_tools)
+    assert world_state["name"] == "refund_world"
+    assert {
+        "actor",
+        "resource",
+        "transition",
+        "invariant",
+        "success_condition",
+        "policy",
+        "adversarial_surface",
+    } <= set(world_state["signals"])
+    assert world_state["state"]["case"]["status"] == "resolved"
+    assert world_state["summary"]["completed_required_transition_count"] == 3
+    assert world_state["summary"]["invariant_violation_count"] == 0
+    assert world_state["summary"]["success_condition_pass_count"] == 1
+    assert world_state["summary"]["terminal_status"] == "success"
+    assert trace_artifacts and trace_artifacts[-1]["transition_log"]
+
+
+def test_normalize_world_contract_and_loader_support_dotted_effects():
+    contract = normalize_world_contract(
+        name="checkout_world",
+        actors=["checkout_agent"],
+        resources=["cart"],
+        initial_state={"cart": {"paid": False}},
+        transitions=[
+            {
+                "id": "pay",
+                "effects": {"cart.paid": True},
+                "required": True,
+            }
+        ],
+        success_conditions=[{"id": "paid", "must": {"cart.paid": True}}],
+    )
+
+    assert contract["transitions"][0]["effects"] == {"cart": {"paid": True}}
+    environment = load_world_contract(contract)
+    snapshot = environment.reset()
+    assert snapshot.state["world_contract"]["summary"]["required_transition_count"] == 1
 
 
 @pytest.mark.asyncio
