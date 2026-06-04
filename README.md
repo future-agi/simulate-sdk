@@ -389,9 +389,12 @@ Future AGI UI workers that should run simulations without shelling out:
 ```python
 import asyncio
 from fi.simulate import (
+    compare_results,
+    create_baseline,
     detect_manifest_command,
     load_manifest,
     optimize_manifest_file,
+    render_report,
     run_manifest_file,
 )
 
@@ -403,6 +406,10 @@ else:
     result = asyncio.run(run_manifest_file("manifests/run.json"))
 
 assert result["exit_code"] == 0
+
+baseline = create_baseline(result)
+comparison = compare_results(baseline, result)
+report = render_report(comparison)
 ```
 
 Markdown reporting turns JSON artifacts from `run`, `redteam`, `optimize`,
@@ -447,6 +454,12 @@ Manifests currently support:
   child statuses, compact summaries, findings, and scores
 - `agent-simulate report RESULT.json --markdown RESULT.md` renders
   human-readable Markdown from CLI JSON artifacts
+- Python SDK callers can use the same manifest/result contract via
+  `load_manifest`, `detect_manifest_command`, `run_manifest_file`,
+  `run_redteam_manifest_file`, `optimize_manifest_file`, `replay_manifests`,
+  `create_baseline`, `compare_results`, `render_report`,
+  `promote_to_regression`, `render_junit`, `render_sarif`, and
+  `render_markdown`
 - `optimization.target.search_space` over JSON paths in the same manifest when
   `agent-opt` is installed
 - JSON, JUnit, SARIF, and Markdown outputs from CLI flags or manifest `outputs`

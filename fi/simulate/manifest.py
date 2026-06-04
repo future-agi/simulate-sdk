@@ -6,7 +6,7 @@ import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Literal, Mapping, Optional
+from typing import Any, Dict, Literal, Mapping, Optional, Sequence
 
 
 CLI_SCHEMA_VERSION = "agent-simulate.cli.v1"
@@ -40,6 +40,12 @@ def load_manifest_file(path: str | Path) -> Dict[str, Any]:
 
 
 load_manifest = load_manifest_file
+
+
+def public_result(result: Mapping[str, Any]) -> Dict[str, Any]:
+    """Return a JSON-safe result payload without local output bookkeeping."""
+
+    return _cli()._public_result(result)
 
 
 def detect_manifest_command(
@@ -99,6 +105,225 @@ def evaluate_manifest_report(manifest: Mapping[str, Any], report: Any) -> Any:
     """Score a report with the manifest's evaluation.agent_report block."""
 
     return _cli()._evaluate_manifest_report(manifest, report)
+
+
+def render_junit(result: Mapping[str, Any]) -> str:
+    """Render a CLI-compatible JUnit XML string for any manifest result."""
+
+    return _cli()._junit_xml(result)
+
+
+def render_sarif(
+    result: Mapping[str, Any],
+    *,
+    manifest_path: str | Path = ".",
+) -> str:
+    """Render a SARIF 2.1.0 JSON string for result findings."""
+
+    return _cli()._sarif_json(result, Path(manifest_path).expanduser().resolve())
+
+
+def render_markdown(
+    result: Mapping[str, Any],
+    *,
+    source_path: str | Path = ".",
+) -> str:
+    """Render the same Markdown report text produced by the CLI."""
+
+    return _cli()._markdown_text(result, Path(source_path).expanduser().resolve())
+
+
+def create_baseline_file(
+    path: str | Path,
+    *,
+    name: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Load a result artifact and return a compact compare-safe baseline."""
+
+    source_path = Path(path).expanduser().resolve()
+    return create_baseline(
+        load_manifest_file(source_path),
+        source_path=source_path,
+        name=name,
+    )
+
+
+def create_baseline(
+    source: Mapping[str, Any],
+    *,
+    source_path: str | Path = ".",
+    name: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Return a compact compare-safe baseline for a run/redteam/optimize result."""
+
+    started = time.time()
+    return _cli()._baseline_result(
+        source=copy.deepcopy(dict(source)),
+        source_path=Path(source_path).expanduser().resolve(),
+        name=name,
+        duration_seconds=round(time.time() - started, 4),
+    )
+
+
+def compare_result_files(
+    baseline_path: str | Path,
+    current_path: str | Path,
+    *,
+    min_score_delta: float = 0.0,
+    max_new_findings: int = 0,
+    max_new_error_findings: int = 0,
+    min_metric_delta: Optional[float] = None,
+    name: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Load two result artifacts and return the same compare payload as the CLI."""
+
+    baseline_path = Path(baseline_path).expanduser().resolve()
+    current_path = Path(current_path).expanduser().resolve()
+    return compare_results(
+        load_manifest_file(baseline_path),
+        load_manifest_file(current_path),
+        baseline_path=baseline_path,
+        current_path=current_path,
+        min_score_delta=min_score_delta,
+        max_new_findings=max_new_findings,
+        max_new_error_findings=max_new_error_findings,
+        min_metric_delta=min_metric_delta,
+        name=name,
+    )
+
+
+def compare_results(
+    baseline: Mapping[str, Any],
+    current: Mapping[str, Any],
+    *,
+    baseline_path: str | Path = "baseline.json",
+    current_path: str | Path = "current.json",
+    min_score_delta: float = 0.0,
+    max_new_findings: int = 0,
+    max_new_error_findings: int = 0,
+    min_metric_delta: Optional[float] = None,
+    name: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Compare baseline/current result payloads with stable gate semantics."""
+
+    started = time.time()
+    return _cli()._compare_results(
+        baseline=copy.deepcopy(dict(baseline)),
+        current=copy.deepcopy(dict(current)),
+        baseline_path=Path(baseline_path).expanduser().resolve(),
+        current_path=Path(current_path).expanduser().resolve(),
+        min_score_delta=float(min_score_delta),
+        max_new_findings=int(max_new_findings),
+        max_new_error_findings=int(max_new_error_findings),
+        min_metric_delta=min_metric_delta,
+        name=name,
+        duration_seconds=round(time.time() - started, 4),
+    )
+
+
+def render_report_file(
+    path: str | Path,
+    *,
+    name: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Load a result artifact and return a Markdown report payload."""
+
+    source_path = Path(path).expanduser().resolve()
+    return render_report(
+        load_manifest_file(source_path),
+        source_path=source_path,
+        name=name,
+    )
+
+
+def render_report(
+    source: Mapping[str, Any],
+    *,
+    source_path: str | Path = ".",
+    name: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Return a Markdown report payload for any manifest result."""
+
+    started = time.time()
+    return _cli()._report_result(
+        source=copy.deepcopy(dict(source)),
+        source_path=Path(source_path).expanduser().resolve(),
+        name=name,
+        duration_seconds=round(time.time() - started, 4),
+    )
+
+
+def promote_to_regression_file(
+    path: str | Path,
+    *,
+    name: Optional[str] = None,
+    min_level: Literal["note", "warning", "error"] = "warning",
+    max_findings: int = 25,
+    required_env: Sequence[str] = (),
+) -> Dict[str, Any]:
+    """Load a result artifact and return a runnable red-team regression manifest."""
+
+    source_path = Path(path).expanduser().resolve()
+    return promote_to_regression(
+        load_manifest_file(source_path),
+        source_path=source_path,
+        name=name,
+        min_level=min_level,
+        max_findings=max_findings,
+        required_env=required_env,
+    )
+
+
+def promote_to_regression(
+    source: Mapping[str, Any],
+    *,
+    source_path: str | Path = ".",
+    name: Optional[str] = None,
+    min_level: Literal["note", "warning", "error"] = "warning",
+    max_findings: int = 25,
+    required_env: Sequence[str] = (),
+) -> Dict[str, Any]:
+    """Return a regression-promotion payload with an embedded runnable manifest."""
+
+    started = time.time()
+    return _cli()._regression_promotion_result(
+        source=copy.deepcopy(dict(source)),
+        source_path=Path(source_path).expanduser().resolve(),
+        name=name,
+        min_level=str(min_level),
+        max_findings=int(max_findings),
+        required_env=list(required_env),
+        duration_seconds=round(time.time() - started, 4),
+    )
+
+
+def replay_manifests(
+    manifests: Sequence[str | Path],
+    *,
+    name: Optional[str] = None,
+    dry_run: bool = False,
+    fail_fast: bool = False,
+) -> Dict[str, Any]:
+    """Run files/directories/globs as one manifest replay suite."""
+
+    cli = _cli()
+    started = time.time()
+    requested = [str(item) for item in manifests]
+    paths = cli._replay_manifest_paths(requested)
+    children = []
+    for path in paths:
+        child = cli._execute_replay_manifest(path, dry_run=bool(dry_run))
+        children.append(child)
+        if child.get("exit_code") != 0 and fail_fast:
+            break
+    return cli._replay_result(
+        children=children,
+        requested=requested,
+        name=name,
+        duration_seconds=round(time.time() - started, 4),
+        dry_run=bool(dry_run),
+        fail_fast=bool(fail_fast),
+    )
 
 
 async def run_manifest_file(
@@ -466,6 +691,10 @@ __all__ = [
     "ManifestRunOptions",
     "apply_manifest_env",
     "build_manifest_optimization_problem",
+    "compare_result_files",
+    "compare_results",
+    "create_baseline",
+    "create_baseline_file",
     "detect_manifest_command",
     "evaluate_manifest_report",
     "load_manifest",
@@ -473,9 +702,18 @@ __all__ = [
     "missing_manifest_env",
     "optimize_manifest",
     "optimize_manifest_file",
+    "promote_to_regression",
+    "promote_to_regression_file",
+    "public_result",
     "redteam_manifest",
     "redteam_manifest_file",
     "required_manifest_env",
+    "render_junit",
+    "render_markdown",
+    "render_report",
+    "render_report_file",
+    "render_sarif",
+    "replay_manifests",
     "run_local_text_manifest",
     "run_manifest",
     "run_manifest_file",
