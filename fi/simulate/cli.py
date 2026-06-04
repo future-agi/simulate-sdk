@@ -51,19 +51,20 @@ class ManifestError(ValueError):
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
-    if args.command in {"run", "redteam", "optimize", "compare", "baseline"}:
+    if args.command in {"run", "redteam", "optimize", "compare", "baseline", "report"}:
         try:
-            result = (
-                asyncio.run(run_manifest_command(args))
-                if args.command == "run"
-                else asyncio.run(redteam_manifest_command(args))
-                if args.command == "redteam"
-                else compare_results_command(args)
-                if args.command == "compare"
-                else baseline_result_command(args)
-                if args.command == "baseline"
-                else optimize_manifest_command(args)
-            )
+            if args.command == "run":
+                result = asyncio.run(run_manifest_command(args))
+            elif args.command == "redteam":
+                result = asyncio.run(redteam_manifest_command(args))
+            elif args.command == "compare":
+                result = compare_results_command(args)
+            elif args.command == "baseline":
+                result = baseline_result_command(args)
+            elif args.command == "report":
+                result = report_result_command(args)
+            else:
+                result = optimize_manifest_command(args)
         except ManifestError as exc:
             print(f"agent-simulate: {exc}", file=sys.stderr)
             return 2
@@ -71,7 +72,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(f"agent-simulate: {args.command} failed: {exc}", file=sys.stderr)
             return 3
         if not result.get("outputs_written") and not getattr(args, "quiet", False):
-            print(json.dumps(_public_result(result), indent=2, sort_keys=True))
+            if args.command == "report":
+                print(_markdown_text(result, Path(getattr(args, "result", "."))))
+            else:
+                print(json.dumps(_public_result(result), indent=2, sort_keys=True))
         return int(result.get("exit_code", 1))
     parser.print_help()
     return 2
@@ -178,6 +182,19 @@ def baseline_result_command(args: argparse.Namespace) -> Dict[str, Any]:
     source_path = Path(args.result).expanduser().resolve()
     source = load_manifest(source_path)
     result = _baseline_result(
+        source=source,
+        source_path=source_path,
+        name=getattr(args, "name", None),
+        duration_seconds=round(time.time() - started, 4),
+    )
+    return _write_outputs(result, {}, args, source_path)
+
+
+def report_result_command(args: argparse.Namespace) -> Dict[str, Any]:
+    started = time.time()
+    source_path = Path(args.result).expanduser().resolve()
+    source = load_manifest(source_path)
+    result = _report_result(
         source=source,
         source_path=source_path,
         name=getattr(args, "name", None),
@@ -815,6 +832,304 @@ def _baseline_optimization_summary(source: Mapping[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _report_result(
+    *,
+    source: Mapping[str, Any],
+    source_path: Path,
+    name: Optional[str],
+    duration_seconds: float,
+) -> Dict[str, Any]:
+    source_name = str(source.get("name") or source_path.stem)
+    findings = _result_findings(source)
+    error_findings = [finding for finding in findings if _sarif_level(finding) == "error"]
+    score = _optional_primary_score(source)
+    sections = _markdown_sections(source)
+    report_name = name or f"{source_name}-report"
+    markdown = _result_markdown(
+        source,
+        source_path=source_path,
+        title=report_name,
+        sections=sections,
+        score=score,
+        findings=findings,
+    )
+    return {
+        "schema_version": CLI_SCHEMA_VERSION,
+        "kind": "agent-simulate.report.v1",
+        "name": report_name,
+        "status": "passed",
+        "exit_code": 0,
+        "summary": {
+            "source_name": source_name,
+            "source_status": source.get("status"),
+            "source_score": score,
+            "source_schema_version": source.get("schema_version"),
+            "finding_count": len(findings),
+            "error_finding_count": len(error_findings),
+            "sections": sections,
+        },
+        "report": {
+            "format": "markdown",
+            "source_path": str(source_path),
+            "markdown": markdown,
+            "sections": sections,
+        },
+        "duration_seconds": duration_seconds,
+    }
+
+
+def _optional_primary_score(result: Mapping[str, Any]) -> Optional[float]:
+    try:
+        return _result_primary_score(result)
+    except ManifestError:
+        return None
+
+
+def _markdown_sections(result: Mapping[str, Any]) -> List[str]:
+    sections = ["summary"]
+    if result.get("redteam") is not None:
+        sections.append("redteam")
+    if result.get("compare") is not None:
+        sections.append("compare")
+    if result.get("optimization") is not None:
+        sections.append("optimization")
+    if result.get("baseline") is not None:
+        sections.append("baseline")
+    if _result_metric_averages(result) or dict(result.get("compare") or {}).get("metrics"):
+        sections.append("metrics")
+    if _result_findings(result):
+        sections.append("findings")
+    return sections
+
+
+def _result_markdown(
+    result: Mapping[str, Any],
+    *,
+    source_path: Path,
+    title: Optional[str] = None,
+    sections: Optional[Sequence[str]] = None,
+    score: Optional[float] = None,
+    findings: Optional[Sequence[Mapping[str, Any]]] = None,
+) -> str:
+    sections = list(sections or _markdown_sections(result))
+    findings = list(findings if findings is not None else _result_findings(result))
+    score = _optional_primary_score(result) if score is None else score
+    summary = dict(result.get("summary") or {})
+    lines = [
+        f"# {_md_text(title or result.get('name') or source_path.stem)}",
+        "",
+        f"- Source: `{_md_code(source_path)}`",
+        f"- Source status: {_md_text(result.get('status') or 'unknown')}",
+        f"- Source score: {_format_value(score)}",
+        f"- Source schema: {_md_text(result.get('schema_version') or 'unknown')}",
+        f"- Findings: {_format_value(len(findings))}",
+    ]
+    if "case_count" in summary:
+        lines.append(f"- Cases: {_format_value(summary.get('case_count'))}")
+    lines.append("")
+
+    if "redteam" in sections:
+        lines.extend(_redteam_markdown(result))
+    if "compare" in sections:
+        lines.extend(_compare_markdown(result))
+    if "optimization" in sections:
+        lines.extend(_optimization_markdown(result))
+    if "baseline" in sections:
+        lines.extend(_baseline_markdown(result))
+    if "metrics" in sections:
+        lines.extend(_metrics_markdown(result))
+    if "findings" in sections:
+        lines.extend(_findings_markdown(findings))
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _redteam_markdown(result: Mapping[str, Any]) -> List[str]:
+    redteam = dict(result.get("redteam") or {})
+    rows = [
+        ("Finding count", redteam.get("finding_count")),
+        ("Error finding count", redteam.get("error_finding_count")),
+        ("Severity threshold", redteam.get("severity_threshold")),
+        ("Taxonomies", _join_values(redteam.get("taxonomies"))),
+        ("Attack types", _join_values(redteam.get("attack_types"))),
+        ("Surfaces", _join_values(redteam.get("surfaces"))),
+        ("Channels", _join_values(redteam.get("channels"))),
+        ("Providers", _join_values(redteam.get("providers"))),
+        ("Frameworks", _join_values(redteam.get("frameworks"))),
+        ("Signals", _join_values(redteam.get("signals"))),
+    ]
+    return [
+        "## Red Team",
+        "",
+        *_key_value_table(rows),
+        "",
+    ]
+
+
+def _compare_markdown(result: Mapping[str, Any]) -> List[str]:
+    summary = dict(result.get("summary") or {})
+    compare = dict(result.get("compare") or {})
+    gates = dict(compare.get("gates") or {})
+    rows = [
+        ("Baseline path", compare.get("baseline_path")),
+        ("Current path", compare.get("current_path")),
+        ("Baseline score", summary.get("baseline_score")),
+        ("Current score", summary.get("current_score")),
+        ("Score delta", summary.get("score_delta")),
+        ("New findings", summary.get("new_finding_count")),
+        ("New error findings", summary.get("new_error_finding_count")),
+        ("Resolved findings", summary.get("resolved_finding_count")),
+        ("Comparison passed", summary.get("comparison_passed")),
+        ("Min score delta", gates.get("min_score_delta")),
+        ("Max new findings", gates.get("max_new_findings")),
+        ("Max new error findings", gates.get("max_new_error_findings")),
+        ("Min metric delta", gates.get("min_metric_delta")),
+    ]
+    return [
+        "## Compare",
+        "",
+        *_key_value_table(rows),
+        "",
+    ]
+
+
+def _optimization_markdown(result: Mapping[str, Any]) -> List[str]:
+    summary = dict(result.get("summary") or {})
+    optimization = dict(result.get("optimization") or {})
+    rows = [
+        ("Final score", optimization.get("final_score", summary.get("optimization_score"))),
+        ("Passed", summary.get("optimization_passed")),
+        ("Threshold", summary.get("threshold")),
+        ("Best candidate", optimization.get("best_candidate_id", summary.get("best_candidate_id"))),
+        ("Total iterations", summary.get("total_iterations")),
+        ("Total evaluations", summary.get("total_evaluations")),
+        ("History count", len(list(optimization.get("history") or []))),
+        ("Search paths", _join_values(summary.get("search_paths"))),
+    ]
+    return [
+        "## Optimization",
+        "",
+        *_key_value_table(rows),
+        "",
+    ]
+
+
+def _baseline_markdown(result: Mapping[str, Any]) -> List[str]:
+    baseline = dict(result.get("baseline") or {})
+    rows = [
+        ("Kind", result.get("kind")),
+        ("Source name", baseline.get("source_name")),
+        ("Source status", baseline.get("source_status")),
+        ("Source schema", baseline.get("source_schema_version")),
+        ("Dropped sections", _join_values(baseline.get("dropped_sections"))),
+    ]
+    return [
+        "## Baseline",
+        "",
+        *_key_value_table(rows),
+        "",
+    ]
+
+
+def _metrics_markdown(result: Mapping[str, Any]) -> List[str]:
+    compare_metrics = list(dict(result.get("compare") or {}).get("metrics") or [])
+    if compare_metrics:
+        rows = [
+            [
+                item.get("name"),
+                item.get("baseline"),
+                item.get("current"),
+                item.get("delta"),
+            ]
+            for item in compare_metrics
+            if isinstance(item, Mapping)
+        ]
+        table = _markdown_table(["Metric", "Baseline", "Current", "Delta"], rows)
+    else:
+        metrics = _result_metric_averages(result)
+        rows = [[name, metrics[name]] for name in sorted(metrics)]
+        table = _markdown_table(["Metric", "Score"], rows)
+    return ["## Metrics", "", *table, ""]
+
+
+def _findings_markdown(findings: Sequence[Mapping[str, Any]]) -> List[str]:
+    rows = [
+        [
+            _sarif_level(finding),
+            finding.get("type") or "finding",
+            finding.get("metric"),
+            finding.get("check") or finding.get("key"),
+            finding.get("expected"),
+            finding.get("actual"),
+            finding.get("case_index"),
+        ]
+        for finding in findings[:25]
+    ]
+    lines = [
+        "## Findings",
+        "",
+        *_markdown_table(["Level", "Type", "Metric", "Check", "Expected", "Actual", "Case"], rows),
+    ]
+    if len(findings) > 25:
+        lines.extend(["", f"{len(findings) - 25} additional finding(s) omitted from the Markdown table."])
+    lines.append("")
+    return lines
+
+
+def _key_value_table(rows: Sequence[tuple[str, Any]]) -> List[str]:
+    return _markdown_table(
+        ["Field", "Value"],
+        [[name, value] for name, value in rows if value not in (None, "", [], {})],
+    )
+
+
+def _markdown_table(headers: Sequence[str], rows: Sequence[Sequence[Any]]) -> List[str]:
+    if not rows:
+        return ["No data."]
+    return [
+        "| " + " | ".join(_md_cell(header) for header in headers) + " |",
+        "| " + " | ".join("---" for _ in headers) + " |",
+        *["| " + " | ".join(_md_cell(value) for value in row) + " |" for row in rows],
+    ]
+
+
+def _markdown_text(result: Mapping[str, Any], source_path: Path) -> str:
+    report = result.get("report") if isinstance(result.get("report"), Mapping) else {}
+    markdown = report.get("markdown") if isinstance(report, Mapping) else None
+    if isinstance(markdown, str) and markdown:
+        return markdown.rstrip() + "\n"
+    return _result_markdown(result, source_path=source_path)
+
+
+def _join_values(value: Any) -> Optional[str]:
+    values = _coerce_list(value)
+    if not values:
+        return None
+    return ", ".join(str(item) for item in values if item not in (None, ""))
+
+
+def _md_text(value: Any) -> str:
+    return _format_value(value).replace("\n", " ")
+
+
+def _md_code(value: Any) -> str:
+    return str(value).replace("`", "\\`")
+
+
+def _md_cell(value: Any) -> str:
+    text = _md_text(value).replace("|", "\\|")
+    return text if len(text) <= 140 else f"{text[:137]}..."
+
+
+def _format_value(value: Any) -> str:
+    if value is None:
+        return "n/a"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, float):
+        return f"{value:.4f}".rstrip("0").rstrip(".")
+    return str(value)
+
+
 def _compare_results(
     *,
     baseline: Mapping[str, Any],
@@ -1201,12 +1516,16 @@ def _write_outputs(
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(_sarif_json(result, manifest_path), encoding="utf-8")
         written.append(str(path))
+    for path in outputs.get("markdown", []):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(_markdown_text(result, manifest_path), encoding="utf-8")
+        written.append(str(path))
     result["outputs_written"] = written
     return result
 
 
 def _output_paths(manifest: Mapping[str, Any], args: argparse.Namespace, base_dir: Path) -> Dict[str, List[Path]]:
-    outputs = {"json": [], "junit": [], "sarif": []}
+    outputs = {"json": [], "junit": [], "sarif": [], "markdown": []}
     manifest_outputs = dict(manifest.get("outputs") or {})
     raw_json = [
         *_coerce_list(manifest_outputs.get("json")),
@@ -1220,6 +1539,11 @@ def _output_paths(manifest: Mapping[str, Any], args: argparse.Namespace, base_di
         *_coerce_list(manifest_outputs.get("sarif")),
         *_coerce_list(getattr(args, "sarif", [])),
     ]
+    raw_markdown = [
+        *_coerce_list(manifest_outputs.get("markdown")),
+        *_coerce_list(manifest_outputs.get("md")),
+        *_coerce_list(getattr(args, "markdown", [])),
+    ]
     for value in raw_json:
         path = _resolve_output_path(str(value), base_dir)
         if _is_junit_path(path):
@@ -1230,6 +1554,7 @@ def _output_paths(manifest: Mapping[str, Any], args: argparse.Namespace, base_di
             outputs["json"].append(path)
     outputs["junit"].extend(_resolve_output_path(str(value), base_dir) for value in raw_junit)
     outputs["sarif"].extend(_resolve_output_path(str(value), base_dir) for value in raw_sarif)
+    outputs["markdown"].extend(_resolve_output_path(str(value), base_dir) for value in raw_markdown)
     return outputs
 
 
@@ -1528,6 +1853,12 @@ def _build_parser() -> argparse.ArgumentParser:
     baseline.add_argument("-o", "--output", action="append", default=[], help="Write baseline JSON output to this path.")
     baseline.add_argument("--name", default=None, help="Override the baseline artifact name.")
     baseline.add_argument("--quiet", action="store_true", help="Do not print JSON summary when no output path is configured.")
+    report = subparsers.add_parser("report", help="Render a Markdown report from a CLI result JSON.")
+    report.add_argument("result", help="Path to the source JSON/YAML result artifact.")
+    report.add_argument("-o", "--output", action="append", default=[], help="Write JSON report payload to this path.")
+    report.add_argument("--markdown", "--md", action="append", default=[], help="Write Markdown report to this path.")
+    report.add_argument("--name", default=None, help="Override the report artifact name.")
+    report.add_argument("--quiet", action="store_true", help="Do not print Markdown when no output path is configured.")
     optimize = subparsers.add_parser("optimize", help="Optimize a manifest with agent-opt over JSON search paths.")
     optimize.add_argument("manifest", help="Path to a JSON/YAML optimization manifest.")
     optimize.add_argument("-o", "--output", action="append", default=[], help="Write JSON output to this path. .xml paths are treated as JUnit.")

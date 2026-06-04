@@ -768,6 +768,86 @@ def test_cli_runner_baseline_compacts_result_and_compare_accepts_it(tmp_path):
     assert compare["summary"]["new_finding_count"] == 0
 
 
+def test_cli_runner_report_writes_markdown_for_redteam_result(tmp_path):
+    finding = {
+        "type": "red_team_open_high_findings_high",
+        "metric": "red_team_campaign_quality",
+        "severity": "high",
+        "check": "max_open_high_findings",
+        "expected": 0,
+        "actual": 1,
+    }
+    result = _cli_result(score=0.91, findings=[finding], redteam=True)
+    result["redteam"].update(
+        {
+            "error_finding_count": 1,
+            "taxonomies": ["owasp_llm"],
+            "attack_types": ["prompt_injection"],
+            "surfaces": ["chat"],
+        }
+    )
+    source_path = tmp_path / "redteam-result.json"
+    json_path = tmp_path / "redteam-report.json"
+    markdown_path = tmp_path / "redteam-report.md"
+    source_path.write_text(json.dumps(result), encoding="utf-8")
+
+    exit_code = main([
+        "report",
+        str(source_path),
+        "--output",
+        str(json_path),
+        "--markdown",
+        str(markdown_path),
+    ])
+
+    assert exit_code == 0
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+    markdown = markdown_path.read_text(encoding="utf-8")
+    assert payload["kind"] == "agent-simulate.report.v1"
+    assert payload["summary"]["source_name"] == "cli-result"
+    assert payload["summary"]["finding_count"] == 1
+    assert payload["report"]["markdown"] == markdown
+    assert "# cli-result-report" in markdown
+    assert "## Red Team" in markdown
+    assert "## Metrics" in markdown
+    assert "## Findings" in markdown
+    assert "red_team_open_high_findings_high" in markdown
+    assert "prompt_injection" in markdown
+
+
+def test_cli_runner_report_summarizes_failed_compare_result(tmp_path):
+    finding = {
+        "type": "red_team_open_high_findings_high",
+        "metric": "red_team_campaign_quality",
+        "severity": "high",
+        "check": "max_open_high_findings",
+        "expected": 0,
+        "actual": 1,
+    }
+    baseline_path = tmp_path / "baseline.json"
+    current_path = tmp_path / "current.json"
+    compare_path = tmp_path / "compare.json"
+    report_path = tmp_path / "compare-report.md"
+    baseline_path.write_text(json.dumps(_cli_result(score=0.95, redteam=True)), encoding="utf-8")
+    current_path.write_text(
+        json.dumps(_cli_result(score=0.9, findings=[finding], redteam=True)),
+        encoding="utf-8",
+    )
+
+    compare_exit = main(["compare", str(baseline_path), str(current_path), "--output", str(compare_path)])
+    report_exit = main(["report", str(compare_path), "--markdown", str(report_path)])
+
+    assert compare_exit == 1
+    assert report_exit == 0
+    markdown = report_path.read_text(encoding="utf-8")
+    assert "Source status: failed" in markdown
+    assert "## Compare" in markdown
+    assert "Score delta" in markdown
+    assert "New error findings" in markdown
+    assert "## Findings" in markdown
+    assert "score_regression" in markdown
+
+
 def test_cli_runner_optimizes_manifest_search_paths_and_writes_outputs(tmp_path, monkeypatch):
     pytest.importorskip("fi.opt")
     monkeypatch.setenv("SIMULATE_CLI_OPT_TEST_KEY", "real-local-opt-key")

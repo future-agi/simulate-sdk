@@ -329,6 +329,17 @@ agent-simulate optimize examples/cli_optimizer_portfolio_optimization.json \
   --junit artifacts/optimizer-portfolio-optimization.junit.xml
 ```
 
+Markdown reporting turns JSON artifacts from `run`, `redteam`, `optimize`,
+`baseline`, or `compare` into a human-readable report for review threads,
+artifacts, and handoffs. `--output` writes the JSON report payload; `--markdown`
+or `--md` writes the rendered Markdown.
+
+```bash
+agent-simulate report artifacts/redteam-result.json \
+  --output artifacts/redteam-report.json \
+  --markdown artifacts/redteam-result.md
+```
+
 The runner fails before execution when `required_env` keys are missing, returns
 exit code `0` for passing evals, `1` for failing evals, and `2` for manifest/env
 validation errors. Use `--dry-run` to validate a manifest and environment
@@ -346,6 +357,8 @@ Manifests currently support:
 - `agent-simulate baseline` creates compact compare-safe baseline artifacts
 - `agent-simulate compare` gates baseline/current result artifacts by score
   delta, new findings, new error findings, and optional per-metric deltas
+- `agent-simulate report RESULT.json --markdown RESULT.md` renders
+  human-readable Markdown from CLI JSON artifacts
 - `optimization.target.search_space` over JSON paths in the same manifest when
   `agent-opt` is installed
 - JSON, JUnit, and SARIF outputs from CLI flags or manifest `outputs`
