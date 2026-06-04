@@ -51,13 +51,15 @@ class ManifestError(ValueError):
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
-    if args.command in {"run", "redteam", "optimize"}:
+    if args.command in {"run", "redteam", "optimize", "compare"}:
         try:
             result = (
                 asyncio.run(run_manifest_command(args))
                 if args.command == "run"
                 else asyncio.run(redteam_manifest_command(args))
                 if args.command == "redteam"
+                else compare_results_command(args)
+                if args.command == "compare"
                 else optimize_manifest_command(args)
             )
         except ManifestError as exc:
@@ -146,6 +148,27 @@ def optimize_manifest_command(args: argparse.Namespace) -> Dict[str, Any]:
         duration_seconds=round(time.time() - started, 4),
     )
     return _write_outputs(payload, manifest, args, manifest_path)
+
+
+def compare_results_command(args: argparse.Namespace) -> Dict[str, Any]:
+    started = time.time()
+    baseline_path = Path(args.baseline).expanduser().resolve()
+    current_path = Path(args.current).expanduser().resolve()
+    baseline = load_manifest(baseline_path)
+    current = load_manifest(current_path)
+    result = _compare_results(
+        baseline=baseline,
+        current=current,
+        baseline_path=baseline_path,
+        current_path=current_path,
+        min_score_delta=float(args.min_score_delta),
+        max_new_findings=int(args.max_new_findings),
+        max_new_error_findings=int(args.max_new_error_findings),
+        min_metric_delta=args.min_metric_delta,
+        name=getattr(args, "name", None),
+        duration_seconds=round(time.time() - started, 4),
+    )
+    return _write_outputs(result, {}, args, current_path)
 
 
 async def run_manifest_command(args: argparse.Namespace) -> Dict[str, Any]:
@@ -673,6 +696,253 @@ def _unique_strings(values: Iterable[Any]) -> List[str]:
     return result
 
 
+def _compare_results(
+    *,
+    baseline: Mapping[str, Any],
+    current: Mapping[str, Any],
+    baseline_path: Path,
+    current_path: Path,
+    min_score_delta: float,
+    max_new_findings: int,
+    max_new_error_findings: int,
+    min_metric_delta: Optional[float],
+    name: Optional[str],
+    duration_seconds: float,
+) -> Dict[str, Any]:
+    baseline_score = _result_primary_score(baseline)
+    current_score = _result_primary_score(current)
+    score_delta = round(current_score - baseline_score, 4)
+    baseline_findings = _comparable_findings(baseline)
+    current_findings = _comparable_findings(current)
+    baseline_fingerprints = _finding_map(baseline_findings)
+    current_fingerprints = _finding_map(current_findings)
+    new_fingerprints = sorted(set(current_fingerprints) - set(baseline_fingerprints))
+    resolved_fingerprints = sorted(set(baseline_fingerprints) - set(current_fingerprints))
+    new_findings = [current_fingerprints[fingerprint] for fingerprint in new_fingerprints]
+    resolved_findings = [baseline_fingerprints[fingerprint] for fingerprint in resolved_fingerprints]
+    new_error_findings = [finding for finding in new_findings if _sarif_level(finding) == "error"]
+    baseline_metrics = _result_metric_averages(baseline)
+    current_metrics = _result_metric_averages(current)
+    metric_comparisons = _metric_comparisons(baseline_metrics, current_metrics)
+
+    gate_findings: List[Dict[str, Any]] = []
+    if score_delta < min_score_delta:
+        gate_findings.append(
+            {
+                "type": "score_regression",
+                "metric": "compare_score_delta",
+                "check": "min_score_delta",
+                "expected": min_score_delta,
+                "actual": score_delta,
+                "baseline_score": baseline_score,
+                "current_score": current_score,
+            }
+        )
+    if len(new_findings) > max_new_findings:
+        gate_findings.extend(_new_finding_gate_records(new_findings))
+    if len(new_error_findings) > max_new_error_findings:
+        gate_findings.append(
+            {
+                "type": "new_error_findings",
+                "metric": "compare_new_error_findings",
+                "check": "max_new_error_findings",
+                "expected": max_new_error_findings,
+                "actual": len(new_error_findings),
+            }
+        )
+    if min_metric_delta is not None:
+        for item in metric_comparisons:
+            if item["delta"] < min_metric_delta:
+                gate_findings.append(
+                    {
+                        "type": "metric_regression",
+                        "metric": item["name"],
+                        "check": "min_metric_delta",
+                        "expected": min_metric_delta,
+                        "actual": item["delta"],
+                        "baseline": item["baseline"],
+                        "current": item["current"],
+                    }
+                )
+
+    passed = not gate_findings
+    evaluation = {
+        "score": 1.0 if passed else 0.0,
+        "passed": passed,
+        "cases": [
+            {
+                "index": 0,
+                "score": 1.0 if passed else 0.0,
+                "passed": passed,
+                "metrics": [
+                    {
+                        "name": "compare_score_delta",
+                        "score": 1.0 if score_delta >= min_score_delta else 0.0,
+                        "reason": f"Score delta {score_delta} against minimum {min_score_delta}.",
+                        "details": {
+                            "baseline_score": baseline_score,
+                            "current_score": current_score,
+                            "score_delta": score_delta,
+                        },
+                    },
+                    {
+                        "name": "compare_new_findings",
+                        "score": 1.0 if len(new_findings) <= max_new_findings else 0.0,
+                        "reason": f"{len(new_findings)} new finding(s) against maximum {max_new_findings}.",
+                        "details": {"new_findings": new_findings},
+                    },
+                    {
+                        "name": "compare_new_error_findings",
+                        "score": 1.0 if len(new_error_findings) <= max_new_error_findings else 0.0,
+                        "reason": f"{len(new_error_findings)} new error finding(s) against maximum {max_new_error_findings}.",
+                        "details": {"new_error_findings": new_error_findings},
+                    },
+                ],
+                "findings": gate_findings,
+            }
+        ],
+        "summary": {
+            "metric_averages": {
+                "compare_score_delta": score_delta,
+                "compare_new_findings": float(len(new_findings)),
+                "compare_new_error_findings": float(len(new_error_findings)),
+            },
+            "findings": gate_findings,
+        },
+    }
+    return {
+        "schema_version": CLI_SCHEMA_VERSION,
+        "name": name or f"compare-{baseline_path.stem}-to-{current_path.stem}",
+        "status": "passed" if passed else "failed",
+        "exit_code": 0 if passed else 1,
+        "summary": {
+            "case_count": 1,
+            "baseline_score": baseline_score,
+            "current_score": current_score,
+            "score_delta": score_delta,
+            "new_finding_count": len(new_findings),
+            "new_error_finding_count": len(new_error_findings),
+            "resolved_finding_count": len(resolved_findings),
+            "metric_regression_count": sum(1 for finding in gate_findings if finding.get("type") == "metric_regression"),
+            "comparison_passed": passed,
+        },
+        "compare": {
+            "baseline_path": str(baseline_path),
+            "current_path": str(current_path),
+            "gates": {
+                "min_score_delta": min_score_delta,
+                "max_new_findings": max_new_findings,
+                "max_new_error_findings": max_new_error_findings,
+                "min_metric_delta": min_metric_delta,
+            },
+            "metrics": metric_comparisons,
+            "findings": {
+                "baseline_count": len(baseline_findings),
+                "current_count": len(current_findings),
+                "new": new_findings,
+                "resolved": resolved_findings,
+                "new_error": new_error_findings,
+            },
+        },
+        "evaluation": evaluation,
+        "duration_seconds": duration_seconds,
+    }
+
+
+def _result_primary_score(result: Mapping[str, Any]) -> float:
+    summary = dict(result.get("summary") or {})
+    evaluation = dict(result.get("evaluation") or {})
+    optimization = dict(result.get("optimization") or {})
+    for value in (
+        summary.get("evaluation_score"),
+        summary.get("optimization_score"),
+        summary.get("score"),
+        evaluation.get("score"),
+        optimization.get("final_score"),
+    ):
+        parsed = _float_or_none(value)
+        if parsed is not None:
+            return parsed
+    status = str(result.get("status") or "").lower()
+    if status == "passed":
+        return 1.0
+    if status == "failed":
+        return 0.0
+    raise ManifestError("compare inputs must include a score or passed/failed status")
+
+
+def _result_metric_averages(result: Mapping[str, Any]) -> Dict[str, float]:
+    summary_metrics = dict(dict(result.get("summary") or {}).get("metric_averages") or {})
+    evaluation_metrics = dict(dict(dict(result.get("evaluation") or {}).get("summary") or {}).get("metric_averages") or {})
+    merged = {**evaluation_metrics, **summary_metrics}
+    return {
+        str(key): float(value)
+        for key, value in merged.items()
+        if _float_or_none(value) is not None
+    }
+
+
+def _metric_comparisons(
+    baseline_metrics: Mapping[str, float],
+    current_metrics: Mapping[str, float],
+) -> List[Dict[str, Any]]:
+    names = sorted(set(baseline_metrics) | set(current_metrics))
+    comparisons = []
+    for name in names:
+        baseline = float(baseline_metrics.get(name, 0.0))
+        current = float(current_metrics.get(name, 0.0))
+        comparisons.append(
+            {
+                "name": name,
+                "baseline": baseline,
+                "current": current,
+                "delta": round(current - baseline, 4),
+            }
+        )
+    return comparisons
+
+
+def _comparable_findings(result: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    findings = _result_findings(result)
+    if "redteam" in result:
+        findings = [finding for finding in findings if _is_redteam_finding(finding)]
+    return findings
+
+
+def _finding_map(findings: Sequence[Mapping[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    return {_finding_fingerprint(finding): dict(finding) for finding in findings}
+
+
+def _finding_fingerprint(finding: Mapping[str, Any]) -> str:
+    fields = {
+        key: _to_plain(finding.get(key))
+        for key in ("type", "metric", "check", "key", "expected", "actual", "case_index", "reason")
+        if finding.get(key) not in (None, "", [], {})
+    }
+    return json.dumps(fields or _to_plain(dict(finding)), sort_keys=True, default=str)
+
+
+def _new_finding_gate_records(findings: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+    records = []
+    for finding in findings:
+        record = dict(finding)
+        record.setdefault("type", str(finding.get("type") or "new_finding"))
+        record.setdefault("metric", str(finding.get("metric") or "compare_new_findings"))
+        record["check"] = "new_finding"
+        record["fingerprint"] = _finding_fingerprint(finding)
+        records.append(record)
+    return records
+
+
+def _float_or_none(value: Any) -> Optional[float]:
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _optimization_config(manifest: Mapping[str, Any]) -> Dict[str, Any]:
     config = dict(manifest.get("optimization") or {})
     if not config:
@@ -1122,6 +1392,18 @@ def _build_parser() -> argparse.ArgumentParser:
     redteam.add_argument("--name", default=None, help="Override the red-team run name.")
     redteam.add_argument("--dry-run", action="store_true", help="Validate manifest/env without executing.")
     redteam.add_argument("--quiet", action="store_true", help="Do not print JSON summary when no output path is configured.")
+    compare = subparsers.add_parser("compare", help="Compare a current CLI result against a baseline result.")
+    compare.add_argument("baseline", help="Path to the baseline JSON result.")
+    compare.add_argument("current", help="Path to the current JSON result.")
+    compare.add_argument("-o", "--output", action="append", default=[], help="Write JSON output to this path. .xml paths are treated as JUnit; .sarif paths as SARIF.")
+    compare.add_argument("--junit", action="append", default=[], help="Write compact JUnit XML output.")
+    compare.add_argument("--sarif", action="append", default=[], help="Write SARIF 2.1.0 findings output.")
+    compare.add_argument("--min-score-delta", type=float, default=0.0, help="Minimum allowed current_score - baseline_score.")
+    compare.add_argument("--max-new-findings", type=int, default=0, help="Maximum allowed new findings.")
+    compare.add_argument("--max-new-error-findings", type=int, default=0, help="Maximum allowed new error-level findings.")
+    compare.add_argument("--min-metric-delta", type=float, default=None, help="Optional minimum allowed delta for each shared metric.")
+    compare.add_argument("--name", default=None, help="Override the comparison run name.")
+    compare.add_argument("--quiet", action="store_true", help="Do not print JSON summary when no output path is configured.")
     optimize = subparsers.add_parser("optimize", help="Optimize a manifest with agent-opt over JSON search paths.")
     optimize.add_argument("manifest", help="Path to a JSON/YAML optimization manifest.")
     optimize.add_argument("-o", "--output", action="append", default=[], help="Write JSON output to this path. .xml paths are treated as JUnit.")

@@ -294,6 +294,19 @@ agent-simulate redteam examples/cli_redteam_manifest.json \
   --sarif artifacts/redteam.sarif.json
 ```
 
+Compare current results against a checked-in or downloaded baseline to block
+score regressions and new red-team findings in PRs.
+
+```bash
+agent-simulate compare baselines/redteam-main.json artifacts/redteam-result.json \
+  --output artifacts/redteam-compare.json \
+  --junit artifacts/redteam-compare.junit.xml \
+  --sarif artifacts/redteam-compare.sarif.json \
+  --min-score-delta 0 \
+  --max-new-findings 0 \
+  --max-new-error-findings 0
+```
+
 Optimization uses the same manifest shape plus an `optimization` block. The
 optimizer searches JSON paths over the run manifest, executes the resulting
 candidate manifest, scores it with `ai-evaluation`, and returns the best
@@ -321,6 +334,8 @@ Manifests currently support:
   `adversarial_attack_pack`, `red_team_campaign`, `red_team_readiness`,
   `framework_import`, `workspace_run_manifest`, and `observability_replay`
 - local `evaluation.agent_report.config` passed directly to `ai-evaluation`
+- `agent-simulate compare` gates baseline/current result artifacts by score
+  delta, new findings, new error findings, and optional per-metric deltas
 - `optimization.target.search_space` over JSON paths in the same manifest when
   `agent-opt` is installed
 - JSON, JUnit, and SARIF outputs from CLI flags or manifest `outputs`

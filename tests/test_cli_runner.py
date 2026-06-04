@@ -629,6 +629,106 @@ def test_cli_runner_redteam_requires_redteam_block(tmp_path, monkeypatch):
     assert main(["redteam", str(manifest_path), "--quiet"]) == 2
 
 
+def _cli_result(score=0.95, findings=None, metrics=None, *, redteam=False):
+    payload = {
+        "schema_version": "agent-simulate.cli.v1",
+        "name": "cli-result",
+        "status": "passed" if score >= 0.9 else "failed",
+        "exit_code": 0 if score >= 0.9 else 1,
+        "summary": {
+            "case_count": 1,
+            "evaluation_score": score,
+            "evaluation_passed": score >= 0.9,
+            "metric_averages": metrics or {"red_team_campaign_quality": score},
+        },
+        "evaluation": {
+            "score": score,
+            "passed": score >= 0.9,
+            "cases": [
+                {
+                    "index": 0,
+                    "score": score,
+                    "passed": score >= 0.9,
+                    "metrics": [],
+                    "findings": list(findings or []),
+                }
+            ],
+        },
+    }
+    if redteam:
+        payload["redteam"] = {"finding_count": len(findings or [])}
+    return payload
+
+
+def test_cli_runner_compare_passes_when_current_matches_baseline(tmp_path):
+    baseline_path = tmp_path / "baseline.json"
+    current_path = tmp_path / "current.json"
+    output_path = tmp_path / "compare.json"
+    junit_path = tmp_path / "compare.junit.xml"
+    sarif_path = tmp_path / "compare.sarif.json"
+    baseline_path.write_text(json.dumps(_cli_result(score=0.95)), encoding="utf-8")
+    current_path.write_text(json.dumps(_cli_result(score=0.96)), encoding="utf-8")
+
+    exit_code = main([
+        "compare",
+        str(baseline_path),
+        str(current_path),
+        "--output",
+        str(output_path),
+        "--junit",
+        str(junit_path),
+        "--sarif",
+        str(sarif_path),
+    ])
+
+    assert exit_code == 0
+    payload = json.loads(output_path.read_text(encoding="utf-8"))
+    assert payload["status"] == "passed"
+    assert payload["summary"]["score_delta"] == 0.01
+    assert payload["summary"]["new_finding_count"] == 0
+    assert "failures=\"0\"" in junit_path.read_text(encoding="utf-8")
+    assert json.loads(sarif_path.read_text(encoding="utf-8"))["runs"][0]["results"] == []
+
+
+def test_cli_runner_compare_fails_on_score_drop_and_new_redteam_finding(tmp_path):
+    finding = {
+        "type": "red_team_open_high_findings_high",
+        "metric": "red_team_campaign_quality",
+        "severity": "high",
+        "check": "max_open_high_findings",
+        "expected": 0,
+        "actual": 1,
+    }
+    baseline_path = tmp_path / "baseline.json"
+    current_path = tmp_path / "current.json"
+    output_path = tmp_path / "compare.json"
+    sarif_path = tmp_path / "compare.sarif.json"
+    baseline_path.write_text(json.dumps(_cli_result(score=0.95, redteam=True)), encoding="utf-8")
+    current_path.write_text(
+        json.dumps(_cli_result(score=0.9, findings=[finding], redteam=True)),
+        encoding="utf-8",
+    )
+
+    exit_code = main([
+        "compare",
+        str(baseline_path),
+        str(current_path),
+        "--output",
+        str(output_path),
+        "--sarif",
+        str(sarif_path),
+    ])
+
+    assert exit_code == 1
+    payload = json.loads(output_path.read_text(encoding="utf-8"))
+    assert payload["status"] == "failed"
+    assert payload["summary"]["score_delta"] == -0.05
+    assert payload["summary"]["new_finding_count"] == 1
+    assert payload["summary"]["new_error_finding_count"] == 1
+    rule_ids = {result["ruleId"] for result in json.loads(sarif_path.read_text(encoding="utf-8"))["runs"][0]["results"]}
+    assert {"score_regression", "red_team_open_high_findings_high", "new_error_findings"} <= rule_ids
+
+
 def test_cli_runner_optimizes_manifest_search_paths_and_writes_outputs(tmp_path, monkeypatch):
     pytest.importorskip("fi.opt")
     monkeypatch.setenv("SIMULATE_CLI_OPT_TEST_KEY", "real-local-opt-key")
