@@ -1155,6 +1155,7 @@ def _apply_redteam_eval_defaults(
                     {
                         "require_attack_surface_matrix": True,
                         "require_run_artifacts": True,
+                        "require_finding_mapping": True,
                         "require_mitigation_mapping": True,
                     }
                 )

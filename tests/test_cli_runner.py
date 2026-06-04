@@ -794,6 +794,8 @@ def test_cli_runner_redteam_auto_generates_attack_matrix(tmp_path, monkeypatch):
     assert attack_pack["summary"]["canary_count"] == 1
     assert campaign["summary"]["scenario_count"] == 12
     assert campaign["summary"]["run_count"] == 4
+    assert campaign["summary"]["unmapped_finding_count"] == 0
+    assert campaign["summary"]["unmapped_findings"] == []
     assert campaign["summary"]["missing_required_attack_types"] == []
     assert campaign["summary"]["missing_required_providers"] == []
     assert "failures=\"0\"" in junit_path.read_text(encoding="utf-8")
@@ -857,6 +859,14 @@ def test_cli_runner_redteam_fails_on_evidence_bound_matrix_gaps(tmp_path, monkey
                         "provider": "local_cli",
                     },
                 ],
+                findings=[
+                    {
+                        "id": "unmapped_prompt_leak",
+                        "severity": "low",
+                        "status": "accepted",
+                        "attack_type": "prompt_injection",
+                    }
+                ],
                 artifacts=[{"id": "generic-report", "type": "json", "path": "artifacts/redteam.json"}],
                 mitigations=[{"id": "generic-mitigation", "status": "implemented", "controls": ["instruction_hierarchy"]}],
                 observability={"logs": ["logs/redteam.jsonl"]},
@@ -891,6 +901,7 @@ def test_cli_runner_redteam_fails_on_evidence_bound_matrix_gaps(tmp_path, monkey
             "require_observability": True,
             "require_attack_surface_matrix": True,
             "require_run_artifacts": True,
+            "require_finding_mapping": True,
             "require_mitigation_mapping": True,
             "min_attack_pack_count": 1,
             "min_attack_count": 1,
@@ -930,12 +941,14 @@ def test_cli_runner_redteam_fails_on_evidence_bound_matrix_gaps(tmp_path, monkey
     assert campaign["summary"]["covered_cell_count"] == 0
     assert campaign["summary"]["missing_coverage_cells"][0]["id"] == "prompt_injection|tool|chat|local_cli"
     assert campaign["summary"]["missing_run_artifact_cells"][0]["id"] == "prompt_injection|tool|chat|local_cli"
+    assert campaign["summary"]["unmapped_findings"][0]["id"] == "unmapped_prompt_leak"
     assert campaign["summary"]["missing_mitigation_cells"][0]["id"] == "prompt_injection|tool|chat|local_cli"
     assert "failures=\"1\"" in junit_path.read_text(encoding="utf-8")
     sarif = json.loads(sarif_path.read_text(encoding="utf-8"))
     rule_ids = {result["ruleId"] for result in sarif["runs"][0]["results"]}
     assert "red_team_attack_surface_cell_missing" in rule_ids
     optional_rule_ids = {
+        "red_team_finding_mapping_missing",
         "red_team_run_artifact_missing",
         "red_team_mitigation_mapping_missing",
     }

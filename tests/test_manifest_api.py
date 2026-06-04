@@ -250,6 +250,8 @@ def test_public_redteam_manifest_prepares_generated_matrix(tmp_path, monkeypatch
     assert state["adversarial"]["attack_pack"]["summary"]["attack_count"] == 6
     assert state["red_team_campaign"]["summary"]["scenario_count"] == 12
     assert state["red_team_campaign"]["summary"]["open_high_finding_count"] == 0
+    assert state["red_team_campaign"]["summary"]["unmapped_finding_count"] == 0
+    assert state["red_team_campaign"]["summary"]["unmapped_findings"] == []
 
 
 def _write_manifest(path: Path, manifest: dict):
