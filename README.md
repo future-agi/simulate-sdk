@@ -2,8 +2,10 @@
 
 > **SDK migration:** new public SDK development now happens in
 > [`agent-learning-kit`](../agent-learning-kit). Use `agent-learn` and
-> `agent_learning.*` for new docs, examples, and integrations. This repository
-> is the backing simulation runtime during the migration.
+> `agent_learning.*` for new docs, examples, and integrations. The simulation
+> runtime code has been moved into `agent-learning-kit/src/fi/simulate`; this
+> repository is retained only as legacy source/history and should not be
+> published as `agent-simulate`.
 
 <div align="center">
 

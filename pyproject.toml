@@ -1,7 +1,7 @@
 [tool.poetry]
-name = "agent-simulate"
+name = "agent-learning-kit-legacy-simulate-source"
 version = "0.1.3"
-description = "Simulate, record, and score conversations with voice and text AI agents — the Simulate SDK for Future AGI."
+description = "Legacy simulation source moved into agent-learning-kit; do not publish as agent-simulate."
 authors = ["Future AGI <no-reply@futureagi.com>"]
 license = "Apache-2.0"
 readme = "README.md"
@@ -63,9 +63,6 @@ livekit = ["livekit-agents"]
 evaluation = ["ai-evaluation"]
 all = ["livekit-agents", "ai-evaluation"]
 
-[tool.poetry.scripts]
-agent-simulate = "fi.simulate.cli:main"
-
 [tool.poetry.group.dev.dependencies]
 pytest = ">=8.0.0"
 black = ">=24.0.0"
@@ -74,4 +71,3 @@ ruff = ">=0.4.0"
 [build-system]
 requires = ["poetry-core"]
 build-backend = "poetry.core.masonry.api"
-
