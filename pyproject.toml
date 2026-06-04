@@ -63,6 +63,9 @@ livekit = ["livekit-agents"]
 evaluation = ["ai-evaluation"]
 all = ["livekit-agents", "ai-evaluation"]
 
+[tool.poetry.scripts]
+agent-simulate = "fi.simulate.cli:main"
+
 [tool.poetry.group.dev.dependencies]
 pytest = ">=8.0.0"
 black = ">=24.0.0"
@@ -71,5 +74,4 @@ ruff = ">=0.4.0"
 [build-system]
 requires = ["poetry-core"]
 build-backend = "poetry.core.masonry.api"
-
 

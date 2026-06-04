@@ -266,6 +266,36 @@ print(report.results[0].events)
 
 See [`examples/local_multimodal_simulation.py`](examples/local_multimodal_simulation.py) for a full offline browser/CUA-style cookbook.
 
+## CLI runner for CI
+
+`agent-simulate` also includes a manifest-driven CLI for promptfoo-style local
+and CI runs. The first CLI slice runs local text simulations, replay
+environments, and local `ai-evaluation` agent-report gates, then writes stable
+JSON and JUnit outputs for automation.
+
+```bash
+export SIMULATE_CLI_EXAMPLE_KEY="your-real-ci-secret-or-local-test-key"
+
+agent-simulate run examples/cli_optimizer_portfolio_manifest.json \
+  --output artifacts/optimizer-portfolio-result.json \
+  --junit artifacts/optimizer-portfolio.junit.xml
+```
+
+The runner fails before execution when `required_env` keys are missing, returns
+exit code `0` for passing evals, `1` for failing evals, and `2` for manifest/env
+validation errors. Use `--dry-run` to validate a manifest and environment
+without running the simulation.
+
+Manifests currently support:
+
+- `simulation.engine: local_text`
+- scripted, echo, or `module:function` Python-callable agents
+- replay environments such as `optimizer_backend_portfolio`,
+  `optimizer_society_trace`, `agent_memory_lineage`, `red_team_readiness`,
+  `framework_import`, `workspace_run_manifest`, and `observability_replay`
+- local `evaluation.agent_report.config` passed directly to `ai-evaluation`
+- JSON and JUnit outputs from CLI flags or manifest `outputs`
+
 ### Local environments
 
 Use environment adapters when the agent needs a world to act on: mocked APIs,
