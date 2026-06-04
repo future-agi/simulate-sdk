@@ -4147,6 +4147,152 @@ class RedTeamCampaignEnvironment(EnvironmentAdapter):
         return copy.deepcopy(self.campaign)
 
 
+class RedTeamReadinessEnvironment(EnvironmentAdapter):
+    """
+    Replay preflight evidence that must be ready before trusting red-team runs.
+
+    This combines framework import, campaign, workspace execution, trust
+    boundary, control-plane, observability, and artifact evidence into one gate.
+    """
+
+    name = "red_team_readiness"
+
+    def __init__(
+        self,
+        manifest: Any = None,
+        *,
+        name: str = "red-team-readiness",
+        target: Optional[Mapping[str, Any]] = None,
+        framework_import: Optional[Mapping[str, Any]] = None,
+        red_team_campaign: Optional[Mapping[str, Any]] = None,
+        workspace_run: Optional[Mapping[str, Any]] = None,
+        trust_boundary: Optional[Mapping[str, Any]] = None,
+        control_plane: Optional[Mapping[str, Any]] = None,
+        observability: Optional[Mapping[str, Any]] = None,
+        artifacts: Optional[Iterable[Any]] = None,
+        required_evidence: Optional[Iterable[str]] = None,
+        required_signals: Optional[Iterable[str]] = None,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        self.initial_manifest = normalize_red_team_readiness_manifest(
+            manifest,
+            name=name,
+            target=target,
+            framework_import=framework_import,
+            red_team_campaign=red_team_campaign,
+            workspace_run=workspace_run,
+            trust_boundary=trust_boundary,
+            control_plane=control_plane,
+            observability=observability,
+            artifacts=artifacts,
+            required_evidence=required_evidence,
+            required_signals=required_signals,
+            metadata=metadata,
+        )
+        self.manifest: Dict[str, Any] = {}
+
+    def reset(self, **context: Any) -> EnvironmentSnapshot:
+        self.manifest = copy.deepcopy(self.initial_manifest)
+        return EnvironmentSnapshot(
+            tools=self._tool_specs(),
+            artifacts=[self._trace_artifact()],
+            events=[
+                SimulationEvent(
+                    type="red_team_readiness",
+                    name="red_team_readiness_ready",
+                    payload={
+                        "name": self.manifest.get("name"),
+                        "summary": copy.deepcopy(self.manifest.get("summary", {})),
+                        "signals": copy.deepcopy(self.manifest.get("signals", [])),
+                    },
+                )
+            ],
+            state={"red_team_readiness": self._trace_payload()},
+            metadata={"red_team_readiness": copy.deepcopy(self.manifest.get("summary", {}))},
+        )
+
+    def handle_tool_call(
+        self,
+        tool_call: Mapping[str, Any],
+        **context: Any,
+    ) -> Optional[ToolExecutionResult]:
+        name = _tool_name(tool_call)
+        if name not in {
+            "red_team_readiness_status",
+            "list_red_team_readiness_evidence",
+            "list_red_team_readiness_gaps",
+        }:
+            return None
+        call_id = _tool_call_id(tool_call)
+
+        if name == "red_team_readiness_status":
+            result = self._trace_payload()
+            event_name = "red_team_readiness_status"
+            content = f"Red-team readiness {self.manifest.get('name')} status recorded."
+        elif name == "list_red_team_readiness_evidence":
+            summary = copy.deepcopy(self.manifest.get("summary", {}))
+            result = {
+                "ready_components": summary.get("ready_components", []),
+                "missing_required_evidence": summary.get("missing_required_evidence", []),
+                "observed_signals": summary.get("observed_signals", []),
+                "artifact_count": summary.get("artifact_count", 0),
+                "observability_hook_count": summary.get("observability_hook_count", 0),
+            }
+            event_name = "red_team_readiness_evidence_listed"
+            content = "Listed red-team readiness evidence."
+        else:
+            summary = copy.deepcopy(self.manifest.get("summary", {}))
+            result = {
+                "blocking_gaps": summary.get("blocking_gaps", []),
+                "missing_required_evidence": summary.get("missing_required_evidence", []),
+                "missing_required_signals": summary.get("missing_required_signals", []),
+                "failed_components": summary.get("failed_components", []),
+            }
+            event_name = "red_team_readiness_gaps_listed"
+            content = "Listed red-team readiness gaps."
+
+        return ToolExecutionResult(
+            tool_call_id=call_id,
+            tool_name=name,
+            content=content,
+            result=result,
+            success=True,
+            state_updates={"red_team_readiness": self._trace_payload()},
+            artifacts=[self._trace_artifact()],
+            events=[SimulationEvent(type="red_team_readiness", name=event_name, payload=result)],
+        )
+
+    def _tool_specs(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                "name": "red_team_readiness_status",
+                "description": "Return the full red-team readiness preflight manifest.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            {
+                "name": "list_red_team_readiness_evidence",
+                "description": "List ready components, observed signals, artifacts, and observability hooks.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            {
+                "name": "list_red_team_readiness_gaps",
+                "description": "List missing and blocking red-team readiness gaps.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        ]
+
+    def _trace_artifact(self) -> SimulationArtifact:
+        return SimulationArtifact(
+            type="trace",
+            role="environment",
+            data=self._trace_payload(),
+            metadata={"kind": "red_team_readiness"},
+        )
+
+    def _trace_payload(self) -> Dict[str, Any]:
+        return copy.deepcopy(self.manifest)
+
+
 def normalize_world_attack_replay(
     *,
     world_contract: Optional[Mapping[str, Any]] = None,
@@ -12197,6 +12343,142 @@ def load_framework_import_manifest(
     )
 
 
+def normalize_red_team_readiness_manifest(
+    payload: Any = None,
+    *,
+    name: str = "red-team-readiness",
+    target: Optional[Mapping[str, Any]] = None,
+    framework_import: Optional[Mapping[str, Any]] = None,
+    red_team_campaign: Optional[Mapping[str, Any]] = None,
+    workspace_run: Optional[Mapping[str, Any]] = None,
+    trust_boundary: Optional[Mapping[str, Any]] = None,
+    control_plane: Optional[Mapping[str, Any]] = None,
+    observability: Optional[Mapping[str, Any]] = None,
+    artifacts: Optional[Iterable[Any]] = None,
+    required_evidence: Optional[Iterable[str]] = None,
+    required_signals: Optional[Iterable[str]] = None,
+    metadata: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Normalize red-team preflight evidence into one readiness gate."""
+
+    payload_dict = dict(payload) if isinstance(payload, Mapping) else {}
+    manifest_name = str(payload_dict.get("name") or name)
+    target_record = _red_team_readiness_mapping(target if target is not None else payload_dict.get("target"))
+    framework_import_record = _red_team_readiness_mapping(
+        framework_import
+        if framework_import is not None
+        else payload_dict.get("framework_import", payload_dict.get("framework_import_manifest"))
+    )
+    campaign_record = _red_team_readiness_mapping(
+        red_team_campaign
+        if red_team_campaign is not None
+        else payload_dict.get("red_team_campaign", payload_dict.get("campaign"))
+    )
+    workspace_record = _red_team_readiness_mapping(
+        workspace_run if workspace_run is not None else payload_dict.get("workspace_run")
+    )
+    trust_record = _red_team_readiness_mapping(
+        trust_boundary
+        if trust_boundary is not None
+        else payload_dict.get("trust_boundary", payload_dict.get("agent_trust_boundary"))
+    )
+    control_record = _red_team_readiness_mapping(
+        control_plane
+        if control_plane is not None
+        else payload_dict.get("control_plane", payload_dict.get("agent_control_plane"))
+    )
+    observability_record = _red_team_readiness_mapping(
+        observability if observability is not None else payload_dict.get("observability")
+    )
+    artifact_records = _normalize_red_team_readiness_artifacts(
+        artifacts if artifacts is not None else payload_dict.get("artifacts")
+    )
+    required_evidence_keys = _red_team_readiness_key_list(
+        required_evidence if required_evidence is not None else payload_dict.get("required_evidence")
+    )
+    required_signal_keys = _red_team_readiness_key_list(
+        required_signals if required_signals is not None else payload_dict.get("required_signals")
+    )
+    summary = _red_team_readiness_summary(
+        target=target_record,
+        framework_import=framework_import_record,
+        red_team_campaign=campaign_record,
+        workspace_run=workspace_record,
+        trust_boundary=trust_record,
+        control_plane=control_record,
+        observability=observability_record,
+        artifacts=artifact_records,
+        required_evidence=required_evidence_keys,
+        required_signals=required_signal_keys,
+    )
+    signals = _red_team_readiness_signals(
+        target=target_record,
+        framework_import=framework_import_record,
+        red_team_campaign=campaign_record,
+        workspace_run=workspace_record,
+        trust_boundary=trust_record,
+        control_plane=control_record,
+        observability=observability_record,
+        artifacts=artifact_records,
+        summary=summary,
+    )
+    merged_metadata = {
+        **dict(payload_dict.get("metadata") or {}),
+        **dict(metadata or {}),
+    }
+    return {
+        "kind": "red_team_readiness",
+        "name": manifest_name,
+        "target": target_record,
+        "framework_import": framework_import_record,
+        "red_team_campaign": campaign_record,
+        "workspace_run": workspace_record,
+        "trust_boundary": trust_record,
+        "control_plane": control_record,
+        "observability": observability_record,
+        "artifacts": artifact_records,
+        "required_evidence": required_evidence_keys,
+        "required_signals": required_signal_keys,
+        "summary": summary,
+        "signals": signals,
+        "metadata": copy.deepcopy(merged_metadata),
+    }
+
+
+def load_red_team_readiness_manifest(
+    source: str | os.PathLike[str] | Mapping[str, Any],
+    *,
+    headers: Optional[Mapping[str, str]] = None,
+    auth: Optional[Mapping[str, Any]] = None,
+    pagination: Optional[Mapping[str, Any]] = None,
+    max_pages: int = 20,
+    timeout: float = 30.0,
+    metadata: Optional[Mapping[str, Any]] = None,
+    **kwargs: Any,
+) -> RedTeamReadinessEnvironment:
+    """Load a local/HTTP red-team readiness manifest and return an environment."""
+
+    source_metadata: Dict[str, Any] = {}
+    if isinstance(source, (str, os.PathLike)) or _is_export_source_spec(source):
+        loaded, source_metadata = _load_framework_trace_export_source_with_metadata(
+            source,
+            headers=headers,
+            auth=auth,
+            pagination=pagination,
+            max_pages=max_pages,
+            timeout=timeout,
+        )
+    else:
+        loaded = source
+    if not isinstance(loaded, Mapping):
+        raise TypeError("Red-team readiness export must be a mapping")
+    return RedTeamReadinessEnvironment(
+        loaded,
+        metadata={**source_metadata, **dict(metadata or {})},
+        **kwargs,
+    )
+
+
 def normalize_workspace_run_manifest(
     payload: Any = None,
     *,
@@ -13651,6 +13933,411 @@ def _normalize_framework_import_key(value: Any) -> str:
 
 
 def _framework_import_int(value: Any) -> Optional[int]:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(value.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def _red_team_readiness_mapping(value: Any) -> Dict[str, Any]:
+    if value in (None, "", [], {}):
+        return {}
+    if isinstance(value, Mapping):
+        return copy.deepcopy(dict(value))
+    return {"name": str(value)}
+
+
+def _normalize_red_team_readiness_artifacts(value: Any) -> List[Dict[str, Any]]:
+    records: List[Dict[str, Any]] = []
+    for index, raw in enumerate(_as_iterable(value), start=1):
+        if raw in (None, "", [], {}):
+            continue
+        item = copy.deepcopy(dict(raw)) if isinstance(raw, Mapping) else {"path": str(raw)}
+        artifact_type = _red_team_readiness_key(item.get("type") or item.get("kind") or "artifact")
+        item.update(
+            {
+                "id": str(item.get("id") or item.get("name") or f"artifact_{index}"),
+                "type": artifact_type,
+                "signals": sorted(
+                    {
+                        "artifact",
+                        artifact_type,
+                        *_red_team_readiness_key_list(item.get("signals")),
+                    }
+                ),
+            }
+        )
+        records.append(item)
+    return records
+
+
+def _red_team_readiness_summary(
+    *,
+    target: Mapping[str, Any],
+    framework_import: Mapping[str, Any],
+    red_team_campaign: Mapping[str, Any],
+    workspace_run: Mapping[str, Any],
+    trust_boundary: Mapping[str, Any],
+    control_plane: Mapping[str, Any],
+    observability: Mapping[str, Any],
+    artifacts: Sequence[Mapping[str, Any]],
+    required_evidence: Sequence[str],
+    required_signals: Sequence[str],
+) -> Dict[str, Any]:
+    component_ready = {
+        "framework_import": _red_team_readiness_framework_import_ready(framework_import),
+        "red_team_campaign": _red_team_readiness_campaign_ready(red_team_campaign),
+        "workspace_run": _red_team_readiness_workspace_ready(workspace_run),
+        "trust_boundary": _red_team_readiness_trust_boundary_ready(trust_boundary),
+        "control_plane": _red_team_readiness_control_plane_ready(control_plane),
+    }
+    component_present = {
+        "target": bool(target),
+        "framework_import": bool(framework_import),
+        "red_team_campaign": bool(red_team_campaign),
+        "workspace_run": bool(workspace_run),
+        "trust_boundary": bool(trust_boundary),
+        "control_plane": bool(control_plane),
+        "observability": bool(observability),
+        "artifacts": bool(artifacts),
+    }
+    observed_signals = _red_team_readiness_observed_signals(
+        target=target,
+        framework_import=framework_import,
+        red_team_campaign=red_team_campaign,
+        workspace_run=workspace_run,
+        trust_boundary=trust_boundary,
+        control_plane=control_plane,
+        observability=observability,
+        artifacts=artifacts,
+    )
+    observed_evidence = {
+        key
+        for key, present in component_present.items()
+        if present
+    }
+    observed_evidence.update(
+        f"{key}_ready"
+        for key, ready in component_ready.items()
+        if ready
+    )
+    observed_evidence.update(observed_signals)
+    artifact_count = len(artifacts) + sum(
+        _red_team_readiness_int(_red_team_readiness_summary_of(child).get("artifact_count")) or 0
+        for child in (framework_import, red_team_campaign, workspace_run)
+    )
+    observability_hook_count = _red_team_readiness_observability_hook_count(observability) + sum(
+        _red_team_readiness_int(_red_team_readiness_summary_of(child).get("observability_hook_count")) or 0
+        for child in (framework_import, red_team_campaign, workspace_run)
+    )
+    blocking_gaps: List[str] = []
+    if not target:
+        blocking_gaps.append("target_missing")
+    for component, present in component_present.items():
+        if component in {"target", "observability", "artifacts"}:
+            continue
+        if not present:
+            blocking_gaps.append(f"{component}_missing")
+    for component, ready in component_ready.items():
+        if component_present.get(component) and not ready:
+            blocking_gaps.append(f"{component}_not_ready")
+    if not observability_hook_count:
+        blocking_gaps.append("observability_missing")
+    if not artifact_count:
+        blocking_gaps.append("artifacts_missing")
+    missing_required_evidence = sorted(set(required_evidence) - observed_evidence)
+    missing_required_signals = sorted(set(required_signals) - observed_signals)
+    blocking_gaps.extend(f"missing_evidence:{item}" for item in missing_required_evidence)
+    blocking_gaps.extend(f"missing_signal:{item}" for item in missing_required_signals)
+    ready_components = sorted(component for component, ready in component_ready.items() if ready)
+    failed_components = sorted(component for component, ready in component_ready.items() if component_present.get(component) and not ready)
+    return {
+        "has_target": bool(target),
+        "has_framework_import": bool(framework_import),
+        "has_red_team_campaign": bool(red_team_campaign),
+        "has_workspace_run": bool(workspace_run),
+        "has_trust_boundary": bool(trust_boundary),
+        "has_control_plane": bool(control_plane),
+        "has_observability": observability_hook_count > 0,
+        "has_artifacts": artifact_count > 0,
+        "framework_import_ready": component_ready["framework_import"],
+        "red_team_campaign_ready": component_ready["red_team_campaign"],
+        "workspace_run_ready": component_ready["workspace_run"],
+        "trust_boundary_ready": component_ready["trust_boundary"],
+        "control_plane_ready": component_ready["control_plane"],
+        "ready_component_count": len(ready_components),
+        "ready_components": ready_components,
+        "failed_components": failed_components,
+        "artifact_count": artifact_count,
+        "observability_hook_count": observability_hook_count,
+        "blocking_gap_count": len(blocking_gaps),
+        "blocking_gaps": sorted(set(blocking_gaps)),
+        "observed_evidence": sorted(observed_evidence),
+        "observed_signals": sorted(observed_signals),
+        "missing_required_evidence": missing_required_evidence,
+        "missing_required_signals": missing_required_signals,
+    }
+
+
+def _red_team_readiness_signals(
+    *,
+    target: Mapping[str, Any],
+    framework_import: Mapping[str, Any],
+    red_team_campaign: Mapping[str, Any],
+    workspace_run: Mapping[str, Any],
+    trust_boundary: Mapping[str, Any],
+    control_plane: Mapping[str, Any],
+    observability: Mapping[str, Any],
+    artifacts: Sequence[Mapping[str, Any]],
+    summary: Mapping[str, Any],
+) -> List[str]:
+    signals = _red_team_readiness_observed_signals(
+        target=target,
+        framework_import=framework_import,
+        red_team_campaign=red_team_campaign,
+        workspace_run=workspace_run,
+        trust_boundary=trust_boundary,
+        control_plane=control_plane,
+        observability=observability,
+        artifacts=artifacts,
+    )
+    signals.update(
+        _red_team_readiness_key(item)
+        for item in _as_iterable(summary.get("ready_components"))
+        if _red_team_readiness_key(item)
+    )
+    signals.update(
+        _red_team_readiness_key(item)
+        for item in _as_iterable(summary.get("observed_evidence"))
+        if _red_team_readiness_key(item)
+    )
+    return sorted(signal for signal in signals if signal)
+
+
+def _red_team_readiness_observed_signals(
+    *,
+    target: Mapping[str, Any],
+    framework_import: Mapping[str, Any],
+    red_team_campaign: Mapping[str, Any],
+    workspace_run: Mapping[str, Any],
+    trust_boundary: Mapping[str, Any],
+    control_plane: Mapping[str, Any],
+    observability: Mapping[str, Any],
+    artifacts: Sequence[Mapping[str, Any]],
+) -> set[str]:
+    signals = {"red_team_readiness", "readiness", "preflight", "gate"}
+    if target:
+        signals.add("target")
+    for name, payload in [
+        ("framework_import", framework_import),
+        ("red_team_campaign", red_team_campaign),
+        ("workspace_run", workspace_run),
+        ("trust_boundary", trust_boundary),
+        ("control_plane", control_plane),
+    ]:
+        if payload:
+            signals.add(name)
+            signals.update(_red_team_readiness_child_signals(payload))
+    if observability:
+        signals.add("observability")
+    if artifacts:
+        signals.add("artifact")
+    for artifact in artifacts:
+        signals.update(_red_team_readiness_key(item) for item in _as_iterable(artifact.get("signals")) if _red_team_readiness_key(item))
+        signals.add(_red_team_readiness_key(artifact.get("type")))
+    return {signal for signal in (_red_team_readiness_key(item) for item in signals) if signal}
+
+
+def _red_team_readiness_child_signals(payload: Mapping[str, Any]) -> set[str]:
+    summary = _red_team_readiness_summary_of(payload)
+    signals = {
+        _red_team_readiness_key(signal)
+        for signal in _as_iterable(payload.get("signals"))
+        if _red_team_readiness_key(signal)
+    }
+    for key in (
+        "observed_frameworks",
+        "observed_export_types",
+        "observed_signals",
+        "observed_taxonomies",
+        "observed_attack_types",
+        "observed_surfaces",
+        "observed_channels",
+        "observed_providers",
+        "frameworks",
+        "red_team_taxonomies",
+        "controls",
+        "present_controls",
+        "present_categories",
+    ):
+        signals.update(_red_team_readiness_key(item) for item in _as_iterable(summary.get(key)) if _red_team_readiness_key(item))
+    kind = _red_team_readiness_key(payload.get("kind"))
+    if kind:
+        signals.add(kind)
+    return {signal for signal in signals if signal}
+
+
+def _red_team_readiness_framework_import_ready(payload: Mapping[str, Any]) -> bool:
+    summary = _red_team_readiness_summary_of(payload)
+    if not summary:
+        return False
+    return all(
+        bool(summary.get(key))
+        for key in (
+            "has_target",
+            "has_adapter",
+            "has_trace_export",
+            "has_event_stream",
+            "has_lifecycle",
+            "has_capability_matrix",
+            "has_probe_suite",
+            "has_portability_matrix",
+            "has_observability",
+            "has_artifacts",
+        )
+    ) and not any(
+        summary.get(key)
+        for key in (
+            "missing_required_sources",
+            "missing_required_frameworks",
+            "missing_required_export_types",
+            "missing_required_signals",
+            "failed_sources",
+        )
+    ) and (_red_team_readiness_int(summary.get("failed_source_count")) or 0) == 0
+
+
+def _red_team_readiness_campaign_ready(payload: Mapping[str, Any]) -> bool:
+    summary = _red_team_readiness_summary_of(payload)
+    if not summary:
+        return False
+    return (
+        bool(summary.get("has_target"))
+        and (_red_team_readiness_int(summary.get("attack_count")) or 0) > 0
+        and (_red_team_readiness_int(summary.get("scenario_count")) or 0) > 0
+        and (_red_team_readiness_int(summary.get("run_count")) or 0) > 0
+        and (_red_team_readiness_int(summary.get("passed_run_count")) or 0) >= (_red_team_readiness_int(summary.get("run_count")) or 0)
+        and (_red_team_readiness_int(summary.get("multi_turn_scenario_count")) or 0) > 0
+        and (_red_team_readiness_int(summary.get("artifact_count")) or 0) > 0
+        and (_red_team_readiness_int(summary.get("mitigation_count")) or 0) > 0
+        and (_red_team_readiness_int(summary.get("observability_hook_count")) or 0) > 0
+        and (_red_team_readiness_int(summary.get("failed_run_count")) or 0) == 0
+        and (_red_team_readiness_int(summary.get("open_high_finding_count")) or 0) == 0
+        and not any(
+            summary.get(key)
+            for key in (
+                "missing_required_taxonomies",
+                "missing_required_attack_types",
+                "missing_required_surfaces",
+                "missing_required_channels",
+                "missing_required_providers",
+            )
+        )
+    )
+
+
+def _red_team_readiness_workspace_ready(payload: Mapping[str, Any]) -> bool:
+    summary = _red_team_readiness_summary_of(payload)
+    if not summary:
+        return False
+    return (
+        bool(summary.get("has_repository"))
+        and bool(summary.get("has_checkout"))
+        and bool(summary.get("has_commit_sha"))
+        and (_red_team_readiness_int(summary.get("command_count")) or 0) > 0
+        and (_red_team_readiness_int(summary.get("failed_command_count")) or 0) == 0
+        and (_red_team_readiness_int(summary.get("log_count")) or 0) > 0
+        and (_red_team_readiness_int(summary.get("artifact_count")) or 0) > 0
+        and (_red_team_readiness_int(summary.get("eval_count")) or 0) > 0
+        and (_red_team_readiness_int(summary.get("red_team_count")) or 0) > 0
+        and (_red_team_readiness_int(summary.get("open_red_team_finding_count")) or 0) == 0
+        and (_red_team_readiness_int(summary.get("secret_leak_count")) or 0) == 0
+        and bool(summary.get("has_sandbox"))
+        and bool(summary.get("has_secret_redaction"))
+        and bool(summary.get("has_policy_gate"))
+        and (_red_team_readiness_int(summary.get("observability_hook_count")) or 0) > 0
+        and (_red_team_readiness_int(summary.get("ui_verification_count")) or 0) > 0
+        and not summary.get("missing_required_evidence")
+    )
+
+
+def _red_team_readiness_trust_boundary_ready(payload: Mapping[str, Any]) -> bool:
+    summary = _red_team_readiness_summary_of(payload)
+    if not summary:
+        return False
+    return (
+        (_red_team_readiness_int(summary.get("control_count")) or 0) > 0
+        and (_red_team_readiness_int(summary.get("threat_count")) or 0) > 0
+        and float(summary.get("required_control_rate", 0.0) or 0.0) >= 1.0
+        and (_red_team_readiness_int(summary.get("high_risk_unmitigated_count")) or 0) == 0
+        and bool(summary.get("has_identity"))
+        and bool(summary.get("has_permissions"))
+        and bool(summary.get("has_sandbox"))
+        and bool(summary.get("has_audit"))
+        and bool(summary.get("has_canaries"))
+        and bool(summary.get("has_memory_isolation"))
+        and bool(summary.get("has_network_egress_controls"))
+        and bool(summary.get("has_tool_allowlist"))
+        and bool(summary.get("has_data_boundary"))
+        and bool(summary.get("has_secret_handling"))
+    )
+
+
+def _red_team_readiness_control_plane_ready(payload: Mapping[str, Any]) -> bool:
+    summary = _red_team_readiness_summary_of(payload)
+    if not summary:
+        return False
+    return (
+        (_red_team_readiness_int(summary.get("control_count")) or 0) > 0
+        and (_red_team_readiness_int(summary.get("action_count")) or 0) > 0
+        and float(summary.get("required_control_rate", 0.0) or 0.0) >= 1.0
+        and (_red_team_readiness_int(summary.get("exceeded_budget_count")) or 0) == 0
+        and (_red_team_readiness_int(summary.get("missing_budget_count")) or 0) == 0
+        and (_red_team_readiness_int(summary.get("uncontained_incident_count")) or 0) == 0
+        and (_red_team_readiness_int(summary.get("high_risk_uncontained_count")) or 0) == 0
+        and bool(summary.get("has_risk_scoring"))
+        and bool(summary.get("has_action_policy"))
+        and bool(summary.get("has_approval_gates"))
+        and bool(summary.get("has_rollback"))
+        and bool(summary.get("has_kill_switch"))
+        and bool(summary.get("has_circuit_breakers"))
+        and bool(summary.get("has_rate_limits"))
+        and bool(summary.get("has_budgets"))
+        and bool(summary.get("has_audit"))
+        and bool(summary.get("has_containment"))
+        and bool(summary.get("has_drift_detection"))
+    )
+
+
+def _red_team_readiness_summary_of(payload: Mapping[str, Any]) -> Dict[str, Any]:
+    return copy.deepcopy(dict(payload.get("summary") or {})) if isinstance(payload, Mapping) else {}
+
+
+def _red_team_readiness_observability_hook_count(observability: Mapping[str, Any]) -> int:
+    count = sum(
+        len(_as_iterable(observability.get(key)))
+        for key in ("traces", "logs", "metrics", "dashboards", "webhooks", "events", "runs")
+    )
+    return count or (1 if observability else 0)
+
+
+def _red_team_readiness_key_list(value: Any) -> List[str]:
+    return sorted({_red_team_readiness_key(item) for item in _as_iterable(value) if _red_team_readiness_key(item)})
+
+
+def _red_team_readiness_key(value: Any) -> str:
+    return str(value or "").strip().lower().replace("-", "_").replace(" ", "_").replace(".", "_")
+
+
+def _red_team_readiness_int(value: Any) -> Optional[int]:
     if isinstance(value, bool):
         return None
     if isinstance(value, int):
