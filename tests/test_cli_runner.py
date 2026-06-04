@@ -729,6 +729,45 @@ def test_cli_runner_compare_fails_on_score_drop_and_new_redteam_finding(tmp_path
     assert {"score_regression", "red_team_open_high_findings_high", "new_error_findings"} <= rule_ids
 
 
+def test_cli_runner_baseline_compacts_result_and_compare_accepts_it(tmp_path):
+    finding = {
+        "type": "red_team_open_high_findings_high",
+        "metric": "red_team_campaign_quality",
+        "severity": "high",
+        "check": "max_open_high_findings",
+        "expected": 0,
+        "actual": 1,
+    }
+    result = _cli_result(score=0.9, findings=[finding], redteam=True)
+    result["report"] = {"raw_transcript": "contains data that should not be kept in a baseline"}
+    result_path = tmp_path / "redteam-result.json"
+    baseline_path = tmp_path / "redteam-baseline.json"
+    compare_path = tmp_path / "compare.json"
+    result_path.write_text(json.dumps(result), encoding="utf-8")
+
+    baseline_exit = main(["baseline", str(result_path), "--output", str(baseline_path)])
+    compare_exit = main([
+        "compare",
+        str(baseline_path),
+        str(result_path),
+        "--output",
+        str(compare_path),
+    ])
+
+    assert baseline_exit == 0
+    baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+    assert baseline["kind"] == "agent-simulate.baseline.v1"
+    assert "report" not in baseline
+    assert "report" in baseline["baseline"]["dropped_sections"]
+    assert baseline["summary"]["score"] == 0.9
+    assert baseline["summary"]["finding_count"] == 1
+    assert baseline["redteam"]["finding_count"] == 1
+    assert compare_exit == 0
+    compare = json.loads(compare_path.read_text(encoding="utf-8"))
+    assert compare["status"] == "passed"
+    assert compare["summary"]["new_finding_count"] == 0
+
+
 def test_cli_runner_optimizes_manifest_search_paths_and_writes_outputs(tmp_path, monkeypatch):
     pytest.importorskip("fi.opt")
     monkeypatch.setenv("SIMULATE_CLI_OPT_TEST_KEY", "real-local-opt-key")

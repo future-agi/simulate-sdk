@@ -51,7 +51,7 @@ class ManifestError(ValueError):
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
-    if args.command in {"run", "redteam", "optimize", "compare"}:
+    if args.command in {"run", "redteam", "optimize", "compare", "baseline"}:
         try:
             result = (
                 asyncio.run(run_manifest_command(args))
@@ -60,6 +60,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 if args.command == "redteam"
                 else compare_results_command(args)
                 if args.command == "compare"
+                else baseline_result_command(args)
+                if args.command == "baseline"
                 else optimize_manifest_command(args)
             )
         except ManifestError as exc:
@@ -169,6 +171,19 @@ def compare_results_command(args: argparse.Namespace) -> Dict[str, Any]:
         duration_seconds=round(time.time() - started, 4),
     )
     return _write_outputs(result, {}, args, current_path)
+
+
+def baseline_result_command(args: argparse.Namespace) -> Dict[str, Any]:
+    started = time.time()
+    source_path = Path(args.result).expanduser().resolve()
+    source = load_manifest(source_path)
+    result = _baseline_result(
+        source=source,
+        source_path=source_path,
+        name=getattr(args, "name", None),
+        duration_seconds=round(time.time() - started, 4),
+    )
+    return _write_outputs(result, {}, args, source_path)
 
 
 async def run_manifest_command(args: argparse.Namespace) -> Dict[str, Any]:
@@ -694,6 +709,110 @@ def _unique_strings(values: Iterable[Any]) -> List[str]:
         seen.add(text)
         result.append(text)
     return result
+
+
+def _baseline_result(
+    *,
+    source: Mapping[str, Any],
+    source_path: Path,
+    name: Optional[str],
+    duration_seconds: float,
+) -> Dict[str, Any]:
+    score = _result_primary_score(source)
+    metrics = _result_metric_averages(source)
+    findings = _comparable_findings(source)
+    error_findings = [finding for finding in findings if _sarif_level(finding) == "error"]
+    source_summary = dict(source.get("summary") or {})
+    passed = _result_passed(source, score)
+    baseline: Dict[str, Any] = {
+        "schema_version": CLI_SCHEMA_VERSION,
+        "kind": "agent-simulate.baseline.v1",
+        "name": name or f"{source.get('name') or source_path.stem}-baseline",
+        "status": "passed" if passed else "failed",
+        "exit_code": 0,
+        "summary": {
+            "case_count": int(source_summary.get("case_count") or len(dict(source.get("evaluation") or {}).get("cases") or []) or 1),
+            "score": score,
+            "evaluation_score": source_summary.get("evaluation_score", score),
+            "evaluation_passed": passed,
+            "metric_averages": metrics,
+            "finding_count": len(findings),
+            "error_finding_count": len(error_findings),
+        },
+        "baseline": {
+            "source_path": str(source_path),
+            "source_name": str(source.get("name") or source_path.stem),
+            "source_status": source.get("status"),
+            "source_schema_version": source.get("schema_version"),
+            "dropped_sections": _baseline_dropped_sections(source),
+        },
+        "evaluation": {
+            "score": score,
+            "passed": passed,
+            "cases": [
+                {
+                    "index": 0,
+                    "score": score,
+                    "passed": passed,
+                    "metrics": [],
+                    "findings": findings,
+                }
+            ],
+            "summary": {
+                "metric_averages": metrics,
+                "findings": findings,
+            },
+        },
+        "duration_seconds": duration_seconds,
+    }
+    if "redteam" in source:
+        baseline["redteam"] = copy.deepcopy(dict(source.get("redteam") or {}))
+    if "optimization" in source:
+        baseline["optimization"] = _baseline_optimization_summary(source)
+        if "optimization_score" in source_summary:
+            baseline["summary"]["optimization_score"] = source_summary["optimization_score"]
+    if "compare" in source:
+        baseline["compare"] = copy.deepcopy(dict(source.get("compare") or {}))
+    return baseline
+
+
+def _result_passed(source: Mapping[str, Any], score: float) -> bool:
+    evaluation = dict(source.get("evaluation") or {})
+    summary = dict(source.get("summary") or {})
+    for value in (
+        source.get("status"),
+        evaluation.get("passed"),
+        summary.get("evaluation_passed"),
+        summary.get("optimization_passed"),
+        summary.get("comparison_passed"),
+    ):
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str) and value.lower() in {"passed", "failed"}:
+            return value.lower() == "passed"
+    return score >= 0.0
+
+
+def _baseline_dropped_sections(source: Mapping[str, Any]) -> List[str]:
+    dropped = []
+    for key in ("report", "optimization.history", "optimization.best_config"):
+        head, _, tail = key.partition(".")
+        value = source.get(head)
+        if not tail and value not in (None, {}, []):
+            dropped.append(key)
+        elif isinstance(value, Mapping) and value.get(tail) not in (None, {}, []):
+            dropped.append(key)
+    return dropped
+
+
+def _baseline_optimization_summary(source: Mapping[str, Any]) -> Dict[str, Any]:
+    optimization = dict(source.get("optimization") or {})
+    summary = dict(source.get("summary") or {})
+    return {
+        "final_score": optimization.get("final_score", summary.get("optimization_score")),
+        "best_candidate_id": optimization.get("best_candidate_id", summary.get("best_candidate_id")),
+        "history_count": len(list(optimization.get("history") or [])),
+    }
 
 
 def _compare_results(
@@ -1404,6 +1523,11 @@ def _build_parser() -> argparse.ArgumentParser:
     compare.add_argument("--min-metric-delta", type=float, default=None, help="Optional minimum allowed delta for each shared metric.")
     compare.add_argument("--name", default=None, help="Override the comparison run name.")
     compare.add_argument("--quiet", action="store_true", help="Do not print JSON summary when no output path is configured.")
+    baseline = subparsers.add_parser("baseline", help="Create a compact compare-safe baseline from a CLI result JSON.")
+    baseline.add_argument("result", help="Path to the source JSON result.")
+    baseline.add_argument("-o", "--output", action="append", default=[], help="Write baseline JSON output to this path.")
+    baseline.add_argument("--name", default=None, help="Override the baseline artifact name.")
+    baseline.add_argument("--quiet", action="store_true", help="Do not print JSON summary when no output path is configured.")
     optimize = subparsers.add_parser("optimize", help="Optimize a manifest with agent-opt over JSON search paths.")
     optimize.add_argument("manifest", help="Path to a JSON/YAML optimization manifest.")
     optimize.add_argument("-o", "--output", action="append", default=[], help="Write JSON output to this path. .xml paths are treated as JUnit.")

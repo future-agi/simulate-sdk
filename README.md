@@ -294,6 +294,15 @@ agent-simulate redteam examples/cli_redteam_manifest.json \
   --sarif artifacts/redteam.sarif.json
 ```
 
+Create compact baselines from passing results before storing them in the repo
+or artifact registry. Baselines keep scores, metrics, findings, and red-team
+summaries, while dropping bulky raw report payloads by default.
+
+```bash
+agent-simulate baseline artifacts/redteam-result.json \
+  --output baselines/redteam-main.json
+```
+
 Compare current results against a checked-in or downloaded baseline to block
 score regressions and new red-team findings in PRs.
 
@@ -334,6 +343,7 @@ Manifests currently support:
   `adversarial_attack_pack`, `red_team_campaign`, `red_team_readiness`,
   `framework_import`, `workspace_run_manifest`, and `observability_replay`
 - local `evaluation.agent_report.config` passed directly to `ai-evaluation`
+- `agent-simulate baseline` creates compact compare-safe baseline artifacts
 - `agent-simulate compare` gates baseline/current result artifacts by score
   delta, new findings, new error findings, and optional per-metric deltas
 - `optimization.target.search_space` over JSON paths in the same manifest when
