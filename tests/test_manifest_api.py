@@ -254,6 +254,40 @@ def test_public_redteam_manifest_prepares_generated_matrix(tmp_path, monkeypatch
     assert state["red_team_campaign"]["summary"]["unmapped_findings"] == []
 
 
+def test_public_redteam_manifest_prepares_research_preset_matrix(monkeypatch):
+    monkeypatch.setenv("SIMULATE_PUBLIC_REDTEAM_PRESET_KEY", "real-local-redteam-preset-key")
+    manifest = redteam_matrix_manifest(
+        name="public-redteam-preset",
+        required_env="SIMULATE_PUBLIC_REDTEAM_PRESET_KEY",
+    )
+    manifest["redteam"]["preset"] = "agentic_research_core"
+    original = copy.deepcopy(manifest)
+
+    prepared = prepare_redteam_manifest(manifest)
+
+    assert manifest == original
+    redteam_envs = {
+        item["type"]: item["data"]
+        for item in prepared["simulation"]["environments"]
+    }
+    attack_pack = redteam_envs["adversarial_attack_pack"]
+    campaign = redteam_envs["red_team_campaign"]
+    assert attack_pack["metadata"]["presets"] == ["agentic_research_core"]
+    assert campaign["metadata"]["presets"] == ["agentic_research_core"]
+    assert len(attack_pack["attacks"]) == 80
+    assert len(campaign["scenarios"]) == 160
+    assert len(campaign["artifacts"]) == 160
+    assert len(campaign["mitigations"]) == 160
+    quality = prepared["evaluation"]["agent_report"]["config"]["red_team_campaign_quality"]
+    assert "multi_turn_jailbreak" in quality["required_attack_types"]
+    assert "retrieval" in quality["required_surfaces"]
+    source_ids = {
+        item["id"]
+        for item in campaign["metadata"]["preset_sources"]
+    }
+    assert {"harmbench", "jailbreakbench", "redbench", "agentdojo_family"} <= source_ids
+
+
 def _write_manifest(path: Path, manifest: dict):
     path.write_text(json.dumps(manifest), encoding="utf-8")
     return path

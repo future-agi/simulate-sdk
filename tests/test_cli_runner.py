@@ -803,6 +803,51 @@ def test_cli_runner_redteam_auto_generates_attack_matrix(tmp_path, monkeypatch):
     assert sarif["runs"][0]["results"] == []
 
 
+def test_cli_runner_redteam_research_preset_expands_attack_matrix(tmp_path, monkeypatch):
+    monkeypatch.setenv("SIMULATE_CLI_REDTEAM_PRESET_KEY", "real-local-redteam-preset-key")
+    manifest = redteam_matrix_manifest(
+        name="redteam-research-preset",
+        required_env="SIMULATE_CLI_REDTEAM_PRESET_KEY",
+    )
+    manifest["redteam"]["preset"] = "agentic_research_core"
+    manifest_path = tmp_path / "redteam-research-preset.json"
+    output_path = tmp_path / "redteam-research-preset-result.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    exit_code = main([
+        "redteam",
+        str(manifest_path),
+        "--output",
+        str(output_path),
+    ])
+
+    assert exit_code == 0
+    payload = json.loads(output_path.read_text(encoding="utf-8"))
+    metrics = payload["summary"]["metric_averages"]
+    assert payload["status"] == "passed"
+    assert payload["redteam"]["presets"] == ["agentic_research_core"]
+    assert "harmbench" in payload["redteam"]["taxonomies"]
+    assert "agentdojo" in payload["redteam"]["taxonomies"]
+    assert "multi_turn_jailbreak" in payload["redteam"]["attack_types"]
+    assert "retrieval" in payload["redteam"]["surfaces"]
+    assert "mcp" in payload["redteam"]["surfaces"]
+    assert metrics["adversarial_resilience"] == 1.0
+    assert metrics["red_team_campaign_quality"] == 1.0
+
+    state = payload["report"]["results"][0]["metadata"]["environment_state"]
+    attack_pack = state["adversarial"]["attack_pack"]
+    campaign = state["red_team_campaign"]
+    assert attack_pack["summary"]["attack_count"] == 80
+    assert campaign["summary"]["scenario_count"] == 160
+    assert campaign["summary"]["coverage_cell_count"] == 160
+    assert campaign["summary"]["unmapped_finding_count"] == 0
+    source_ids = {
+        item["id"]
+        for item in campaign["metadata"]["preset_sources"]
+    }
+    assert {"harmbench", "jailbreakbench", "redbench", "agentdojo_family"} <= source_ids
+
+
 def test_cli_runner_redteam_fails_on_evidence_bound_matrix_gaps(tmp_path, monkeypatch):
     monkeypatch.setenv("SIMULATE_CLI_REDTEAM_TEST_KEY", "real-local-redteam-key")
     manifest = _redteam_manifest()
