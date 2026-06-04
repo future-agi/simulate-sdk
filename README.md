@@ -269,9 +269,9 @@ See [`examples/local_multimodal_simulation.py`](examples/local_multimodal_simula
 ## CLI runner for CI
 
 `agent-simulate` also includes a manifest-driven CLI for promptfoo-style local
-and CI runs. The first CLI slice runs local text simulations, replay
-environments, and local `ai-evaluation` agent-report gates, then writes stable
-JSON and JUnit outputs for automation.
+and CI runs. It runs local text simulations, replay environments, red-team
+campaign gates, and local `ai-evaluation` agent-report gates, then writes
+stable JSON, JUnit, and SARIF outputs for automation.
 
 ```bash
 export SIMULATE_CLI_EXAMPLE_KEY="your-real-ci-secret-or-local-test-key"
@@ -279,6 +279,19 @@ export SIMULATE_CLI_EXAMPLE_KEY="your-real-ci-secret-or-local-test-key"
 agent-simulate run examples/cli_optimizer_portfolio_manifest.json \
   --output artifacts/optimizer-portfolio-result.json \
   --junit artifacts/optimizer-portfolio.junit.xml
+```
+
+Red-team manifests add a required `redteam` block and can replay adversarial
+attack packs, campaign evidence, and readiness gates. SARIF output is suitable
+for code-scanning/security dashboards while JUnit keeps CI test views readable.
+
+```bash
+export SIMULATE_CLI_REDTEAM_EXAMPLE_KEY="your-real-ci-secret-or-local-test-key"
+
+agent-simulate redteam examples/cli_redteam_manifest.json \
+  --output artifacts/redteam-result.json \
+  --junit artifacts/redteam.junit.xml \
+  --sarif artifacts/redteam.sarif.json
 ```
 
 Optimization uses the same manifest shape plus an `optimization` block. The
@@ -304,12 +317,13 @@ Manifests currently support:
 - `simulation.engine: local_text`
 - scripted, echo, or `module:function` Python-callable agents
 - replay environments such as `optimizer_backend_portfolio`,
-  `optimizer_society_trace`, `agent_memory_lineage`, `red_team_readiness`,
+  `optimizer_society_trace`, `agent_memory_lineage`,
+  `adversarial_attack_pack`, `red_team_campaign`, `red_team_readiness`,
   `framework_import`, `workspace_run_manifest`, and `observability_replay`
 - local `evaluation.agent_report.config` passed directly to `ai-evaluation`
 - `optimization.target.search_space` over JSON paths in the same manifest when
   `agent-opt` is installed
-- JSON and JUnit outputs from CLI flags or manifest `outputs`
+- JSON, JUnit, and SARIF outputs from CLI flags or manifest `outputs`
 
 ### Local environments
 
