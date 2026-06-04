@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import copy
+import glob
 import importlib
 import importlib.util
 import json
@@ -51,7 +52,7 @@ class ManifestError(ValueError):
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
-    if args.command in {"run", "redteam", "optimize", "compare", "baseline", "report", "promote-to-regression"}:
+    if args.command in {"run", "redteam", "optimize", "compare", "baseline", "report", "promote-to-regression", "replay"}:
         try:
             if args.command == "run":
                 result = asyncio.run(run_manifest_command(args))
@@ -65,6 +66,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 result = report_result_command(args)
             elif args.command == "promote-to-regression":
                 result = promote_to_regression_command(args)
+            elif args.command == "replay":
+                result = replay_suite_command(args)
             else:
                 result = optimize_manifest_command(args)
         except ManifestError as exc:
@@ -220,6 +223,29 @@ def promote_to_regression_command(args: argparse.Namespace) -> Dict[str, Any]:
     )
     result = _write_outputs(result, {}, args, source_path)
     return _write_manifest_outputs(result, args, source_path.parent)
+
+
+def replay_suite_command(args: argparse.Namespace) -> Dict[str, Any]:
+    started = time.time()
+    paths = _replay_manifest_paths(getattr(args, "manifests", []))
+    children: List[Dict[str, Any]] = []
+    for path in paths:
+        child = _execute_replay_manifest(
+            path,
+            dry_run=bool(getattr(args, "dry_run", False)),
+        )
+        children.append(child)
+        if child.get("exit_code") != 0 and getattr(args, "fail_fast", False):
+            break
+    result = _replay_result(
+        children=children,
+        requested=list(getattr(args, "manifests", [])),
+        name=getattr(args, "name", None),
+        duration_seconds=round(time.time() - started, 4),
+        dry_run=bool(getattr(args, "dry_run", False)),
+        fail_fast=bool(getattr(args, "fail_fast", False)),
+    )
+    return _write_outputs(result, {}, args, Path.cwd() / "agent-simulate-replay.json")
 
 
 async def run_manifest_command(args: argparse.Namespace) -> Dict[str, Any]:
@@ -906,6 +932,8 @@ def _optional_primary_score(result: Mapping[str, Any]) -> Optional[float]:
 
 def _markdown_sections(result: Mapping[str, Any]) -> List[str]:
     sections = ["summary"]
+    if result.get("replay") is not None:
+        sections.append("replay")
     if result.get("redteam") is not None:
         sections.append("redteam")
     if result.get("compare") is not None:
@@ -947,6 +975,8 @@ def _result_markdown(
         lines.append(f"- Cases: {_format_value(summary.get('case_count'))}")
     lines.append("")
 
+    if "replay" in sections:
+        lines.extend(_replay_markdown(result))
     if "redteam" in sections:
         lines.extend(_redteam_markdown(result))
     if "compare" in sections:
@@ -960,6 +990,28 @@ def _result_markdown(
     if "findings" in sections:
         lines.extend(_findings_markdown(findings))
     return "\n".join(lines).rstrip() + "\n"
+
+
+def _replay_markdown(result: Mapping[str, Any]) -> List[str]:
+    replay = dict(result.get("replay") or {})
+    manifests = [dict(item) for item in _coerce_list(replay.get("manifests")) if isinstance(item, Mapping)]
+    rows = [
+        [
+            item.get("command"),
+            item.get("status"),
+            item.get("score"),
+            item.get("exit_code"),
+            item.get("finding_count"),
+            Path(str(item.get("path") or "")).name or item.get("path"),
+        ]
+        for item in manifests
+    ]
+    return [
+        "## Replay",
+        "",
+        *_markdown_table(["Command", "Status", "Score", "Exit", "Findings", "Manifest"], rows),
+        "",
+    ]
 
 
 def _redteam_markdown(result: Mapping[str, Any]) -> List[str]:
@@ -1147,6 +1199,274 @@ def _format_value(value: Any) -> str:
     if isinstance(value, float):
         return f"{value:.4f}".rstrip("0").rstrip(".")
     return str(value)
+
+
+def _replay_manifest_paths(patterns: Sequence[Any]) -> List[Path]:
+    if not patterns:
+        raise ManifestError("replay requires at least one manifest path, directory, or glob")
+    paths: List[Path] = []
+    missing: List[str] = []
+    for raw in patterns:
+        text = str(raw)
+        expanded = Path(text).expanduser()
+        matches: List[Path] = []
+        if glob.has_magic(text):
+            matches = [Path(match).expanduser() for match in glob.glob(text, recursive=True)]
+        elif expanded.is_dir():
+            matches = [
+                *expanded.rglob("*.json"),
+                *expanded.rglob("*.yaml"),
+                *expanded.rglob("*.yml"),
+            ]
+        elif expanded.exists():
+            matches = [expanded]
+        else:
+            missing.append(text)
+        paths.extend(path.resolve() for path in matches if path.is_file())
+    if missing:
+        raise ManifestError(f"replay manifest path(s) not found: {', '.join(missing)}")
+    deduped = sorted({str(path): path for path in paths}.values(), key=lambda item: str(item))
+    if not deduped:
+        raise ManifestError("replay did not find any JSON/YAML manifest files")
+    return deduped
+
+
+def _execute_replay_manifest(path: Path, *, dry_run: bool) -> Dict[str, Any]:
+    command = "unknown"
+    try:
+        manifest = load_manifest(path)
+        command = _replay_command_for_manifest(manifest)
+        child_args = argparse.Namespace(
+            manifest=str(path),
+            name=None,
+            threshold=None,
+            no_eval=False,
+            dry_run=dry_run,
+            output=[],
+            junit=[],
+            sarif=[],
+            markdown=[],
+            quiet=True,
+            max_candidates=None,
+        )
+        if command == "redteam":
+            result = asyncio.run(redteam_manifest_command(child_args))
+        elif command == "optimize":
+            result = optimize_manifest_command(child_args)
+        else:
+            result = asyncio.run(run_manifest_command(child_args))
+        return _replay_child_from_result(path=path, command=command, result=result)
+    except ManifestError as exc:
+        return _replay_error_child(path=path, command=command, exit_code=2, error=exc)
+    except Exception as exc:
+        return _replay_error_child(path=path, command=command, exit_code=3, error=exc)
+
+
+def _replay_command_for_manifest(manifest: Mapping[str, Any]) -> str:
+    explicit = str(manifest.get("command") or manifest.get("kind") or "").lower().replace("_", "-")
+    aliases = {
+        "agent-simulate-run": "run",
+        "agent-simulate-redteam": "redteam",
+        "agent-simulate-red-team": "redteam",
+        "agent-simulate-optimize": "optimize",
+    }
+    if explicit in {"run", "redteam", "red-team", "optimize"}:
+        return "redteam" if explicit == "red-team" else explicit
+    if explicit in aliases:
+        return aliases[explicit]
+    if manifest.get("redteam") is not None or manifest.get("red_team") is not None:
+        return "redteam"
+    if manifest.get("optimization") is not None:
+        return "optimize"
+    return "run"
+
+
+def _replay_child_from_result(*, path: Path, command: str, result: Mapping[str, Any]) -> Dict[str, Any]:
+    findings = _comparable_findings(result) if "redteam" in result else _result_findings(result)
+    error_findings = [finding for finding in findings if _sarif_level(finding) == "error"]
+    exit_code = int(result.get("exit_code", 1))
+    child = {
+        "path": str(path),
+        "command": command,
+        "name": str(result.get("name") or path.stem),
+        "status": str(result.get("status") or ("passed" if exit_code == 0 else "failed")),
+        "exit_code": exit_code,
+        "score": _optional_primary_score(result),
+        "duration_seconds": result.get("duration_seconds"),
+        "summary": _replay_child_summary(result),
+        "finding_count": len(findings),
+        "error_finding_count": len(error_findings),
+        "findings": [_replay_child_finding(path, command, finding) for finding in findings],
+    }
+    if "redteam" in result:
+        child["redteam"] = copy.deepcopy(dict(result.get("redteam") or {}))
+    if "optimization" in result:
+        child["optimization"] = _baseline_optimization_summary(result)
+    if exit_code != 0 and not child["findings"]:
+        child["findings"] = [
+            _replay_child_finding(
+                path,
+                command,
+                {
+                    "type": "replay_manifest_failed",
+                    "metric": "replay_manifest_status",
+                    "severity": "high",
+                    "check": "child_exit_code",
+                    "expected": 0,
+                    "actual": exit_code,
+                    "reason": str(result.get("status") or "child manifest failed"),
+                },
+            )
+        ]
+        child["finding_count"] = 1
+        child["error_finding_count"] = 1
+    return child
+
+
+def _replay_error_child(*, path: Path, command: str, exit_code: int, error: BaseException) -> Dict[str, Any]:
+    finding = _replay_child_finding(
+        path,
+        command,
+        {
+            "type": "replay_manifest_error",
+            "metric": "replay_manifest_status",
+            "severity": "high",
+            "check": "execute_manifest",
+            "expected": "exit_code=0",
+            "actual": exit_code,
+            "reason": str(error),
+        },
+    )
+    return {
+        "path": str(path),
+        "command": command,
+        "name": path.stem,
+        "status": "failed",
+        "exit_code": exit_code,
+        "score": 0.0,
+        "duration_seconds": 0.0,
+        "summary": {"error": str(error)},
+        "finding_count": 1,
+        "error_finding_count": 1,
+        "findings": [finding],
+    }
+
+
+def _replay_child_summary(result: Mapping[str, Any]) -> Dict[str, Any]:
+    summary = dict(result.get("summary") or {})
+    allowed = {
+        "case_count",
+        "score",
+        "evaluation_score",
+        "evaluation_passed",
+        "optimization_score",
+        "optimization_passed",
+        "threshold",
+        "finding_count",
+        "error_finding_count",
+        "new_finding_count",
+        "new_error_finding_count",
+        "score_delta",
+    }
+    compact = {key: _to_plain(value) for key, value in summary.items() if key in allowed}
+    metrics = dict(summary.get("metric_averages") or {})
+    if metrics:
+        compact["metric_averages"] = {str(key): float(value) for key, value in metrics.items() if _float_or_none(value) is not None}
+    return compact
+
+
+def _replay_child_finding(path: Path, command: str, finding: Mapping[str, Any]) -> Dict[str, Any]:
+    record = copy.deepcopy(dict(finding))
+    record.setdefault("type", str(record.get("metric") or "replay_manifest_finding"))
+    record.setdefault("metric", str(record.get("metric") or "replay_manifest_status"))
+    record["manifest_path"] = str(path)
+    record["manifest_command"] = command
+    return record
+
+
+def _replay_result(
+    *,
+    children: Sequence[Mapping[str, Any]],
+    requested: Sequence[str],
+    name: Optional[str],
+    duration_seconds: float,
+    dry_run: bool,
+    fail_fast: bool,
+) -> Dict[str, Any]:
+    child_records = [copy.deepcopy(dict(child)) for child in children]
+    total = len(child_records)
+    passed = [child for child in child_records if int(child.get("exit_code", 1)) == 0]
+    failed = [child for child in child_records if int(child.get("exit_code", 1)) != 0]
+    pass_rate = round(len(passed) / total, 4) if total else 0.0
+    findings = [
+        dict(finding)
+        for child in child_records
+        for finding in _coerce_list(child.get("findings"))
+        if isinstance(finding, Mapping)
+    ]
+    error_findings = [finding for finding in findings if _sarif_level(finding) == "error"]
+    evaluation_cases = [
+        _replay_evaluation_case(index=index, child=child)
+        for index, child in enumerate(child_records)
+    ]
+    suite_passed = not failed
+    return {
+        "schema_version": CLI_SCHEMA_VERSION,
+        "kind": "agent-simulate.replay.v1",
+        "name": name or "agent-simulate-replay",
+        "status": "passed" if suite_passed else "failed",
+        "exit_code": 0 if suite_passed else 1,
+        "summary": {
+            "case_count": total,
+            "manifest_count": total,
+            "passed_count": len(passed),
+            "failed_count": len(failed),
+            "score": pass_rate,
+            "replay_pass_rate": pass_rate,
+            "finding_count": len(findings),
+            "error_finding_count": len(error_findings),
+            "dry_run": dry_run,
+            "fail_fast": fail_fast,
+        },
+        "replay": {
+            "requested": list(requested),
+            "manifests": child_records,
+        },
+        "evaluation": {
+            "score": pass_rate,
+            "passed": suite_passed,
+            "cases": evaluation_cases,
+            "summary": {
+                "metric_averages": {"replay_pass_rate": pass_rate},
+                "findings": findings,
+            },
+        },
+        "duration_seconds": duration_seconds,
+    }
+
+
+def _replay_evaluation_case(index: int, child: Mapping[str, Any]) -> Dict[str, Any]:
+    exit_code = int(child.get("exit_code", 1))
+    passed = exit_code == 0
+    return {
+        "index": index,
+        "name": str(child.get("name") or Path(str(child.get("path") or "")).stem or f"manifest-{index + 1}"),
+        "score": 1.0 if passed else 0.0,
+        "passed": passed,
+        "metrics": [
+            {
+                "name": "replay_manifest_status",
+                "score": 1.0 if passed else 0.0,
+                "reason": f"{child.get('command')} {child.get('path')} exited {exit_code}.",
+                "details": {
+                    "path": child.get("path"),
+                    "command": child.get("command"),
+                    "exit_code": exit_code,
+                },
+            }
+        ],
+        "findings": [dict(finding) for finding in _coerce_list(child.get("findings")) if isinstance(finding, Mapping)],
+    }
 
 
 def _regression_promotion_result(
@@ -2415,6 +2735,16 @@ def _build_parser() -> argparse.ArgumentParser:
     promote.add_argument("--required-env", action="append", default=[], help="Required environment variable for the promoted manifest; repeatable.")
     promote.add_argument("--name", default=None, help="Override the promoted manifest name.")
     promote.add_argument("--quiet", action="store_true", help="Do not print JSON summary when no output path is configured.")
+    replay = subparsers.add_parser("replay", help="Run a suite of CLI manifests/regressions and aggregate CI artifacts.")
+    replay.add_argument("manifests", nargs="+", help="Manifest file, directory, or shell-style glob. Repeatable.")
+    replay.add_argument("-o", "--output", action="append", default=[], help="Write JSON replay suite output to this path. .xml paths are treated as JUnit; .sarif paths as SARIF.")
+    replay.add_argument("--junit", action="append", default=[], help="Write compact JUnit XML output.")
+    replay.add_argument("--sarif", action="append", default=[], help="Write SARIF 2.1.0 findings output.")
+    replay.add_argument("--markdown", "--md", action="append", default=[], help="Write Markdown replay report to this path.")
+    replay.add_argument("--name", default=None, help="Override the replay suite name.")
+    replay.add_argument("--dry-run", action="store_true", help="Validate manifests/env without executing simulations.")
+    replay.add_argument("--fail-fast", action="store_true", help="Stop after the first failed child manifest.")
+    replay.add_argument("--quiet", action="store_true", help="Do not print JSON summary when no output path is configured.")
     optimize = subparsers.add_parser("optimize", help="Optimize a manifest with agent-opt over JSON search paths.")
     optimize.add_argument("manifest", help="Path to a JSON/YAML optimization manifest.")
     optimize.add_argument("-o", "--output", action="append", default=[], help="Write JSON output to this path. .xml paths are treated as JUnit.")

@@ -994,6 +994,83 @@ def test_cli_runner_promote_to_regression_requires_findings(tmp_path):
     assert main(["promote-to-regression", str(source_path), "--quiet"]) == 2
 
 
+def test_cli_runner_replay_runs_mixed_manifest_directory_and_writes_ci_outputs(tmp_path, monkeypatch):
+    monkeypatch.setenv("SIMULATE_CLI_TEST_KEY", "real-local-test-key")
+    monkeypatch.setenv("SIMULATE_CLI_REDTEAM_TEST_KEY", "real-local-redteam-key")
+    run_path = tmp_path / "optimizer-portfolio.json"
+    redteam_path = tmp_path / "redteam.json"
+    output_path = tmp_path / "replay-result.json"
+    junit_path = tmp_path / "replay-result.junit.xml"
+    sarif_path = tmp_path / "replay-result.sarif.json"
+    markdown_path = tmp_path / "replay-result.md"
+    run_path.write_text(json.dumps(_portfolio_manifest()), encoding="utf-8")
+    redteam_path.write_text(json.dumps(_redteam_manifest()), encoding="utf-8")
+
+    exit_code = main([
+        "replay",
+        str(tmp_path),
+        "--output",
+        str(output_path),
+        "--junit",
+        str(junit_path),
+        "--sarif",
+        str(sarif_path),
+        "--markdown",
+        str(markdown_path),
+    ])
+
+    assert exit_code == 0
+    payload = json.loads(output_path.read_text(encoding="utf-8"))
+    assert payload["kind"] == "agent-simulate.replay.v1"
+    assert payload["status"] == "passed"
+    assert payload["summary"]["manifest_count"] == 2
+    assert payload["summary"]["passed_count"] == 2
+    assert payload["summary"]["failed_count"] == 0
+    assert payload["summary"]["replay_pass_rate"] == 1.0
+    assert {item["command"] for item in payload["replay"]["manifests"]} == {"run", "redteam"}
+    assert "failures=\"0\"" in junit_path.read_text(encoding="utf-8")
+    sarif_results = json.loads(sarif_path.read_text(encoding="utf-8"))["runs"][0]["results"]
+    assert {item["level"] for item in sarif_results} <= {"warning", "note"}
+    markdown = markdown_path.read_text(encoding="utf-8")
+    assert "## Replay" in markdown
+    assert "optimizer-portfolio.json" in markdown
+    assert "redteam.json" in markdown
+
+
+def test_cli_runner_replay_aggregates_failed_child_manifest(tmp_path):
+    manifest = _portfolio_manifest()
+    manifest["required_env"] = ["SIMULATE_REPLAY_MISSING_KEY"]
+    manifest_path = tmp_path / "missing-env.json"
+    output_path = tmp_path / "replay-result.json"
+    junit_path = tmp_path / "replay-result.junit.xml"
+    sarif_path = tmp_path / "replay-result.sarif.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    exit_code = main([
+        "replay",
+        str(manifest_path),
+        "--output",
+        str(output_path),
+        "--junit",
+        str(junit_path),
+        "--sarif",
+        str(sarif_path),
+    ])
+
+    assert exit_code == 1
+    payload = json.loads(output_path.read_text(encoding="utf-8"))
+    child = payload["replay"]["manifests"][0]
+    assert payload["status"] == "failed"
+    assert payload["summary"]["manifest_count"] == 1
+    assert payload["summary"]["failed_count"] == 1
+    assert child["exit_code"] == 2
+    assert child["findings"][0]["type"] == "replay_manifest_error"
+    assert "SIMULATE_REPLAY_MISSING_KEY" in child["findings"][0]["reason"]
+    assert "failures=\"1\"" in junit_path.read_text(encoding="utf-8")
+    sarif = json.loads(sarif_path.read_text(encoding="utf-8"))
+    assert sarif["runs"][0]["results"][0]["ruleId"] == "replay_manifest_error"
+
+
 def test_cli_runner_optimizes_manifest_search_paths_and_writes_outputs(tmp_path, monkeypatch):
     pytest.importorskip("fi.opt")
     monkeypatch.setenv("SIMULATE_CLI_OPT_TEST_KEY", "real-local-opt-key")

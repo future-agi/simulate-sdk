@@ -271,7 +271,7 @@ See [`examples/local_multimodal_simulation.py`](examples/local_multimodal_simula
 `agent-simulate` also includes a manifest-driven CLI for promptfoo-style local
 and CI runs. It runs local text simulations, replay environments, red-team
 campaign gates, and local `ai-evaluation` agent-report gates, then writes
-stable JSON, JUnit, and SARIF outputs for automation.
+stable JSON, JUnit, SARIF, and Markdown outputs for automation.
 
 ```bash
 export SIMULATE_CLI_EXAMPLE_KEY="your-real-ci-secret-or-local-test-key"
@@ -330,6 +330,25 @@ promote, defaulting to `warning`. Use `--max-findings` to cap promoted cases,
 `--name` to set the regression manifest name, and `--quiet` for quieter
 automation logs.
 
+Replay runs a suite of previously created CLI manifests or promoted regressions
+in CI. Inputs can be manifest files, directories, or shell-style globs. Each
+manifest auto-detects its command: `redteam` when it has a `redteam` or
+`red_team` block, `optimize` when it has an `optimization` block, and `run`
+otherwise. The suite artifact aggregates child statuses, compact summaries,
+findings, and scores.
+
+```bash
+agent-simulate replay MANIFEST_OR_GLOB... \
+  --output artifacts/replay.json \
+  --junit artifacts/replay.junit.xml \
+  --sarif artifacts/replay.sarif.json \
+  --markdown artifacts/replay.md
+```
+
+Use `--dry-run` to validate discovered manifests without executing them,
+`--fail-fast` to stop after the first failing child run, `--name` to set the
+suite name, and `--quiet` for quieter automation logs.
+
 Optimization uses the same manifest shape plus an `optimization` block. The
 optimizer searches JSON paths over the run manifest, executes the resulting
 candidate manifest, scores it with `ai-evaluation`, and returns the best
@@ -344,7 +363,7 @@ agent-simulate optimize examples/cli_optimizer_portfolio_optimization.json \
 ```
 
 Markdown reporting turns JSON artifacts from `run`, `redteam`, `optimize`,
-`baseline`, or `compare` into a human-readable report for review threads,
+`replay`, `baseline`, or `compare` into a human-readable report for review threads,
 artifacts, and handoffs. `--output` writes the JSON report payload; `--markdown`
 or `--md` writes the rendered Markdown.
 
@@ -373,11 +392,15 @@ Manifests currently support:
   delta, new findings, new error findings, and optional per-metric deltas
 - `agent-simulate promote-to-regression RESULT.json --manifest regressions/<name>.json --output artifacts/<name>-promotion.json`
   turns red-team/compare findings into runnable red-team regression manifests
+- `agent-simulate replay MANIFEST_OR_GLOB... --output artifacts/replay.json --junit artifacts/replay.junit.xml --sarif artifacts/replay.sarif.json --markdown artifacts/replay.md`
+  runs manifest files, directories, or shell-style globs as one CI suite,
+  auto-detecting `redteam`, `optimize`, or `run` per manifest and aggregating
+  child statuses, compact summaries, findings, and scores
 - `agent-simulate report RESULT.json --markdown RESULT.md` renders
   human-readable Markdown from CLI JSON artifacts
 - `optimization.target.search_space` over JSON paths in the same manifest when
   `agent-opt` is installed
-- JSON, JUnit, and SARIF outputs from CLI flags or manifest `outputs`
+- JSON, JUnit, SARIF, and Markdown outputs from CLI flags or manifest `outputs`
 
 ### Local environments
 
