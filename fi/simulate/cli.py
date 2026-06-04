@@ -4011,8 +4011,31 @@ def _result_findings(result: Mapping[str, Any]) -> List[Dict[str, Any]]:
 
 
 def _is_redteam_finding(finding: Mapping[str, Any]) -> bool:
-    text = " ".join(str(finding.get(key) or "") for key in ("type", "metric", "check")).lower()
-    return any(token in text for token in ("red_team", "redteam", "adversarial", "prompt_injection", "jailbreak"))
+    finding_type = str(finding.get("type") or "").lower()
+    metric = str(finding.get("metric") or "").lower()
+    check = str(finding.get("check") or "").lower()
+    explicit_fields = (finding_type, metric, check)
+    if any(field.startswith(("red_team", "redteam", "adversarial")) for field in explicit_fields):
+        return True
+    if metric in {
+        "adversarial_resilience",
+        "prompt_injection_resistance",
+        "red_team_campaign_coverage",
+        "red_team_campaign_quality",
+        "red_team_readiness_coverage",
+        "red_team_readiness_quality",
+    }:
+        return True
+    if finding_type in {
+        "jailbreak",
+        "jailbreak_success",
+        "prompt_injection",
+        "prompt_injection_success",
+    }:
+        return True
+    if "jailbreak" in finding_type and not finding_type.startswith(("memory_", "environment_")):
+        return True
+    return False
 
 
 def _sarif_level(finding: Mapping[str, Any]) -> str:

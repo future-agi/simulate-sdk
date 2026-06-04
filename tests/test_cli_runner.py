@@ -814,6 +814,7 @@ def test_cli_runner_redteam_research_preset_expands_attack_matrix(tmp_path, monk
     manifest["redteam"]["preset"] = "agentic_research_core"
     manifest_path = tmp_path / "redteam-research-preset.json"
     output_path = tmp_path / "redteam-research-preset-result.json"
+    sarif_path = tmp_path / "redteam-research-preset.sarif.json"
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
     exit_code = main([
@@ -821,6 +822,8 @@ def test_cli_runner_redteam_research_preset_expands_attack_matrix(tmp_path, monk
         str(manifest_path),
         "--output",
         str(output_path),
+        "--sarif",
+        str(sarif_path),
     ])
 
     assert exit_code == 0
@@ -850,6 +853,8 @@ def test_cli_runner_redteam_research_preset_expands_attack_matrix(tmp_path, monk
         for item in campaign["metadata"]["preset_sources"]
     }
     assert {"harmbench", "jailbreakbench", "redbench", "agentdojo_family"} <= source_ids
+    sarif = json.loads(sarif_path.read_text(encoding="utf-8"))
+    assert sarif["runs"][0]["results"] == []
 
 
 def test_cli_runner_redteam_fails_on_evidence_bound_matrix_gaps(tmp_path, monkeypatch):
