@@ -1536,8 +1536,14 @@ def test_cli_runner_optimizes_manifest_search_paths_and_writes_outputs(tmp_path,
     assert payload["evaluation"]["passed"] is True
     assert payload["summary"]["metric_averages"]["manifest_optimization_coverage"] == 1.0
     assert payload["summary"]["metric_averages"]["manifest_optimization_quality"] == 1.0
+    assert payload["summary"]["metric_averages"]["optimizer_trace_coverage"] == 1.0
+    assert payload["summary"]["metric_averages"]["optimizer_trace_quality"] == 1.0
     assert payload["optimization"]["best_config"]["simulation"]["environments"][0]["data"]["selected_optimizer"] == "bandit"
     assert payload["optimization"]["manifest_optimization"]["kind"] == "manifest_optimization"
+    assert payload["optimization"]["optimizer_trace"]["kind"] == "optimizer_society_trace"
+    assert payload["optimization"]["optimizer_trace"]["summary"]["has_steward"] is True
+    assert payload["optimization"]["optimizer_trace"]["summary"]["has_contract_gate"] is True
+    assert payload["optimization"]["optimizer_trace"]["best_candidate_id"] == payload["optimization"]["best_candidate_id"]
     assert payload["optimization"]["history"]
     assert any(item["patch"] for item in payload["optimization"]["history"])
     assert any(
@@ -1549,6 +1555,7 @@ def test_cli_runner_optimizes_manifest_search_paths_and_writes_outputs(tmp_path,
     assert "failures=\"0\"" in junit_path.read_text(encoding="utf-8")
     markdown = markdown_path.read_text(encoding="utf-8")
     assert "manifest_optimization_quality" in markdown
+    assert "optimizer_trace_quality" in markdown
     assert "## Optimization" in markdown
 
 
@@ -1583,6 +1590,7 @@ def test_cli_runner_optimize_failing_threshold_emits_evaluation_findings(tmp_pat
     sarif = json.loads(sarif_path.read_text(encoding="utf-8"))
     rule_ids = {result["ruleId"] for result in sarif["runs"][0]["results"]}
     assert "manifest_optimization_final_score_low" in rule_ids
+    assert "optimizer_trace_best_score_low" in rule_ids
 
 
 def test_cli_runner_optimize_dry_run_reports_search_space(tmp_path, monkeypatch):

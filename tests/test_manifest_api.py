@@ -267,9 +267,12 @@ def test_public_optimize_manifest_file_runs_when_agent_opt_is_available(monkeypa
     assert result["status"] == "passed"
     assert result["exit_code"] == 0
     assert result["summary"]["optimization_score"] >= 0.9
+    assert result["summary"]["metric_averages"]["optimizer_trace_coverage"] == 1.0
+    assert result["summary"]["metric_averages"]["optimizer_trace_quality"] == 1.0
     assert result["optimization"]["best_config"]["simulation"]["environments"][0]["data"][
         "selected_optimizer"
     ] == "bandit"
+    assert result["optimization"]["optimizer_trace"]["kind"] == "optimizer_society_trace"
 
 
 def test_public_result_management_apis_run_real_replay_and_reports(tmp_path, monkeypatch):
