@@ -3666,6 +3666,22 @@ def _red_team_item_covers_cell(item: Mapping[str, Any], cell: Mapping[str, str])
     return True
 
 
+def _red_team_item_has_executed_evidence(item: Mapping[str, Any]) -> bool:
+    def _has_any(*fields: str) -> bool:
+        for field in fields:
+            if field in item and item.get(field) not in (None, "", [], {}):
+                return True
+        return False
+
+    has_attack_case = _has_any("attack_case_id", "attack_id", "case_id", "scenario_id")
+    has_input = _has_any("attack_prompt", "input", "prompt", "request", "payload")
+    has_output = _has_any("assistant_output", "output", "response", "transcript")
+    has_tool_calls = any(field in item for field in ("tool_calls", "tools", "tool_results"))
+    has_verdict = _has_any("verdict", "status", "outcome") or item.get("passed") is not None
+    has_logs = _has_any("logs", "raw_log", "events", "transcript", "log_path", "trace_id", "path")
+    return all([has_attack_case, has_input, has_output, has_tool_calls, has_verdict, has_logs])
+
+
 def _red_team_missing_cell(cell: Mapping[str, Any], missing: Sequence[str]) -> Dict[str, Any]:
     return {
         "id": str(cell.get("id") or ""),
@@ -3698,6 +3714,7 @@ def _red_team_campaign_matrix_summary(
     coverage_matrix: List[Dict[str, Any]] = []
     missing_coverage_cells: List[Dict[str, Any]] = []
     missing_run_artifact_cells: List[Dict[str, Any]] = []
+    missing_executed_cells: List[Dict[str, Any]] = []
     missing_mitigation_cells: List[Dict[str, Any]] = []
     mapped_finding_ids: set[str] = set()
     for cell in required_cells:
@@ -3709,6 +3726,15 @@ def _red_team_campaign_matrix_summary(
             if item.get("id") and item.get("status") == "passed" and _red_team_item_covers_cell(item, cell)
         )
         artifact_ids = sorted(str(item.get("id")) for item in artifacts if item.get("id") and _red_team_item_covers_cell(item, cell))
+        executed_evidence_ids = sorted(
+            {
+                str(item.get("id"))
+                for item in [*runs, *artifacts]
+                if item.get("id")
+                and _red_team_item_covers_cell(item, cell)
+                and _red_team_item_has_executed_evidence(item)
+            }
+        )
         finding_ids = sorted(str(item.get("id")) for item in findings if item.get("id") and _red_team_item_covers_cell(item, cell))
         mitigation_ids = sorted(
             str(item.get("id"))
@@ -3723,12 +3749,14 @@ def _red_team_campaign_matrix_summary(
             "run_ids": run_ids,
             "passed_run_ids": passed_run_ids,
             "artifact_ids": artifact_ids,
+            "executed_evidence_ids": executed_evidence_ids,
             "finding_ids": finding_ids,
             "mitigation_ids": mitigation_ids,
             "has_scenario": bool(scenario_ids),
             "has_run": bool(run_ids),
             "has_passed_run": bool(passed_run_ids),
             "has_artifact": bool(artifact_ids),
+            "has_executed_evidence": bool(executed_evidence_ids),
             "has_finding": bool(finding_ids),
             "has_mitigation": bool(mitigation_ids),
         }
@@ -3743,6 +3771,8 @@ def _red_team_campaign_matrix_summary(
             missing_coverage_cells.append(_red_team_missing_cell(cell, coverage_missing))
         if not artifact_ids:
             missing_run_artifact_cells.append(_red_team_missing_cell(cell, ["artifact"]))
+        if not executed_evidence_ids:
+            missing_executed_cells.append(_red_team_missing_cell(cell, ["executed_evidence"]))
         if not mitigation_ids:
             missing_mitigation_cells.append(_red_team_missing_cell(cell, ["mitigation"]))
     unmapped_findings = [
@@ -3761,6 +3791,7 @@ def _red_team_campaign_matrix_summary(
         "coverage_cell_count": len(coverage_matrix),
         "covered_cell_count": sum(1 for cell in coverage_matrix if cell.get("has_scenario") and cell.get("has_passed_run")),
         "artifact_bound_cell_count": sum(1 for cell in coverage_matrix if cell.get("has_artifact")),
+        "executed_cell_count": sum(1 for cell in coverage_matrix if cell.get("has_executed_evidence")),
         "finding_bound_cell_count": sum(1 for cell in coverage_matrix if cell.get("has_finding")),
         "finding_mapped_count": len(mapped_finding_ids),
         "unmapped_finding_count": len(unmapped_findings),
@@ -3768,6 +3799,7 @@ def _red_team_campaign_matrix_summary(
         "coverage_matrix": coverage_matrix,
         "missing_coverage_cells": missing_coverage_cells,
         "missing_run_artifact_cells": missing_run_artifact_cells,
+        "missing_executed_cells": missing_executed_cells,
         "unmapped_findings": unmapped_findings,
         "missing_mitigation_cells": missing_mitigation_cells,
     }
@@ -4378,10 +4410,12 @@ class RedTeamCampaignEnvironment(EnvironmentAdapter):
                 "missing_required_providers": summary.get("missing_required_providers", []),
                 "missing_coverage_cells": summary.get("missing_coverage_cells", []),
                 "missing_run_artifact_cells": summary.get("missing_run_artifact_cells", []),
+                "missing_executed_cells": summary.get("missing_executed_cells", []),
                 "unmapped_findings": summary.get("unmapped_findings", []),
                 "missing_mitigation_cells": summary.get("missing_mitigation_cells", []),
                 "coverage_cell_count": summary.get("coverage_cell_count", 0),
                 "covered_cell_count": summary.get("covered_cell_count", 0),
+                "executed_cell_count": summary.get("executed_cell_count", 0),
                 "unmapped_finding_count": summary.get("unmapped_finding_count", 0),
                 "failed_runs": summary.get("failed_runs", []),
                 "open_high_findings": summary.get("open_high_findings", []),

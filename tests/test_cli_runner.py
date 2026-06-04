@@ -794,6 +794,8 @@ def test_cli_runner_redteam_auto_generates_attack_matrix(tmp_path, monkeypatch):
     assert attack_pack["summary"]["canary_count"] == 1
     assert campaign["summary"]["scenario_count"] == 12
     assert campaign["summary"]["run_count"] == 4
+    assert campaign["summary"]["executed_cell_count"] == 12
+    assert campaign["summary"]["missing_executed_cells"] == []
     assert campaign["summary"]["unmapped_finding_count"] == 0
     assert campaign["summary"]["unmapped_findings"] == []
     assert campaign["summary"]["missing_required_attack_types"] == []
@@ -840,6 +842,8 @@ def test_cli_runner_redteam_research_preset_expands_attack_matrix(tmp_path, monk
     assert attack_pack["summary"]["attack_count"] == 80
     assert campaign["summary"]["scenario_count"] == 160
     assert campaign["summary"]["coverage_cell_count"] == 160
+    assert campaign["summary"]["executed_cell_count"] == 160
+    assert campaign["summary"]["missing_executed_cells"] == []
     assert campaign["summary"]["unmapped_finding_count"] == 0
     source_ids = {
         item["id"]
@@ -946,6 +950,7 @@ def test_cli_runner_redteam_fails_on_evidence_bound_matrix_gaps(tmp_path, monkey
             "require_observability": True,
             "require_attack_surface_matrix": True,
             "require_run_artifacts": True,
+            "require_executed_run_evidence": True,
             "require_finding_mapping": True,
             "require_mitigation_mapping": True,
             "min_attack_pack_count": 1,
@@ -986,6 +991,7 @@ def test_cli_runner_redteam_fails_on_evidence_bound_matrix_gaps(tmp_path, monkey
     assert campaign["summary"]["covered_cell_count"] == 0
     assert campaign["summary"]["missing_coverage_cells"][0]["id"] == "prompt_injection|tool|chat|local_cli"
     assert campaign["summary"]["missing_run_artifact_cells"][0]["id"] == "prompt_injection|tool|chat|local_cli"
+    assert campaign["summary"]["missing_executed_cells"][0]["id"] == "prompt_injection|tool|chat|local_cli"
     assert campaign["summary"]["unmapped_findings"][0]["id"] == "unmapped_prompt_leak"
     assert campaign["summary"]["missing_mitigation_cells"][0]["id"] == "prompt_injection|tool|chat|local_cli"
     assert "failures=\"1\"" in junit_path.read_text(encoding="utf-8")
@@ -994,6 +1000,7 @@ def test_cli_runner_redteam_fails_on_evidence_bound_matrix_gaps(tmp_path, monkey
     assert "red_team_attack_surface_cell_missing" in rule_ids
     optional_rule_ids = {
         "red_team_finding_mapping_missing",
+        "red_team_run_evidence_missing",
         "red_team_run_artifact_missing",
         "red_team_mitigation_mapping_missing",
     }

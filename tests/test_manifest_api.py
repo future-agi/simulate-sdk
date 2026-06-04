@@ -250,6 +250,8 @@ def test_public_redteam_manifest_prepares_generated_matrix(tmp_path, monkeypatch
     assert state["adversarial"]["attack_pack"]["summary"]["attack_count"] == 6
     assert state["red_team_campaign"]["summary"]["scenario_count"] == 12
     assert state["red_team_campaign"]["summary"]["open_high_finding_count"] == 0
+    assert state["red_team_campaign"]["summary"]["executed_cell_count"] == 12
+    assert state["red_team_campaign"]["summary"]["missing_executed_cells"] == []
     assert state["red_team_campaign"]["summary"]["unmapped_finding_count"] == 0
     assert state["red_team_campaign"]["summary"]["unmapped_findings"] == []
 
@@ -278,7 +280,11 @@ def test_public_redteam_manifest_prepares_research_preset_matrix(monkeypatch):
     assert len(campaign["scenarios"]) == 160
     assert len(campaign["artifacts"]) == 160
     assert len(campaign["mitigations"]) == 160
+    assert all("attack_case_id" in item for item in campaign["artifacts"])
+    assert all("assistant_output" in item for item in campaign["artifacts"])
+    assert all("logs" in item for item in campaign["artifacts"])
     quality = prepared["evaluation"]["agent_report"]["config"]["red_team_campaign_quality"]
+    assert quality["require_executed_run_evidence"] is True
     assert "multi_turn_jailbreak" in quality["required_attack_types"]
     assert "retrieval" in quality["required_surfaces"]
     source_ids = {
