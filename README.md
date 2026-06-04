@@ -371,7 +371,9 @@ suite name, and `--quiet` for quieter automation logs.
 Optimization uses the same manifest shape plus an `optimization` block. The
 optimizer searches JSON paths over the run manifest, executes the resulting
 candidate manifest, scores it with `ai-evaluation`, and returns the best
-candidate config.
+candidate config. The CLI delegates candidate search and score normalization to
+`fi.opt.ManifestOptimizationProblem`; `simulate-sdk` keeps ownership of the
+real manifest runner, environment adapters, and agent-report scoring.
 
 ```bash
 export SIMULATE_CLI_OPT_EXAMPLE_KEY="your-real-ci-secret-or-local-test-key"

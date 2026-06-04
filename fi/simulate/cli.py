@@ -121,39 +121,41 @@ def optimize_manifest_command(args: argparse.Namespace) -> Dict[str, Any]:
         }
         return _write_outputs(result, manifest, args, manifest_path)
 
-    target, optimizer_kwargs = _build_optimizer_inputs(optimization)
     try:
-        from fi.opt.optimizers import AgentOptimizer
+        from fi.opt import ManifestOptimizationProblem
     except Exception as exc:  # pragma: no cover - optional dependency clarity
         raise ManifestError("agent-opt is required for `agent-simulate optimize`.") from exc
 
     manifest_base = copy.deepcopy(dict(manifest))
     manifest_base.pop("optimization", None)
 
-    def evaluate_candidate(candidate: Any) -> Any:
-        candidate_manifest = _deep_merge(copy.deepcopy(manifest_base), copy.deepcopy(candidate.config))
-        report = asyncio.run(_run_local_text_manifest(candidate_manifest, manifest_path))
+    def evaluate_manifest(candidate_manifest: Mapping[str, Any], candidate: Any) -> Any:
+        return _run_local_text_manifest(candidate_manifest, manifest_path)
+
+    def score_manifest(
+        candidate_manifest: Mapping[str, Any],
+        report: Any,
+        candidate: Any,
+    ) -> Dict[str, Any]:
         evaluation = _evaluate_manifest_report(candidate_manifest, report)
         score = float(getattr(evaluation, "score", 1.0 if evaluation is None else 0.0))
-        try:
-            from fi.opt import CandidateEvaluation
-        except Exception as exc:  # pragma: no cover - optional dependency clarity
-            raise ManifestError("agent-opt CandidateEvaluation is required for optimization.") from exc
-        return CandidateEvaluation(
-            candidate=candidate,
-            score=score,
-            report=report,
-            metadata={
-                "agent_report_evaluation": _to_plain(evaluation) if evaluation is not None else None,
+        return {
+            "score": score,
+            "metadata": {
+                "agent_report_evaluation": (
+                    _to_plain(evaluation) if evaluation is not None else None
+                ),
                 "report_summary": _report_summary(report),
             },
-        )
+        }
 
-    result = AgentOptimizer(
-        target=target,
-        evaluate_candidate=evaluate_candidate,
-        **optimizer_kwargs,
-    ).optimize()
+    problem = ManifestOptimizationProblem.from_manifest(
+        {**manifest_base, "optimization": optimization},
+        evaluate_manifest=evaluate_manifest,
+        score_manifest=score_manifest,
+        name=str(manifest.get("name") or manifest_path.stem),
+    )
+    result = problem.optimize()
     payload = _optimization_result(
         manifest=manifest,
         optimization_result=result,
