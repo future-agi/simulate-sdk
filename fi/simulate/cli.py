@@ -30,9 +30,17 @@ from fi.simulate import (
     WorkspaceRunEnvironment,
 )
 from fi.simulate.evaluation import evaluate_agent_report
+from fi.simulate.manifest import (
+    CLI_SCHEMA_VERSION,
+    ManifestError,
+    ManifestOptimizationOptions,
+    ManifestRunOptions,
+    optimize_manifest as optimize_manifest_runtime,
+    redteam_manifest as redteam_manifest_runtime,
+    run_manifest as run_manifest_runtime,
+)
 
 
-CLI_SCHEMA_VERSION = "agent-simulate.cli.v1"
 REDTEAM_ENV_TYPES = frozenset(
     {
         "adversarial_attack_pack",
@@ -43,10 +51,6 @@ REDTEAM_ENV_TYPES = frozenset(
         "redteam_readiness",
     }
 )
-
-
-class ManifestError(ValueError):
-    """Raised when a CLI manifest cannot be executed safely."""
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -91,76 +95,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 def optimize_manifest_command(args: argparse.Namespace) -> Dict[str, Any]:
     manifest_path = Path(args.manifest).expanduser().resolve()
     manifest = load_manifest(manifest_path)
-    if args.name:
-        manifest["name"] = args.name
-    if args.threshold is not None:
-        manifest.setdefault("optimization", {})["threshold"] = args.threshold
-    if args.max_candidates is not None:
-        manifest.setdefault("optimization", {}).setdefault("optimizer", {})["max_candidates"] = args.max_candidates
-
-    started = time.time()
-    required_env = _required_env(manifest)
-    missing_env = [key for key in required_env if not os.environ.get(key)]
-    if missing_env:
-        raise ManifestError(f"missing required environment variable(s): {', '.join(sorted(missing_env))}")
-    _apply_manifest_env(manifest)
-    optimization = _optimization_config(manifest)
-    if args.dry_run:
-        result = {
-            "schema_version": CLI_SCHEMA_VERSION,
-            "name": str(manifest.get("name") or manifest_path.stem),
-            "status": "passed",
-            "exit_code": 0,
-            "dry_run": True,
-            "summary": {
-                "required_env": sorted(required_env),
-                "search_path_count": len(_target_config(optimization).get("search_space", {})),
-                "max_candidates": _optimizer_config(optimization).get("max_candidates"),
-            },
-            "duration_seconds": round(time.time() - started, 4),
-        }
-        return _write_outputs(result, manifest, args, manifest_path)
-
-    try:
-        from fi.opt import ManifestOptimizationProblem
-    except Exception as exc:  # pragma: no cover - optional dependency clarity
-        raise ManifestError("agent-opt is required for `agent-simulate optimize`.") from exc
-
-    manifest_base = copy.deepcopy(dict(manifest))
-    manifest_base.pop("optimization", None)
-
-    def evaluate_manifest(candidate_manifest: Mapping[str, Any], candidate: Any) -> Any:
-        return _run_local_text_manifest(candidate_manifest, manifest_path)
-
-    def score_manifest(
-        candidate_manifest: Mapping[str, Any],
-        report: Any,
-        candidate: Any,
-    ) -> Dict[str, Any]:
-        evaluation = _evaluate_manifest_report(candidate_manifest, report)
-        score = float(getattr(evaluation, "score", 1.0 if evaluation is None else 0.0))
-        return {
-            "score": score,
-            "metadata": {
-                "agent_report_evaluation": (
-                    _to_plain(evaluation) if evaluation is not None else None
-                ),
-                "report_summary": _report_summary(report),
-            },
-        }
-
-    problem = ManifestOptimizationProblem.from_manifest(
-        {**manifest_base, "optimization": optimization},
-        evaluate_manifest=evaluate_manifest,
-        score_manifest=score_manifest,
-        name=str(manifest.get("name") or manifest_path.stem),
-    )
-    result = problem.optimize()
-    payload = _optimization_result(
+    payload = optimize_manifest_runtime(
         manifest=manifest,
-        optimization_result=result,
-        threshold=float(optimization.get("threshold", 0.7)),
-        duration_seconds=round(time.time() - started, 4),
+        manifest_path=manifest_path,
+        options=ManifestOptimizationOptions(
+            name=args.name,
+            threshold=args.threshold,
+            max_candidates=args.max_candidates,
+            dry_run=bool(args.dry_run),
+        ),
     )
     return _write_outputs(payload, manifest, args, manifest_path)
 
@@ -269,43 +212,15 @@ def replay_suite_command(args: argparse.Namespace) -> Dict[str, Any]:
 async def run_manifest_command(args: argparse.Namespace) -> Dict[str, Any]:
     manifest_path = Path(args.manifest).expanduser().resolve()
     manifest = load_manifest(manifest_path)
-    if args.name:
-        manifest["name"] = args.name
-    if args.threshold is not None:
-        manifest.setdefault("evaluation", {}).setdefault("agent_report", {})["threshold"] = args.threshold
-    if args.no_eval:
-        manifest.setdefault("evaluation", {})["enabled"] = False
-
-    started = time.time()
-    required_env = _required_env(manifest)
-    missing_env = [key for key in required_env if not os.environ.get(key)]
-    if missing_env:
-        raise ManifestError(f"missing required environment variable(s): {', '.join(sorted(missing_env))}")
-    _apply_manifest_env(manifest)
-    if args.dry_run:
-        result = {
-            "schema_version": CLI_SCHEMA_VERSION,
-            "name": str(manifest.get("name") or manifest_path.stem),
-            "status": "passed",
-            "exit_code": 0,
-            "dry_run": True,
-            "summary": {
-                "required_env": sorted(required_env),
-                "scenario_cases": len(_scenario_dataset(manifest)),
-                "environment_count": len(_environment_specs(manifest)),
-            },
-            "duration_seconds": round(time.time() - started, 4),
-        }
-        return _write_outputs(result, manifest, args, manifest_path)
-
-    report = await _run_local_text_manifest(manifest, manifest_path)
-    evaluation = _evaluate_manifest_report(manifest, report)
-
-    result = _run_result(
+    result = await run_manifest_runtime(
         manifest=manifest,
-        report=report,
-        evaluation=evaluation,
-        duration_seconds=round(time.time() - started, 4),
+        manifest_path=manifest_path,
+        options=ManifestRunOptions(
+            name=args.name,
+            threshold=args.threshold,
+            no_eval=bool(args.no_eval),
+            dry_run=bool(args.dry_run),
+        ),
     )
     return _write_outputs(result, manifest, args, manifest_path)
 
@@ -313,47 +228,15 @@ async def run_manifest_command(args: argparse.Namespace) -> Dict[str, Any]:
 async def redteam_manifest_command(args: argparse.Namespace) -> Dict[str, Any]:
     manifest_path = Path(args.manifest).expanduser().resolve()
     manifest = load_manifest(manifest_path)
-    if args.name:
-        manifest["name"] = args.name
-    if args.threshold is not None:
-        manifest.setdefault("evaluation", {}).setdefault("agent_report", {})["threshold"] = args.threshold
-
-    started = time.time()
-    redteam_summary = _prepare_redteam_manifest(manifest)
-    required_env = _required_env(manifest)
-    missing_env = [key for key in required_env if not os.environ.get(key)]
-    if missing_env:
-        raise ManifestError(f"missing required environment variable(s): {', '.join(sorted(missing_env))}")
-    _apply_manifest_env(manifest)
-    if args.dry_run:
-        result = {
-            "schema_version": CLI_SCHEMA_VERSION,
-            "name": str(manifest.get("name") or manifest_path.stem),
-            "status": "passed",
-            "exit_code": 0,
-            "dry_run": True,
-            "summary": {
-                "required_env": sorted(required_env),
-                "scenario_cases": len(_scenario_dataset(manifest)),
-                "environment_count": len(_environment_specs(manifest)),
-                "redteam": redteam_summary,
-            },
-            "redteam": redteam_summary,
-            "duration_seconds": round(time.time() - started, 4),
-        }
-        return _write_outputs(result, manifest, args, manifest_path)
-
-    report = await _run_local_text_manifest(manifest, manifest_path)
-    evaluation = _evaluate_manifest_report(manifest, report)
-    result = _run_result(
+    result = await redteam_manifest_runtime(
         manifest=manifest,
-        report=report,
-        evaluation=evaluation,
-        duration_seconds=round(time.time() - started, 4),
+        manifest_path=manifest_path,
+        options=ManifestRunOptions(
+            name=args.name,
+            threshold=args.threshold,
+            dry_run=bool(args.dry_run),
+        ),
     )
-    redteam_result = _redteam_result_summary(manifest, result.get("evaluation"))
-    result["redteam"] = redteam_result
-    result["summary"]["redteam"] = redteam_result
     return _write_outputs(result, manifest, args, manifest_path)
 
 

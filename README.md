@@ -383,6 +383,28 @@ agent-simulate optimize examples/cli_optimizer_portfolio_optimization.json \
   --junit artifacts/optimizer-portfolio-optimization.junit.xml
 ```
 
+The same manifest runtime is available as a Python API for SDKs, services, and
+Future AGI UI workers that should run simulations without shelling out:
+
+```python
+import asyncio
+from fi.simulate import (
+    detect_manifest_command,
+    load_manifest,
+    optimize_manifest_file,
+    run_manifest_file,
+)
+
+manifest = load_manifest("manifests/run.json")
+
+if detect_manifest_command(manifest) == "optimize":
+    result = optimize_manifest_file("manifests/run.json")
+else:
+    result = asyncio.run(run_manifest_file("manifests/run.json"))
+
+assert result["exit_code"] == 0
+```
+
 Markdown reporting turns JSON artifacts from `run`, `redteam`, `optimize`,
 `replay`, `baseline`, or `compare` into a human-readable report for review threads,
 artifacts, and handoffs. `--output` writes the JSON report payload; `--markdown`
