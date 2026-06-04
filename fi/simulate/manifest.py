@@ -106,6 +106,28 @@ def build_manifest_agent_callback(
     )
 
 
+def supported_manifest_environment_types() -> list[str]:
+    """Return the manifest environment types supported by the CLI/SDK registry."""
+
+    return sorted(_cli().MANIFEST_ENVIRONMENT_TYPES)
+
+
+def build_manifest_environments(
+    environments: Any,
+    *,
+    base_dir: str | Path = ".",
+) -> list[Any]:
+    """Build environment adapters from manifest ``simulation.environments`` data."""
+
+    if environments in (None, ""):
+        specs: list[Any] = []
+    elif isinstance(environments, Mapping):
+        specs = [copy.deepcopy(dict(environments))]
+    else:
+        specs = copy.deepcopy(list(environments))
+    return _cli()._build_environments(specs, Path(base_dir).expanduser().resolve())
+
+
 async def run_local_text_manifest(
     manifest: Mapping[str, Any],
     manifest_path: str | Path,
@@ -708,6 +730,7 @@ __all__ = [
     "ManifestRunOptions",
     "apply_manifest_env",
     "build_manifest_agent_callback",
+    "build_manifest_environments",
     "build_manifest_optimization_problem",
     "compare_result_files",
     "compare_results",
@@ -737,5 +760,6 @@ __all__ = [
     "run_manifest_file",
     "run_redteam_manifest",
     "run_redteam_manifest_file",
+    "supported_manifest_environment_types",
     "validate_manifest_env",
 ]

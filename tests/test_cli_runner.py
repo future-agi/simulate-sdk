@@ -12,6 +12,8 @@ from fi.simulate import (
 )
 from fi.simulate.cli import main
 
+from manifest_fixtures import environment_registry_manifest
+
 
 FRAMEWORK_AGENT_MODULE = """
 class LangGraphLikeAgent:
@@ -604,6 +606,75 @@ def test_cli_runner_executes_framework_manifest_agent(tmp_path, monkeypatch):
     runtime = case["metadata"]["environment_state"]["framework_runtime"]
     assert runtime["framework"] == "langgraph"
     assert runtime["summary"]["tool_call_count"] == 1
+
+
+def test_cli_runner_executes_manifest_environment_registry(tmp_path, monkeypatch):
+    monkeypatch.setenv(
+        "SIMULATE_CLI_ENV_REGISTRY_TEST_KEY",
+        "real-local-cli-env-registry-key",
+    )
+    manifest_path = tmp_path / "env-registry.json"
+    output_path = tmp_path / "env-registry-result.json"
+    junit_path = tmp_path / "env-registry-result.junit.xml"
+    sarif_path = tmp_path / "env-registry-result.sarif.json"
+    manifest_path.write_text(
+        json.dumps(
+            environment_registry_manifest(
+                name="manifest-environment-registry-cli",
+                required_env="SIMULATE_CLI_ENV_REGISTRY_TEST_KEY",
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    exit_code = main(
+        [
+            "run",
+            str(manifest_path),
+            "--output",
+            str(output_path),
+            "--junit",
+            str(junit_path),
+            "--sarif",
+            str(sarif_path),
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(output_path.read_text(encoding="utf-8"))
+    assert payload["status"] == "passed"
+    metrics = payload["summary"]["metric_averages"]
+    assert metrics["tool_fault_tolerance"] == 1.0
+    assert metrics["world_contract_coverage"] == 1.0
+    assert metrics["world_contract_quality"] == 1.0
+    assert metrics["framework_trace_coverage"] == 1.0
+    assert metrics["framework_adapter_conformance"] == 1.0
+
+    case = payload["report"]["results"][0]
+    state = case["metadata"]["environment_state"]
+    assert state["policy"]["loaded"] is True
+    assert state["files"]["paths"] == ["policy.md"]
+    assert state["world_contract"]["summary"]["completed_required_transition_count"] == 3
+    assert state["framework_trace"]["adapter_conformance"]["score"] == 1.0
+    assert set(case["metadata"]["environment"]["adapters"]) == {
+        "tool_fault_injection",
+        "tool_mock",
+        "files",
+        "world_contract",
+        "framework_trace",
+    }
+
+    lookup_events = [
+        event["payload"]
+        for event in case["events"]
+        if event["type"] == "tool_execution"
+        and event["payload"].get("tool") == "lookup_policy"
+    ]
+    assert [event["success"] for event in lookup_events] == [False, True]
+    assert "failures=\"0\"" in junit_path.read_text(encoding="utf-8")
+    sarif = json.loads(sarif_path.read_text(encoding="utf-8"))
+    assert sarif["version"] == "2.1.0"
+    assert all(result["level"] != "error" for result in sarif["runs"][0]["results"])
 
 
 def test_cli_runner_fails_fast_on_missing_required_env(tmp_path, monkeypatch):

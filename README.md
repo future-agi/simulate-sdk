@@ -402,12 +402,28 @@ agent-simulate run examples/cli_framework_manifest.json \
   --junit artifacts/framework-runtime.junit.xml
 ```
 
+Pure-data manifests can declare the task world as well as the agent target:
+static tool mocks, transient tool faults, in-memory files, portable world
+contracts, and framework/TraceAI-style spans. This gives promptfoo-style CLI
+users the same deterministic environment evidence that the Python SDK and
+Future AGI UI workers can execute.
+
+```bash
+export SIMULATE_CLI_WORLD_FRAMEWORK_EXAMPLE_KEY="your-real-ci-secret-or-local-test-key"
+
+agent-simulate run examples/cli_world_framework_manifest.json \
+  --output artifacts/world-framework-result.json \
+  --junit artifacts/world-framework.junit.xml \
+  --sarif artifacts/world-framework.sarif.json
+```
+
 The same manifest runtime is available as a Python API for SDKs, services, and
 Future AGI UI workers that should run simulations without shelling out:
 
 ```python
 import asyncio
 from fi.simulate import (
+    build_manifest_environments,
     compare_results,
     create_baseline,
     detect_manifest_command,
@@ -418,12 +434,17 @@ from fi.simulate import (
 )
 
 manifest = load_manifest("manifests/run.json")
+environments = build_manifest_environments(
+    manifest.get("simulation", {}).get("environments", []),
+    base_dir="manifests",
+)
 
 if detect_manifest_command(manifest) == "optimize":
     result = optimize_manifest_file("manifests/run.json")
 else:
     result = asyncio.run(run_manifest_file("manifests/run.json"))
 
+assert environments or not manifest.get("simulation", {}).get("environments")
 assert result["exit_code"] == 0
 
 baseline = create_baseline(result)
@@ -458,6 +479,9 @@ Manifests currently support:
   `optimizer_society_trace`, `agent_memory_lineage`,
   `adversarial_attack_pack`, `red_team_campaign`, `red_team_readiness`,
   `framework_import`, `workspace_run_manifest`, and `observability_replay`
+- pure-data local environment adapters: `tool_mock`/`mock_tools`,
+  `tool_fault_injection`/`tool_fault`, `file`/`files`, `world_contract`, and
+  `framework_trace`
 - local `evaluation.agent_report.config` passed directly to `ai-evaluation`
 - `agent-simulate baseline` creates compact compare-safe baseline artifacts
 - `agent-simulate compare` gates baseline/current result artifacts by score
@@ -1169,6 +1193,7 @@ See [`examples/local_trajectory_template_evaluation.py`](examples/local_trajecto
 See [`examples/local_langgraph_event_stream_replay.py`](examples/local_langgraph_event_stream_replay.py) for local LangGraph/LangChain event-stream replay with framework transcript quality checks.
 See [`examples/local_cross_trial_memory_skill.py`](examples/local_cross_trial_memory_skill.py) for cross-trial memory/skill checks over LangGraph/LangChain-style framework trace events.
 See [`examples/local_world_contract_replay.py`](examples/local_world_contract_replay.py) for world contract state-machine checks over actors, resources, transitions, invariants, success conditions, policy gates, adversarial surfaces, and final state.
+See [`examples/cli_world_framework_manifest.json`](examples/cli_world_framework_manifest.json) for a promptfoo-style CLI manifest that combines tool mocks, fault injection, files, world contracts, framework trace evidence, JSON/JUnit/SARIF output, and local `ai-evaluation` gates.
 See [`examples/local_evidence_grounding.py`](examples/local_evidence_grounding.py) for retrieval plus image artifact evidence checks that catch source contradictions and unsupported artifact claims.
 See [`examples/local_structured_artifact_semantics.py`](examples/local_structured_artifact_semantics.py) for parsed receipt/form/table/log-style structured artifacts with semantic field, row, event-sequence, and answer-claim checks.
 See [`examples/local_domain_package_quality.py`](examples/local_domain_package_quality.py) for support ticket, ledger, calendar, and email-thread package fixtures with deterministic workflow-invariant scoring.

@@ -12,13 +12,16 @@ import sys
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence
+from urllib.parse import urlparse
 from xml.etree import ElementTree
 
 from fi.simulate import (
     AdversarialEnvironmentPack,
     AgentMemoryLineageEnvironment,
     AgentResponse,
+    FileEnvironment,
     FrameworkImportManifestEnvironment,
+    FrameworkTraceEnvironment,
     ObservabilityReplayEnvironment,
     OptimizerPortfolioEnvironment,
     OptimizerTraceEnvironment,
@@ -27,7 +30,10 @@ from fi.simulate import (
     RedTeamReadinessEnvironment,
     Scenario,
     TestRunner,
+    ToolFaultInjectionEnvironment,
+    ToolMockEnvironment,
     WorkspaceRunEnvironment,
+    WorldContractEnvironment,
 )
 from fi.simulate.evaluation import evaluate_agent_report
 from fi.simulate.manifest import (
@@ -49,6 +55,33 @@ REDTEAM_ENV_TYPES = frozenset(
         "redteam_campaign",
         "red_team_readiness",
         "redteam_readiness",
+    }
+)
+
+MANIFEST_ENVIRONMENT_TYPES = frozenset(
+    {
+        "adversarial_attack_pack",
+        "adversarial_pack",
+        "agent_memory_lineage",
+        "file",
+        "files",
+        "framework_import",
+        "framework_trace",
+        "mock_tools",
+        "observability_replay",
+        "optimizer_backend_portfolio",
+        "optimizer_portfolio",
+        "optimizer_society_trace",
+        "optimizer_trace",
+        "red_team_campaign",
+        "red_team_readiness",
+        "redteam_campaign",
+        "redteam_readiness",
+        "tool_fault",
+        "tool_fault_injection",
+        "tool_mock",
+        "workspace_run_manifest",
+        "world_contract",
     }
 )
 
@@ -443,6 +476,16 @@ def _build_environments(specs: Iterable[Mapping[str, Any]], base_dir: Path) -> L
             environments.append(OptimizerTraceEnvironment(payload))
         elif env_type == "agent_memory_lineage":
             environments.append(AgentMemoryLineageEnvironment(payload))
+        elif env_type in {"tool_mock", "mock_tools"}:
+            environments.append(_build_tool_mock_environment(payload))
+        elif env_type in {"tool_fault_injection", "tool_fault"}:
+            environments.append(_build_tool_fault_environment(payload))
+        elif env_type in {"file", "files"}:
+            environments.append(_build_file_environment(payload))
+        elif env_type == "world_contract":
+            environments.append(_build_world_contract_environment(payload))
+        elif env_type == "framework_trace":
+            environments.append(_build_framework_trace_environment(payload, base_dir))
         elif env_type in {"adversarial_attack_pack", "adversarial_pack"}:
             environments.append(_build_adversarial_environment(payload))
         elif env_type in {"red_team_campaign", "redteam_campaign"}:
@@ -460,6 +503,121 @@ def _build_environments(specs: Iterable[Mapping[str, Any]], base_dir: Path) -> L
         else:
             raise ManifestError(f"unsupported environment type: {env_type or '<missing>'}")
     return environments
+
+
+def _build_tool_mock_environment(payload: Mapping[str, Any]) -> ToolMockEnvironment:
+    source = dict(payload)
+    raw_tools = source.get("tools") or source.get("responses") or source.get("handlers")
+    if not isinstance(raw_tools, Mapping) or not raw_tools:
+        raise ManifestError("tool_mock environment requires data.tools")
+    tools: Dict[str, Any] = {}
+    inferred_schemas: List[Dict[str, Any]] = []
+    for name, spec in raw_tools.items():
+        tool_name = str(name)
+        if isinstance(spec, Mapping):
+            spec_dict = dict(spec)
+            if isinstance(spec_dict.get("schema"), Mapping):
+                schema = {**dict(spec_dict["schema"]), "name": tool_name}
+                inferred_schemas.append(schema)
+            if "response" in spec_dict:
+                tools[tool_name] = spec_dict["response"]
+            else:
+                tools[tool_name] = {
+                    key: value
+                    for key, value in spec_dict.items()
+                    if key not in {"schema", "description", "parameters"}
+                }
+        else:
+            tools[tool_name] = spec
+    tool_schemas = [
+        dict(item)
+        for item in _coerce_list(source.get("tool_schemas") or source.get("schemas"))
+        if isinstance(item, Mapping)
+    ]
+    tool_schemas.extend(inferred_schemas)
+    return ToolMockEnvironment(
+        tools,
+        tool_schemas=tool_schemas,
+        initial_state=dict(source.get("initial_state") or source.get("state") or {}),
+    )
+
+
+def _build_tool_fault_environment(payload: Mapping[str, Any]) -> ToolFaultInjectionEnvironment:
+    source = dict(payload)
+    failures = source.get("failures") or source.get("tools") or source.get("faults")
+    if failures is None:
+        failures = {
+            key: value
+            for key, value in source.items()
+            if key not in {"default_error", "description", "metadata"}
+        }
+    if not isinstance(failures, Mapping) or not failures:
+        raise ManifestError("tool_fault_injection environment requires data.failures")
+    return ToolFaultInjectionEnvironment(
+        failures,
+        default_error=str(source.get("default_error") or "Injected transient tool failure."),
+    )
+
+
+def _build_file_environment(payload: Mapping[str, Any]) -> FileEnvironment:
+    source = dict(payload)
+    files = source.get("files", source)
+    if not isinstance(files, Mapping):
+        raise ManifestError("files environment requires data.files")
+    return FileEnvironment({str(path): str(content) for path, content in files.items()})
+
+
+def _build_world_contract_environment(payload: Mapping[str, Any]) -> WorldContractEnvironment:
+    source = dict(payload.get("contract") or payload)
+    return WorldContractEnvironment(
+        name=str(source.get("name") or source.get("id") or "world"),
+        actors=_coerce_list(source.get("actors")),
+        resources=_coerce_list(source.get("resources")),
+        transitions=_coerce_list(source.get("transitions")),
+        invariants=_coerce_list(source.get("invariants")),
+        success_conditions=_coerce_list(source.get("success_conditions") or source.get("success")),
+        policy_gates=_coerce_list(source.get("policy_gates") or source.get("policies")),
+        adversarial_surfaces=_coerce_list(source.get("adversarial_surfaces") or source.get("surfaces")),
+        initial_state=dict(source.get("initial_state") or source.get("state") or {}),
+        metadata=dict(source.get("metadata") or {}),
+    )
+
+
+def _build_framework_trace_environment(
+    payload: Mapping[str, Any],
+    base_dir: Path,
+) -> FrameworkTraceEnvironment:
+    source = dict(payload)
+    export_source = source.get("export_source") or source.get("source")
+    if export_source not in (None, ""):
+        export_source = _resolve_manifest_source(str(export_source), base_dir)
+    return FrameworkTraceEnvironment(
+        framework=str(source.get("framework") or "traceai"),
+        spans=_coerce_list(source.get("spans")),
+        events=_coerce_list(source.get("events")),
+        trace_export=source.get("trace_export", source.get("export")),
+        export_source=export_source,
+        export_headers=dict(source.get("export_headers") or source.get("headers") or {}),
+        export_auth=dict(source.get("export_auth") or source.get("auth") or {}),
+        export_pagination=dict(source.get("export_pagination") or source.get("pagination") or {}),
+        export_max_pages=int(source.get("export_max_pages") or source.get("max_pages") or 20),
+        export_timeout=float(source.get("export_timeout") or source.get("timeout") or 30.0),
+        adapter_spec=dict(source.get("adapter_spec") or {}),
+        adapter_required_signals=_coerce_list(source.get("adapter_required_signals")),
+        adapter_required_mappings=dict(source.get("adapter_required_mappings") or {}),
+        state=dict(source.get("state") or {}),
+        metadata=dict(source.get("metadata") or {}),
+    )
+
+
+def _resolve_manifest_source(value: str, base_dir: Path) -> str:
+    parsed = urlparse(value)
+    if parsed.scheme:
+        return value
+    path = Path(value)
+    if not path.is_absolute():
+        path = base_dir / path
+    return str(path)
 
 
 def _build_adversarial_environment(payload: Mapping[str, Any]) -> AdversarialEnvironmentPack:

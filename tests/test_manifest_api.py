@@ -9,6 +9,7 @@ from fi.simulate import (
     MANIFEST_SCHEMA_VERSION,
     ManifestError,
     build_manifest_agent_callback,
+    build_manifest_environments,
     compare_results,
     create_baseline,
     detect_manifest_command,
@@ -22,8 +23,11 @@ from fi.simulate import (
     render_sarif,
     replay_manifests,
     run_manifest_file,
+    supported_manifest_environment_types,
     validate_manifest_env,
 )
+
+from manifest_fixtures import environment_registry_manifest
 
 
 FRAMEWORK_AGENT_MODULE = """
@@ -171,6 +175,46 @@ def test_public_run_manifest_file_executes_real_local_manifest(tmp_path, monkeyp
     assert "public manifest runtime executed" in result["report"]["results"][0][
         "transcript"
     ].lower()
+
+
+def test_public_manifest_environment_registry_builds_and_runs(tmp_path, monkeypatch):
+    monkeypatch.setenv("SIMULATE_PUBLIC_ENV_REGISTRY_KEY", "real-local-env-key")
+    manifest = environment_registry_manifest()
+    manifest_path = tmp_path / "env-registry.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    supported = supported_manifest_environment_types()
+    environments = build_manifest_environments(
+        manifest["simulation"]["environments"],
+        base_dir=tmp_path,
+    )
+    result = asyncio.run(run_manifest_file(manifest_path))
+
+    assert {"tool_mock", "tool_fault_injection", "files", "world_contract", "framework_trace"} <= {
+        environment.name for environment in environments
+    }
+    assert {"tool_mock", "tool_fault_injection", "files", "world_contract", "framework_trace"} <= set(supported)
+    assert result["status"] == "passed"
+    assert result["exit_code"] == 0
+    metrics = result["summary"]["metric_averages"]
+    assert metrics["tool_fault_tolerance"] == 1.0
+    assert metrics["world_contract_quality"] == 1.0
+    assert metrics["framework_adapter_conformance"] == 1.0
+
+    case = result["report"]["results"][0]
+    state = case["metadata"]["environment_state"]
+    assert state["policy"]["decision"] == "refund_allowed"
+    assert state["files"]["paths"] == ["policy.md"]
+    assert state["world_contract"]["summary"]["terminal_status"] == "success"
+    assert state["framework_trace"]["adapter_conformance"]["passed"] is True
+
+    tool_events = [
+        event["payload"]
+        for event in case["events"]
+        if event["type"] == "tool_execution"
+        and event["payload"].get("tool") == "lookup_policy"
+    ]
+    assert [event["success"] for event in tool_events] == [False, True]
 
 
 def _write_manifest(path: Path, manifest: dict):

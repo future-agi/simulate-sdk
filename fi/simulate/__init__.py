@@ -148,6 +148,7 @@ from .manifest import (
     ManifestRunOptions,
     apply_manifest_env,
     build_manifest_agent_callback,
+    build_manifest_environments,
     build_manifest_optimization_problem,
     compare_result_files,
     compare_results,
@@ -177,6 +178,7 @@ from .manifest import (
     run_manifest_file,
     run_redteam_manifest,
     run_redteam_manifest_file,
+    supported_manifest_environment_types,
     validate_manifest_env,
 )
 
@@ -325,6 +327,7 @@ __all__ = [
     "ManifestRunOptions",
     "apply_manifest_env",
     "build_manifest_agent_callback",
+    "build_manifest_environments",
     "build_manifest_optimization_problem",
     "compare_result_files",
     "compare_results",
@@ -354,5 +357,6 @@ __all__ = [
     "run_manifest_file",
     "run_redteam_manifest",
     "run_redteam_manifest_file",
+    "supported_manifest_environment_types",
     "validate_manifest_env",
 ]
