@@ -273,6 +273,25 @@ and CI runs. It runs local text simulations, replay environments, red-team
 campaign gates, and local `ai-evaluation` agent-report gates, then writes
 stable JSON, JUnit, SARIF, and Markdown outputs for automation.
 
+Scaffold a runnable local CLI suite from a blank repo with `init`:
+
+```bash
+agent-simulate init [directory] \
+  --preset ci|run|redteam|optimize|all \
+  --name NAME \
+  --required-env KEY \
+  --output artifacts/init.json
+```
+
+The default preset is `ci`; it writes `manifests/run.json`,
+`manifests/redteam.json`, `artifacts/.gitkeep`, `regressions/.gitkeep`, and
+`README.md`. `--preset optimize` writes `manifests/optimize.json`;
+`--preset all` includes run, red-team, and optimize manifests. Generated run and
+red-team manifests are runnable with `agent-simulate replay manifests ...` after
+the required environment variable is set. `--force` overwrites existing scaffold
+files; without it, `init` refuses to overwrite. Use `--quiet` for quieter
+automation logs.
+
 ```bash
 export SIMULATE_CLI_EXAMPLE_KEY="your-real-ci-secret-or-local-test-key"
 
@@ -390,6 +409,12 @@ Manifests currently support:
 - `agent-simulate baseline` creates compact compare-safe baseline artifacts
 - `agent-simulate compare` gates baseline/current result artifacts by score
   delta, new findings, new error findings, and optional per-metric deltas
+- `agent-simulate init [directory] --preset ci|run|redteam|optimize|all --name NAME --required-env KEY --output artifacts/init.json`
+  scaffolds a runnable local CLI suite; the default `ci` preset writes
+  `manifests/run.json`, `manifests/redteam.json`, `artifacts/.gitkeep`,
+  `regressions/.gitkeep`, and `README.md`, `--preset optimize` writes
+  `manifests/optimize.json`, `--preset all` includes run/red-team/optimize,
+  `--force` overwrites existing scaffold files, and `--quiet` reduces logs
 - `agent-simulate promote-to-regression RESULT.json --manifest regressions/<name>.json --output artifacts/<name>-promotion.json`
   turns red-team/compare findings into runnable red-team regression manifests
 - `agent-simulate replay MANIFEST_OR_GLOB... --output artifacts/replay.json --junit artifacts/replay.junit.xml --sarif artifacts/replay.sarif.json --markdown artifacts/replay.md`

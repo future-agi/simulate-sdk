@@ -1071,6 +1071,89 @@ def test_cli_runner_replay_aggregates_failed_child_manifest(tmp_path):
     assert sarif["runs"][0]["results"][0]["ruleId"] == "replay_manifest_error"
 
 
+def test_cli_runner_init_scaffolds_runnable_ci_suite(tmp_path, monkeypatch):
+    suite_dir = tmp_path / "suite"
+    monkeypatch.setenv("SIMULATE_INIT_TEST_KEY", "real-local-init-key")
+
+    init_exit = main([
+        "init",
+        str(suite_dir),
+        "--name",
+        "futureagi-ci",
+        "--required-env",
+        "SIMULATE_INIT_TEST_KEY",
+        "--output",
+        "artifacts/init.json",
+    ])
+
+    assert init_exit == 0
+    init_payload = json.loads((suite_dir / "artifacts" / "init.json").read_text(encoding="utf-8"))
+    assert init_payload["kind"] == "agent-simulate.init.v1"
+    assert init_payload["summary"]["preset"] == "ci"
+    assert (suite_dir / "manifests" / "run.json").exists()
+    assert (suite_dir / "manifests" / "redteam.json").exists()
+    assert (suite_dir / "regressions" / ".gitkeep").exists()
+    assert (suite_dir / "README.md").exists()
+
+    replay_exit = main([
+        "replay",
+        str(suite_dir / "manifests"),
+        "--output",
+        str(suite_dir / "artifacts" / "replay.json"),
+        "--junit",
+        str(suite_dir / "artifacts" / "replay.junit.xml"),
+        "--sarif",
+        str(suite_dir / "artifacts" / "replay.sarif.json"),
+        "--markdown",
+        str(suite_dir / "artifacts" / "replay.md"),
+    ])
+
+    assert replay_exit == 0
+    replay = json.loads((suite_dir / "artifacts" / "replay.json").read_text(encoding="utf-8"))
+    assert replay["status"] == "passed"
+    assert replay["summary"]["manifest_count"] == 2
+    assert {item["command"] for item in replay["replay"]["manifests"]} == {"run", "redteam"}
+    assert "## Replay" in (suite_dir / "artifacts" / "replay.md").read_text(encoding="utf-8")
+
+
+def test_cli_runner_init_refuses_overwrite_without_force(tmp_path):
+    suite_dir = tmp_path / "suite"
+
+    assert main(["init", str(suite_dir), "--quiet"]) == 0
+    assert main(["init", str(suite_dir), "--quiet"]) == 2
+    assert main(["init", str(suite_dir), "--force", "--quiet"]) == 0
+
+
+def test_cli_runner_init_optimize_preset_writes_dry_run_valid_manifest(tmp_path, monkeypatch):
+    suite_dir = tmp_path / "opt-suite"
+    monkeypatch.setenv("SIMULATE_INIT_OPT_KEY", "real-local-init-opt-key")
+
+    init_exit = main([
+        "init",
+        str(suite_dir),
+        "--preset",
+        "optimize",
+        "--name",
+        "futureagi-opt",
+        "--required-env",
+        "SIMULATE_INIT_OPT_KEY",
+        "--quiet",
+    ])
+    dry_run_exit = main([
+        "optimize",
+        str(suite_dir / "manifests" / "optimize.json"),
+        "--dry-run",
+        "--output",
+        str(suite_dir / "artifacts" / "optimize-dry-run.json"),
+    ])
+
+    assert init_exit == 0
+    assert dry_run_exit == 0
+    payload = json.loads((suite_dir / "artifacts" / "optimize-dry-run.json").read_text(encoding="utf-8"))
+    assert payload["dry_run"] is True
+    assert payload["summary"]["search_path_count"] == 2
+
+
 def test_cli_runner_optimizes_manifest_search_paths_and_writes_outputs(tmp_path, monkeypatch):
     pytest.importorskip("fi.opt")
     monkeypatch.setenv("SIMULATE_CLI_OPT_TEST_KEY", "real-local-opt-key")
