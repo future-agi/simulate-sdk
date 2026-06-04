@@ -1,0 +1,39 @@
+{
+  "version": "agent-simulate.eval.v1",
+  "name": "local-eval-suite",
+  "providers": [
+    {
+      "id": "echo",
+      "type": "echo"
+    },
+    {
+      "id": "scripted-support-agent",
+      "type": "scripted",
+      "response": "Policy answer: {{question}} is covered by the refund policy. No secrets are exposed."
+    }
+  ],
+  "prompts": [
+    {
+      "id": "support-policy-question",
+      "template": "{{question}}"
+    }
+  ],
+  "tests": [
+    {
+      "id": "policy-grounding",
+      "vars": {
+        "question": "Where is the refund policy?"
+      },
+      "assert": [
+        {
+          "type": "contains",
+          "value": "policy"
+        },
+        {
+          "type": "not_contains",
+          "value": "private credentials"
+        }
+      ]
+    }
+  ]
+}

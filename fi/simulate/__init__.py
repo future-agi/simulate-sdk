@@ -182,6 +182,13 @@ from .manifest import (
     supported_manifest_environment_types,
     validate_manifest_env,
 )
+from .suite import (
+    EVAL_SUITE_SCHEMA_VERSION,
+    EvalSuiteOptions,
+    load_eval_suite_file,
+    run_eval_suite,
+    run_eval_suite_file,
+)
 
 __all__ = [
     "AgentDefinition",
@@ -326,6 +333,8 @@ __all__ = [
     "ManifestError",
     "ManifestOptimizationOptions",
     "ManifestRunOptions",
+    "EVAL_SUITE_SCHEMA_VERSION",
+    "EvalSuiteOptions",
     "apply_manifest_env",
     "build_manifest_agent_callback",
     "build_manifest_environments",
@@ -338,6 +347,7 @@ __all__ = [
     "evaluate_manifest_report",
     "load_manifest",
     "load_manifest_file",
+    "load_eval_suite_file",
     "missing_manifest_env",
     "optimize_manifest",
     "optimize_manifest_file",
@@ -354,6 +364,8 @@ __all__ = [
     "render_report_file",
     "render_sarif",
     "replay_manifests",
+    "run_eval_suite",
+    "run_eval_suite_file",
     "run_local_text_manifest",
     "run_manifest",
     "run_manifest_file",

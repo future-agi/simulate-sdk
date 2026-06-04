@@ -46,6 +46,11 @@ from fi.simulate.manifest import (
     redteam_manifest as redteam_manifest_runtime,
     run_manifest as run_manifest_runtime,
 )
+from fi.simulate.suite import (
+    EvalSuiteOptions,
+    load_eval_suite_file,
+    run_eval_suite,
+)
 
 
 REDTEAM_ENV_TYPES = frozenset(
@@ -185,7 +190,7 @@ MANIFEST_ENVIRONMENT_TYPES = frozenset(
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
-    if args.command in {"run", "redteam", "optimize", "compare", "baseline", "report", "promote-to-regression", "replay", "init"}:
+    if args.command in {"run", "redteam", "eval", "optimize", "compare", "baseline", "report", "promote-to-regression", "replay", "init"}:
         try:
             if args.command == "init":
                 result = init_scaffold_command(args)
@@ -193,6 +198,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 result = asyncio.run(run_manifest_command(args))
             elif args.command == "redteam":
                 result = asyncio.run(redteam_manifest_command(args))
+            elif args.command == "eval":
+                result = eval_suite_command(args)
             elif args.command == "compare":
                 result = compare_results_command(args)
             elif args.command == "baseline":
@@ -235,6 +242,21 @@ def optimize_manifest_command(args: argparse.Namespace) -> Dict[str, Any]:
         ),
     )
     return _write_outputs(payload, manifest, args, manifest_path)
+
+
+def eval_suite_command(args: argparse.Namespace) -> Dict[str, Any]:
+    suite_path = Path(args.suite).expanduser().resolve()
+    suite = load_eval_suite_file(suite_path)
+    result = run_eval_suite(
+        suite,
+        suite_path=suite_path,
+        options=EvalSuiteOptions(
+            name=args.name,
+            threshold=args.threshold,
+            dry_run=bool(args.dry_run),
+        ),
+    )
+    return _write_outputs(result, suite, args, suite_path)
 
 
 def init_scaffold_command(args: argparse.Namespace) -> Dict[str, Any]:
@@ -4187,6 +4209,16 @@ def _build_parser() -> argparse.ArgumentParser:
     redteam.add_argument("--name", default=None, help="Override the red-team run name.")
     redteam.add_argument("--dry-run", action="store_true", help="Validate manifest/env without executing.")
     redteam.add_argument("--quiet", action="store_true", help="Do not print JSON summary when no output path is configured.")
+    eval_cmd = subparsers.add_parser("eval", help="Run a promptfoo-style local eval suite.")
+    eval_cmd.add_argument("suite", help="Path to a JSON/YAML eval suite.")
+    eval_cmd.add_argument("-o", "--output", action="append", default=[], help="Write JSON output to this path. .xml paths are treated as JUnit; .sarif paths as SARIF.")
+    eval_cmd.add_argument("--junit", action="append", default=[], help="Write compact JUnit XML output.")
+    eval_cmd.add_argument("--sarif", action="append", default=[], help="Write SARIF 2.1.0 findings output.")
+    eval_cmd.add_argument("--markdown", action="append", default=[], help="Write Markdown report output.")
+    eval_cmd.add_argument("--threshold", type=float, default=None, help="Override suite threshold.")
+    eval_cmd.add_argument("--name", default=None, help="Override the suite run name.")
+    eval_cmd.add_argument("--dry-run", action="store_true", help="Validate suite shape without executing providers.")
+    eval_cmd.add_argument("--quiet", action="store_true", help="Do not print JSON summary when no output path is configured.")
     compare = subparsers.add_parser("compare", help="Compare a current CLI result against a baseline result.")
     compare.add_argument("baseline", help="Path to the baseline JSON result.")
     compare.add_argument("current", help="Path to the current JSON result.")
