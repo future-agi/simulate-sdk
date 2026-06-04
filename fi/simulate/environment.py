@@ -9214,6 +9214,722 @@ class OptimizerTraceEnvironment(EnvironmentAdapter):
         return copy.deepcopy(self.trace)
 
 
+class OptimizerPortfolioEnvironment(EnvironmentAdapter):
+    """
+    Replay a multi-interaction optimizer backend portfolio as simulation evidence.
+
+    This covers the outer allocator layer: backend plan, backend runs, candidate
+    lineage, ablation dependency, consensus, and search-path coverage.
+    """
+
+    name = "optimizer_portfolio"
+
+    def __init__(
+        self,
+        portfolio: Optional[Mapping[str, Any]] = None,
+        *,
+        name: str = "optimizer-backend-portfolio",
+        selected_optimizer: Optional[str] = None,
+        final_score: Optional[float] = None,
+        improved: Optional[bool] = None,
+        feedback_source: Optional[str] = None,
+        rollback_decision: Optional[Mapping[str, Any]] = None,
+        feedback_cases: Optional[Iterable[Mapping[str, Any]]] = None,
+        diagnoses: Optional[Iterable[Mapping[str, Any]]] = None,
+        search_paths: Optional[Iterable[str]] = None,
+        backend_plan: Optional[Iterable[Mapping[str, Any]]] = None,
+        backend_runs: Optional[Iterable[Mapping[str, Any]]] = None,
+        backend_lineage: Optional[Iterable[Mapping[str, Any]]] = None,
+        ablation_report: Optional[Mapping[str, Any]] = None,
+        required_evidence: Optional[Iterable[str]] = None,
+        required_signals: Optional[Iterable[str]] = None,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        self.initial_portfolio = normalize_optimizer_backend_portfolio(
+            portfolio,
+            name=name,
+            selected_optimizer=selected_optimizer,
+            final_score=final_score,
+            improved=improved,
+            feedback_source=feedback_source,
+            rollback_decision=rollback_decision,
+            feedback_cases=feedback_cases,
+            diagnoses=diagnoses,
+            search_paths=search_paths,
+            backend_plan=backend_plan,
+            backend_runs=backend_runs,
+            backend_lineage=backend_lineage,
+            ablation_report=ablation_report,
+            required_evidence=required_evidence,
+            required_signals=required_signals,
+            metadata=metadata,
+        )
+        self.portfolio: Dict[str, Any] = {}
+
+    def reset(self, **context: Any) -> EnvironmentSnapshot:
+        self.portfolio = copy.deepcopy(self.initial_portfolio)
+        events = [
+            SimulationEvent(
+                type="optimizer_portfolio",
+                name="optimizer_portfolio_ready",
+                payload={
+                    "name": self.portfolio.get("name"),
+                    "selected_optimizer": self.portfolio.get("selected_optimizer"),
+                    "signals": copy.deepcopy(self.portfolio.get("signals", [])),
+                    "summary": copy.deepcopy(self.portfolio.get("summary", {})),
+                },
+            )
+        ]
+        for run in self.portfolio.get("backend_runs", []):
+            optimizer = str(run.get("optimizer") or "backend")
+            events.append(
+                SimulationEvent(
+                    type="optimizer_backend_run",
+                    name=f"{optimizer}_{str(run.get('status') or 'run')}",
+                    payload=copy.deepcopy(dict(run)),
+                    metadata={"kind": "optimizer_backend_portfolio", "optimizer": optimizer},
+                )
+            )
+        if self.portfolio.get("ablation_report"):
+            events.append(
+                SimulationEvent(
+                    type="optimizer_ablation",
+                    name="optimizer_ablation_ready",
+                    payload=copy.deepcopy(dict(self.portfolio.get("ablation_report") or {})),
+                    metadata={"kind": "optimizer_backend_portfolio"},
+                )
+            )
+        return EnvironmentSnapshot(
+            tools=self._tool_specs(),
+            artifacts=[self._trace_artifact()],
+            events=events,
+            state={"optimizer_backend_portfolio": self._trace_payload()},
+            metadata={
+                "optimizer_backend_portfolio": {
+                    "name": self.portfolio.get("name"),
+                    "selected_optimizer": self.portfolio.get("selected_optimizer"),
+                    "signals": copy.deepcopy(self.portfolio.get("signals", [])),
+                    "summary": copy.deepcopy(self.portfolio.get("summary", {})),
+                }
+            },
+        )
+
+    def handle_tool_call(
+        self,
+        tool_call: Mapping[str, Any],
+        **context: Any,
+    ) -> Optional[ToolExecutionResult]:
+        name = _tool_name(tool_call)
+        if name not in {
+            "optimizer_portfolio_status",
+            "list_optimizer_backends",
+            "inspect_optimizer_backend",
+            "inspect_optimizer_ablation",
+            "list_optimizer_portfolio_gaps",
+        }:
+            return None
+        arguments = _tool_arguments(tool_call)
+        call_id = _tool_call_id(tool_call)
+
+        if name == "optimizer_portfolio_status":
+            result = self._trace_payload()
+            event_name = "optimizer_portfolio_status"
+            content = "Optimizer backend portfolio status recorded."
+            success = True
+            error = None
+        elif name == "list_optimizer_backends":
+            status = _normalize_optimizer_portfolio_key(arguments.get("status") or "")
+            relation = _normalize_optimizer_portfolio_key(arguments.get("relation") or arguments.get("selection_relation") or "")
+            backends = self._backend_records()
+            if status:
+                backends = [
+                    item
+                    for item in backends
+                    if _normalize_optimizer_portfolio_key(item.get("run", {}).get("status")) == status
+                    or _normalize_optimizer_portfolio_key(item.get("lineage", {}).get("status")) == status
+                ]
+            if relation:
+                backends = [
+                    item
+                    for item in backends
+                    if _normalize_optimizer_portfolio_key(item.get("lineage", {}).get("selection_relation")) == relation
+                ]
+            result = {
+                "name": self.portfolio.get("name"),
+                "backends": backends,
+                "count": len(backends),
+                "query": {"status": status, "relation": relation},
+            }
+            event_name = "optimizer_backends_listed"
+            content = f"Listed {len(backends)} optimizer backend(s)."
+            success = True
+            error = None
+        elif name == "inspect_optimizer_backend":
+            optimizer = _normalize_optimizer_portfolio_key(arguments.get("optimizer") or arguments.get("name") or "")
+            record = next(
+                (
+                    item
+                    for item in self._backend_records()
+                    if _normalize_optimizer_portfolio_key(item.get("optimizer")) == optimizer
+                ),
+                None,
+            )
+            success = record is not None
+            result = {
+                "name": self.portfolio.get("name"),
+                "backend": copy.deepcopy(record),
+                "query": optimizer,
+            }
+            event_name = "optimizer_backend_inspected" if success else "optimizer_backend_missing"
+            content = f"Inspected optimizer backend {optimizer}." if success else f"Optimizer backend not found: {optimizer}"
+            error = None if success else "backend_not_found"
+        elif name == "inspect_optimizer_ablation":
+            ablation = copy.deepcopy(dict(self.portfolio.get("ablation_report") or {}))
+            result = {
+                "name": self.portfolio.get("name"),
+                "ablation_report": ablation,
+            }
+            event_name = "optimizer_ablation_inspected"
+            content = "Inspected optimizer portfolio ablation report."
+            success = True
+            error = None
+        else:
+            summary = copy.deepcopy(dict(self.portfolio.get("summary") or {}))
+            result = {
+                "name": self.portfolio.get("name"),
+                "blocking_gaps": copy.deepcopy(summary.get("blocking_gaps", [])),
+                "failed_backends": copy.deepcopy(summary.get("failed_backends", [])),
+                "missing_required_evidence": copy.deepcopy(summary.get("missing_required_evidence", [])),
+                "missing_required_signals": copy.deepcopy(summary.get("missing_required_signals", [])),
+            }
+            event_name = "optimizer_portfolio_gaps_listed"
+            content = f"Listed {len(result['blocking_gaps'])} optimizer portfolio gap(s)."
+            success = True
+            error = None
+
+        return ToolExecutionResult(
+            tool_call_id=call_id,
+            tool_name=name,
+            content=content,
+            result=result,
+            success=success,
+            error=error,
+            state_updates={"optimizer_backend_portfolio": self._trace_payload()},
+            artifacts=[self._trace_artifact()],
+            events=[
+                SimulationEvent(
+                    type="optimizer_portfolio",
+                    name=event_name,
+                    payload=result,
+                    metadata={"kind": "optimizer_backend_portfolio"},
+                )
+            ],
+        )
+
+    def _tool_specs(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                "name": "optimizer_portfolio_status",
+                "description": "Return normalized optimizer backend portfolio plan, runs, lineage, ablation, signals, and summary.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            {
+                "name": "list_optimizer_backends",
+                "description": "List allocated optimizer backends, optionally filtered by run status or selection relation.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "status": {"type": "string"},
+                        "relation": {"type": "string"},
+                    },
+                },
+            },
+            {
+                "name": "inspect_optimizer_backend",
+                "description": "Inspect one backend's allocation, run, and lineage records.",
+                "parameters": {"type": "object", "properties": {"optimizer": {"type": "string"}}},
+            },
+            {
+                "name": "inspect_optimizer_ablation",
+                "description": "Inspect whether the selected backend was uniquely required or backed by portfolio consensus.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            {
+                "name": "list_optimizer_portfolio_gaps",
+                "description": "List missing evidence, missing signals, failed backends, and blocking portfolio gaps.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        ]
+
+    def _backend_records(self) -> List[Dict[str, Any]]:
+        plans = {
+            _normalize_optimizer_portfolio_key(item.get("optimizer")): copy.deepcopy(dict(item))
+            for item in self.portfolio.get("backend_plan", [])
+            if _normalize_optimizer_portfolio_key(item.get("optimizer"))
+        }
+        runs = {
+            _normalize_optimizer_portfolio_key(item.get("optimizer")): copy.deepcopy(dict(item))
+            for item in self.portfolio.get("backend_runs", [])
+            if _normalize_optimizer_portfolio_key(item.get("optimizer"))
+        }
+        lineage = {
+            _normalize_optimizer_portfolio_key(item.get("optimizer")): copy.deepcopy(dict(item))
+            for item in self.portfolio.get("backend_lineage", [])
+            if _normalize_optimizer_portfolio_key(item.get("optimizer"))
+        }
+        keys = sorted(set(plans) | set(runs) | set(lineage))
+        return [
+            {
+                "optimizer": key,
+                "plan": plans.get(key, {}),
+                "run": runs.get(key, {}),
+                "lineage": lineage.get(key, {}),
+            }
+            for key in keys
+        ]
+
+    def _trace_artifact(self) -> SimulationArtifact:
+        return SimulationArtifact(
+            type="trace",
+            role="environment",
+            data=self._trace_payload(),
+            metadata={
+                "kind": "optimizer_backend_portfolio",
+                "selected_optimizer": self.portfolio.get("selected_optimizer"),
+            },
+        )
+
+    def _trace_payload(self) -> Dict[str, Any]:
+        return copy.deepcopy(self.portfolio)
+
+
+def load_optimizer_backend_portfolio(
+    source: str | os.PathLike[str] | Mapping[str, Any],
+    *,
+    headers: Optional[Mapping[str, str]] = None,
+    auth: Optional[Mapping[str, Any]] = None,
+    pagination: Optional[Mapping[str, Any]] = None,
+    max_pages: int = 20,
+    timeout: float = 30.0,
+    metadata: Optional[Mapping[str, Any]] = None,
+    **kwargs: Any,
+) -> OptimizerPortfolioEnvironment:
+    """Load a local/HTTP optimizer backend portfolio manifest and return an environment."""
+
+    source_metadata: Dict[str, Any] = {}
+    if isinstance(source, (str, os.PathLike)) or _is_export_source_spec(source):
+        loaded, source_metadata = _load_framework_trace_export_source_with_metadata(
+            source,
+            headers=headers,
+            auth=auth,
+            pagination=pagination,
+            max_pages=max_pages,
+            timeout=timeout,
+        )
+    else:
+        loaded = source
+    if not isinstance(loaded, Mapping):
+        raise TypeError("Optimizer backend portfolio export must be a mapping")
+    return OptimizerPortfolioEnvironment(
+        loaded,
+        metadata={**source_metadata, **dict(metadata or {})},
+        **kwargs,
+    )
+
+
+def normalize_optimizer_backend_portfolio(
+    portfolio: Optional[Mapping[str, Any]] = None,
+    *,
+    name: str = "optimizer-backend-portfolio",
+    selected_optimizer: Optional[str] = None,
+    final_score: Optional[float] = None,
+    improved: Optional[bool] = None,
+    feedback_source: Optional[str] = None,
+    rollback_decision: Optional[Mapping[str, Any]] = None,
+    feedback_cases: Optional[Iterable[Mapping[str, Any]]] = None,
+    diagnoses: Optional[Iterable[Mapping[str, Any]]] = None,
+    search_paths: Optional[Iterable[str]] = None,
+    backend_plan: Optional[Iterable[Mapping[str, Any]]] = None,
+    backend_runs: Optional[Iterable[Mapping[str, Any]]] = None,
+    backend_lineage: Optional[Iterable[Mapping[str, Any]]] = None,
+    ablation_report: Optional[Mapping[str, Any]] = None,
+    required_evidence: Optional[Iterable[str]] = None,
+    required_signals: Optional[Iterable[str]] = None,
+    metadata: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Normalize AgentMultiInteractionOptimizer results into a portable portfolio manifest."""
+
+    source = _coerce_plain_dict(portfolio or {})
+    normalized_name = str(source.get("name") or name)
+    normalized_feedback_cases = _optimizer_portfolio_records(
+        feedback_cases if feedback_cases is not None else source.get("feedback_cases") or []
+    )
+    normalized_diagnoses = _optimizer_portfolio_records(
+        diagnoses if diagnoses is not None else source.get("diagnoses") or source.get("diagnostics") or []
+    )
+    normalized_search_paths = sorted(
+        {
+            str(path)
+            for path in _as_iterable(search_paths if search_paths is not None else source.get("search_paths") or [])
+            if str(path)
+        }
+    )
+    normalized_plan = _optimizer_portfolio_records(
+        backend_plan if backend_plan is not None else source.get("backend_plan") or []
+    )
+    normalized_runs = _optimizer_portfolio_records(
+        backend_runs if backend_runs is not None else source.get("backend_runs") or []
+    )
+    normalized_lineage = _optimizer_portfolio_records(
+        backend_lineage if backend_lineage is not None else source.get("backend_lineage") or []
+    )
+    normalized_ablation = _coerce_plain_dict(
+        ablation_report if ablation_report is not None else source.get("ablation_report") or {}
+    )
+    normalized_rollback = _coerce_plain_dict(
+        rollback_decision if rollback_decision is not None else source.get("rollback_decision") or {}
+    )
+    normalized_selected = _optimizer_portfolio_display_key(
+        selected_optimizer
+        or source.get("selected_optimizer")
+        or normalized_ablation.get("selected_optimizer")
+        or ""
+    )
+    normalized_final_score = (
+        _optional_float(final_score)
+        if final_score is not None
+        else _optional_float(source.get("final_score"))
+    )
+    if normalized_final_score is None:
+        scores = [
+            score
+            for score in (_optional_float(item.get("final_score")) for item in normalized_runs)
+            if score is not None
+        ]
+        normalized_final_score = max(scores) if scores else None
+    if improved is not None:
+        normalized_improved = bool(improved)
+    elif "improved" in source:
+        normalized_improved = bool(source.get("improved"))
+    else:
+        normalized_improved = any(bool(item.get("improved")) for item in normalized_runs)
+    normalized_feedback_source = str(feedback_source or source.get("feedback_source") or "")
+    required_evidence_keys = sorted(
+        {
+            _normalize_optimizer_portfolio_key(key)
+            for key in _as_iterable(required_evidence if required_evidence is not None else source.get("required_evidence") or [])
+            if _normalize_optimizer_portfolio_key(key)
+        }
+    )
+    required_signal_keys = sorted(
+        {
+            _normalize_optimizer_portfolio_key(key)
+            for key in _as_iterable(required_signals if required_signals is not None else source.get("required_signals") or [])
+            if _normalize_optimizer_portfolio_key(key)
+        }
+    )
+    signals = _optimizer_portfolio_signals(
+        selected_optimizer=normalized_selected,
+        feedback_cases=normalized_feedback_cases,
+        diagnoses=normalized_diagnoses,
+        search_paths=normalized_search_paths,
+        backend_plan=normalized_plan,
+        backend_runs=normalized_runs,
+        backend_lineage=normalized_lineage,
+        ablation_report=normalized_ablation,
+        rollback_decision=normalized_rollback,
+        final_score=normalized_final_score,
+        improved=normalized_improved,
+    )
+    summary = _optimizer_portfolio_summary(
+        selected_optimizer=normalized_selected,
+        final_score=normalized_final_score,
+        improved=normalized_improved,
+        feedback_cases=normalized_feedback_cases,
+        diagnoses=normalized_diagnoses,
+        search_paths=normalized_search_paths,
+        backend_plan=normalized_plan,
+        backend_runs=normalized_runs,
+        backend_lineage=normalized_lineage,
+        ablation_report=normalized_ablation,
+        rollback_decision=normalized_rollback,
+        required_evidence=required_evidence_keys,
+        required_signals=required_signal_keys,
+        signals=signals,
+    )
+    return {
+        "kind": "optimizer_backend_portfolio",
+        "name": normalized_name,
+        "selected_optimizer": normalized_selected or None,
+        "final_score": normalized_final_score,
+        "improved": normalized_improved,
+        "feedback_source": normalized_feedback_source or None,
+        "rollback_decision": normalized_rollback,
+        "feedback_cases": normalized_feedback_cases,
+        "diagnoses": normalized_diagnoses,
+        "search_paths": normalized_search_paths,
+        "backend_plan": normalized_plan,
+        "backend_runs": normalized_runs,
+        "backend_lineage": normalized_lineage,
+        "ablation_report": normalized_ablation,
+        "required_evidence": required_evidence_keys,
+        "required_signals": required_signal_keys,
+        "signals": sorted(signals),
+        "summary": summary,
+        "metadata": {
+            **copy.deepcopy(dict(source.get("metadata") or {})),
+            **copy.deepcopy(dict(metadata or {})),
+        },
+    }
+
+
+def _optimizer_portfolio_records(values: Iterable[Any]) -> List[Dict[str, Any]]:
+    records: List[Dict[str, Any]] = []
+    for value in _as_iterable(values):
+        item = _coerce_plain_dict(value)
+        if not item:
+            continue
+        if item.get("optimizer"):
+            item["optimizer"] = _optimizer_portfolio_display_key(item.get("optimizer"))
+        if item.get("status"):
+            item["status"] = _normalize_optimizer_portfolio_key(item.get("status"))
+        if item.get("selection_relation"):
+            item["selection_relation"] = _normalize_optimizer_portfolio_key(item.get("selection_relation"))
+        for path_key in ("patch_paths", "unique_patch_paths", "shared_patch_paths", "search_paths"):
+            if path_key in item:
+                item[path_key] = sorted({str(path) for path in _as_iterable(item.get(path_key)) if str(path)})
+        records.append(item)
+    return records
+
+
+def _optimizer_portfolio_signals(
+    *,
+    selected_optimizer: str,
+    feedback_cases: Sequence[Mapping[str, Any]],
+    diagnoses: Sequence[Mapping[str, Any]],
+    search_paths: Sequence[str],
+    backend_plan: Sequence[Mapping[str, Any]],
+    backend_runs: Sequence[Mapping[str, Any]],
+    backend_lineage: Sequence[Mapping[str, Any]],
+    ablation_report: Mapping[str, Any],
+    rollback_decision: Mapping[str, Any],
+    final_score: Optional[float],
+    improved: bool,
+) -> set[str]:
+    signals = {"optimizer_portfolio", "backend_portfolio", "optimizer_backend_portfolio"}
+    if selected_optimizer:
+        signals.update({"selected_optimizer", _normalize_optimizer_portfolio_key(selected_optimizer)})
+    if feedback_cases:
+        signals.add("feedback")
+    if diagnoses:
+        signals.add("diagnostic")
+    if search_paths:
+        signals.add("search_path")
+    if backend_plan:
+        signals.add("backend_plan")
+    if backend_runs:
+        signals.add("backend_run")
+    if backend_lineage:
+        signals.add("backend_lineage")
+    if ablation_report:
+        signals.add("ablation")
+    if rollback_decision:
+        signals.add("rollback_decision")
+    if final_score is not None:
+        signals.add("score")
+    if improved:
+        signals.add("improvement")
+    for item in [*backend_plan, *backend_runs, *backend_lineage]:
+        optimizer = _normalize_optimizer_portfolio_key(item.get("optimizer"))
+        if optimizer:
+            signals.add(optimizer)
+        status = _normalize_optimizer_portfolio_key(item.get("status"))
+        if status:
+            signals.add(status)
+        relation = _normalize_optimizer_portfolio_key(item.get("selection_relation"))
+        if relation:
+            signals.add("selected_relation")
+            signals.add(relation)
+        allocation_kind = _normalize_optimizer_portfolio_key(
+            item.get("allocation_kind") or _coerce_plain_dict(item.get("metadata")).get("allocation_kind")
+        )
+        if allocation_kind:
+            signals.add(allocation_kind)
+    consensus = [
+        _normalize_optimizer_portfolio_key(item)
+        for item in _as_iterable(ablation_report.get("consensus_backends"))
+        if _normalize_optimizer_portfolio_key(item)
+    ]
+    if consensus:
+        signals.add("consensus")
+        signals.update(consensus)
+    dependency = _normalize_optimizer_portfolio_key(ablation_report.get("dependency"))
+    if dependency:
+        signals.add(dependency)
+    return signals
+
+
+def _optimizer_portfolio_summary(
+    *,
+    selected_optimizer: str,
+    final_score: Optional[float],
+    improved: bool,
+    feedback_cases: Sequence[Mapping[str, Any]],
+    diagnoses: Sequence[Mapping[str, Any]],
+    search_paths: Sequence[str],
+    backend_plan: Sequence[Mapping[str, Any]],
+    backend_runs: Sequence[Mapping[str, Any]],
+    backend_lineage: Sequence[Mapping[str, Any]],
+    ablation_report: Mapping[str, Any],
+    rollback_decision: Mapping[str, Any],
+    required_evidence: Sequence[str],
+    required_signals: Sequence[str],
+    signals: set[str],
+) -> Dict[str, Any]:
+    planned = sorted({_normalize_optimizer_portfolio_key(item.get("optimizer")) for item in backend_plan if _normalize_optimizer_portfolio_key(item.get("optimizer"))})
+    completed = sorted(
+        {
+            _normalize_optimizer_portfolio_key(item.get("optimizer"))
+            for item in backend_runs
+            if _normalize_optimizer_portfolio_key(item.get("status")) in {"completed", "success", "succeeded"}
+            and _normalize_optimizer_portfolio_key(item.get("optimizer"))
+        }
+    )
+    failed = sorted(
+        {
+            _normalize_optimizer_portfolio_key(item.get("optimizer"))
+            for item in backend_runs
+            if (
+                _normalize_optimizer_portfolio_key(item.get("status")) in {"failed", "error"}
+                or item.get("failure")
+            )
+            and _normalize_optimizer_portfolio_key(item.get("optimizer"))
+        }
+    )
+    lineage_backends = sorted({_normalize_optimizer_portfolio_key(item.get("optimizer")) for item in backend_lineage if _normalize_optimizer_portfolio_key(item.get("optimizer"))})
+    selected_key = _normalize_optimizer_portfolio_key(selected_optimizer)
+    selected_lineage = [
+        item
+        for item in backend_lineage
+        if _normalize_optimizer_portfolio_key(item.get("optimizer")) == selected_key
+        or _normalize_optimizer_portfolio_key(item.get("selection_relation")) == "selected"
+    ]
+    consensus = sorted(
+        {
+            _normalize_optimizer_portfolio_key(item)
+            for item in _as_iterable(ablation_report.get("consensus_backends"))
+            if _normalize_optimizer_portfolio_key(item)
+        }
+    )
+    selection_relations = sorted(
+        {
+            _normalize_optimizer_portfolio_key(item.get("selection_relation"))
+            for item in backend_lineage
+            if _normalize_optimizer_portfolio_key(item.get("selection_relation"))
+        }
+    )
+    allocation_kinds = sorted(
+        {
+            _normalize_optimizer_portfolio_key(item.get("allocation_kind") or _coerce_plain_dict(item.get("metadata")).get("allocation_kind"))
+            for item in backend_plan
+            if _normalize_optimizer_portfolio_key(item.get("allocation_kind") or _coerce_plain_dict(item.get("metadata")).get("allocation_kind"))
+        }
+    )
+    observed_evidence = {
+        "optimizer_portfolio",
+        "backend_portfolio",
+        "optimizer_backend_portfolio",
+        *(signal for signal in signals if signal),
+    }
+    missing_evidence = sorted(set(required_evidence) - observed_evidence)
+    missing_signals = sorted(set(required_signals) - signals)
+    gaps: List[str] = []
+    if not selected_key:
+        gaps.append("selected_optimizer_missing")
+    if not backend_plan:
+        gaps.append("backend_plan_missing")
+    if not backend_runs:
+        gaps.append("backend_runs_missing")
+    if not backend_lineage:
+        gaps.append("backend_lineage_missing")
+    if not completed:
+        gaps.append("completed_backend_missing")
+    if not ablation_report:
+        gaps.append("ablation_report_missing")
+    if not selected_lineage:
+        gaps.append("selected_lineage_missing")
+    if not consensus:
+        gaps.append("consensus_missing")
+    if not feedback_cases:
+        gaps.append("feedback_missing")
+    if not diagnoses:
+        gaps.append("diagnostics_missing")
+    if not search_paths:
+        gaps.append("search_paths_missing")
+    if failed:
+        gaps.append("failed_backend_present")
+    if missing_evidence:
+        gaps.append("required_evidence_missing")
+    if missing_signals:
+        gaps.append("required_signal_missing")
+    return {
+        "selected_optimizer": selected_key or None,
+        "selected_candidate_id": ablation_report.get("selected_candidate_id") or None,
+        "dependency": _normalize_optimizer_portfolio_key(ablation_report.get("dependency")) or None,
+        "selected_backend_required": bool(ablation_report.get("selected_backend_required", False)),
+        "final_score": final_score,
+        "best_without_selected_score": _optional_float(ablation_report.get("best_without_selected_score")),
+        "score_delta_without_selected": _optional_float(ablation_report.get("score_delta_without_selected")),
+        "backend_plan_count": len(backend_plan),
+        "backend_run_count": len(backend_runs),
+        "completed_backend_count": len(completed),
+        "failed_backend_count": len(failed),
+        "lineage_count": len(backend_lineage),
+        "selected_lineage_count": len(selected_lineage),
+        "improved_backend_count": sum(1 for item in backend_runs if bool(item.get("improved"))),
+        "consensus_backend_count": len(consensus),
+        "feedback_case_count": len(feedback_cases),
+        "diagnostic_count": len(diagnoses),
+        "search_path_count": len(search_paths),
+        "unique_optimizer_count": len(set(planned) | set(completed) | set(lineage_backends)),
+        "planned_backends": planned,
+        "completed_backends": completed,
+        "failed_backends": failed,
+        "lineage_backends": lineage_backends,
+        "consensus_backends": consensus,
+        "search_paths": sorted(str(path) for path in search_paths),
+        "selection_relations": selection_relations,
+        "allocation_kinds": allocation_kinds,
+        "has_selected_optimizer": bool(selected_key),
+        "has_backend_plan": bool(backend_plan),
+        "has_backend_runs": bool(backend_runs),
+        "has_backend_lineage": bool(backend_lineage),
+        "has_completed_backend": bool(completed),
+        "has_ablation": bool(ablation_report),
+        "has_consensus": bool(consensus),
+        "has_selected_relation": bool(selected_lineage),
+        "has_diagnostics": bool(diagnoses),
+        "has_feedback": bool(feedback_cases),
+        "has_search_paths": bool(search_paths),
+        "has_improvement": bool(improved),
+        "has_rollback_decision": bool(rollback_decision),
+        "has_failure_evidence": bool(failed),
+        "observed_evidence": sorted(observed_evidence),
+        "observed_signals": sorted(signals),
+        "missing_required_evidence": missing_evidence,
+        "missing_required_signals": missing_signals,
+        "blocking_gaps": gaps,
+    }
+
+
+def _optimizer_portfolio_display_key(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _normalize_optimizer_portfolio_key(value: Any) -> str:
+    return str(value or "").strip().lower().replace("-", "_").replace(" ", "_").replace(".", "_")
+
+
 def normalize_optimizer_society_trace(
     trace: Optional[Mapping[str, Any]] = None,
     *,

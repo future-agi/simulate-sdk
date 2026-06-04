@@ -27,6 +27,7 @@ from fi.simulate import (
     ImageEnvironment,
     MultiAgentRoomEnvironment,
     ObservabilityReplayEnvironment,
+    OptimizerPortfolioEnvironment,
     OptimizerTraceEnvironment,
     OrchestrationTraceEnvironment,
     RetrievalMemoryEnvironment,
@@ -66,6 +67,7 @@ from fi.simulate import (
     load_langgraph_event_stream,
     load_mcp_tool_session_export,
     load_observability_replay_pack,
+    load_optimizer_backend_portfolio,
     normalize_orchestration_trace_export,
     normalize_streaming_trace_export,
     normalize_adversarial_attack_pack,
@@ -82,6 +84,7 @@ from fi.simulate import (
     normalize_framework_trace_events,
     normalize_framework_adapter_conformance,
     normalize_observability_replay_pack,
+    normalize_optimizer_backend_portfolio,
     normalize_optimizer_society_trace,
     normalize_framework_trace_export,
     normalize_mcp_tool_session_export,
@@ -3857,6 +3860,262 @@ async def test_optimizer_trace_environment_emits_society_trace_and_scores_qualit
     metrics = evaluation.summary["metric_averages"]
     assert metrics["optimizer_trace_coverage"] == 1.0
     assert metrics["optimizer_trace_quality"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_optimizer_portfolio_environment_replays_backend_lineage_and_scores_quality():
+    portfolio = normalize_optimizer_backend_portfolio(
+        name="multi-interaction-backend-portfolio",
+        selected_optimizer="society",
+        final_score=1.0,
+        improved=True,
+        feedback_source="futureagi",
+        rollback_decision={"rollback_required": False, "reason": "portfolio consensus accepted"},
+        feedback_cases=[
+            {
+                "id": "case_multi_agent_memory",
+                "metrics": [
+                    {"name": "multi_agent_coordination_quality", "score": 0.3},
+                    {"name": "agent_memory_lineage_quality", "score": 0.2},
+                ],
+            }
+        ],
+        diagnoses=[
+            {"component": "multi_agent", "failure_mode": "coordination_failure"},
+            {"component": "memory", "failure_mode": "memory_contamination"},
+        ],
+        search_paths=[
+            "multi_agent.handoff.contract",
+            "memory.shared_case_summary",
+            "policy.reconciliation.mode",
+        ],
+        backend_plan=[
+            {
+                "optimizer": "society",
+                "rank": 1,
+                "weight": 1.0,
+                "reason": "multi-agent handoff and policy reconciliation need role deliberation",
+                "allocation_kind": "society_deliberation",
+            },
+            {
+                "optimizer": "social_memory",
+                "rank": 2,
+                "weight": 0.8,
+                "reason": "memory lineage defects need social memory repair",
+                "allocation_kind": "memory_collective",
+            },
+            {
+                "optimizer": "pareto",
+                "rank": 3,
+                "weight": 0.6,
+                "reason": "policy and memory scores require tradeoff audit",
+                "allocation_kind": "multi_objective",
+            },
+        ],
+        backend_runs=[
+            {
+                "optimizer": "society",
+                "rank": 1,
+                "status": "completed",
+                "final_score": 1.0,
+                "improved": True,
+                "total_evaluations": 12,
+            },
+            {
+                "optimizer": "social_memory",
+                "rank": 2,
+                "status": "completed",
+                "final_score": 0.98,
+                "improved": True,
+                "total_evaluations": 9,
+            },
+            {
+                "optimizer": "pareto",
+                "rank": 3,
+                "status": "completed",
+                "final_score": 0.97,
+                "improved": True,
+                "total_evaluations": 8,
+            },
+        ],
+        backend_lineage=[
+            {
+                "optimizer": "society",
+                "rank": 1,
+                "status": "completed",
+                "final_score": 1.0,
+                "improved": True,
+                "candidate_id": "candidate_society",
+                "candidate_patch": {
+                    "multi_agent.handoff.contract": "explicit_policy",
+                    "memory.shared_case_summary": "enabled",
+                    "policy.reconciliation.mode": "evidence_weighted",
+                },
+                "patch_paths": [
+                    "multi_agent.handoff.contract",
+                    "memory.shared_case_summary",
+                    "policy.reconciliation.mode",
+                ],
+                "shared_patch_paths": ["memory.shared_case_summary"],
+                "unique_patch_paths": ["multi_agent.handoff.contract"],
+                "selection_relation": "selected",
+            },
+            {
+                "optimizer": "social_memory",
+                "rank": 2,
+                "status": "completed",
+                "final_score": 0.98,
+                "improved": True,
+                "candidate_id": "candidate_social_memory",
+                "candidate_patch": {"memory.shared_case_summary": "enabled"},
+                "patch_paths": ["memory.shared_case_summary"],
+                "shared_patch_paths": ["memory.shared_case_summary"],
+                "selection_relation": "equivalent",
+            },
+            {
+                "optimizer": "pareto",
+                "rank": 3,
+                "status": "completed",
+                "final_score": 0.97,
+                "improved": True,
+                "candidate_id": "candidate_pareto",
+                "candidate_patch": {"policy.reconciliation.mode": "evidence_weighted"},
+                "patch_paths": ["policy.reconciliation.mode"],
+                "selection_relation": "supporting",
+            },
+        ],
+        ablation_report={
+            "selected_optimizer": "society",
+            "selected_candidate_id": "candidate_society",
+            "final_score": 1.0,
+            "best_without_selected_optimizer": "social_memory",
+            "best_without_selected_score": 0.98,
+            "score_delta_without_selected": 0.02,
+            "selected_backend_required": False,
+            "dependency": "backend_consensus",
+            "consensus_backends": ["social_memory", "pareto"],
+            "selected_patch_support": {
+                "memory.shared_case_summary": ["society", "social_memory"],
+                "policy.reconciliation.mode": ["society", "pareto"],
+            },
+        },
+        required_evidence=[
+            "optimizer_portfolio",
+            "backend_plan",
+            "backend_run",
+            "backend_lineage",
+            "selected_optimizer",
+            "ablation",
+            "consensus",
+            "selected_relation",
+            "diagnostic",
+            "feedback",
+            "search_path",
+            "improvement",
+            "rollback_decision",
+        ],
+        required_signals=["society", "social_memory", "pareto", "backend_consensus", "completed"],
+    )
+
+    async def agent(input):
+        return AgentResponse(
+            content="Optimizer backend portfolio inspected with lineage, consensus, ablation, and gaps.",
+            tool_calls=[
+                {"id": "status", "name": "optimizer_portfolio_status", "arguments": {}},
+                {"id": "list", "name": "list_optimizer_backends", "arguments": {"status": "completed"}},
+                {"id": "backend", "name": "inspect_optimizer_backend", "arguments": {"optimizer": "society"}},
+                {"id": "ablation", "name": "inspect_optimizer_ablation", "arguments": {}},
+                {"id": "gaps", "name": "list_optimizer_portfolio_gaps", "arguments": {}},
+            ],
+        )
+
+    report = await LocalTextEngine().run(
+        scenario=_scenario(),
+        agent_callback=agent,
+        environment=OptimizerPortfolioEnvironment(portfolio),
+        max_turns=1,
+        min_turns=1,
+    )
+    result = report.results[0]
+    state = result.metadata["environment_state"]["optimizer_backend_portfolio"]
+    summary = state["summary"]
+    assert summary["selected_optimizer"] == "society"
+    assert summary["backend_plan_count"] == 3
+    assert summary["completed_backend_count"] == 3
+    assert summary["lineage_count"] == 3
+    assert summary["consensus_backend_count"] == 2
+    assert summary["blocking_gaps"] == []
+    assert any(
+        artifact.metadata.get("kind") == "optimizer_backend_portfolio"
+        for artifact in result.artifacts
+    )
+
+    evaluation = evaluate_agent_report(
+        report,
+        config={
+            "required_optimizer_portfolio": [
+                "optimizer_portfolio",
+                "backend_plan",
+                "backend_run",
+                "backend_lineage",
+                "selected_optimizer",
+                "ablation",
+                "consensus",
+                "selected_relation",
+                "diagnostic",
+                "feedback",
+                "search_path",
+                "improvement",
+                "rollback_decision",
+                "society",
+                "social_memory",
+                "pareto",
+            ],
+            "optimizer_portfolio_quality": {
+                "required_backends": ["society", "social_memory", "pareto"],
+                "required_completed_backends": ["society", "social_memory", "pareto"],
+                "required_consensus_backends": ["social_memory", "pareto"],
+                "required_search_paths": [
+                    "multi_agent.handoff.contract",
+                    "memory.shared_case_summary",
+                    "policy.reconciliation.mode",
+                ],
+                "required_selection_relations": ["selected", "equivalent", "supporting"],
+                "required_dependencies": ["backend_consensus"],
+                "min_backend_plan_count": 3,
+                "min_backend_run_count": 3,
+                "min_completed_backends": 3,
+                "min_lineage_count": 3,
+                "min_consensus_backends": 2,
+                "min_feedback_cases": 1,
+                "min_diagnostics": 1,
+                "min_search_paths": 3,
+                "min_improved_backends": 3,
+                "min_final_score": 0.99,
+                "max_failed_backends": 0,
+                "require_selected_optimizer": True,
+                "require_backend_plan": True,
+                "require_backend_runs": True,
+                "require_backend_lineage": True,
+                "require_completed_backend": True,
+                "require_ablation": True,
+                "require_consensus": True,
+                "require_selected_relation": True,
+                "require_diagnostics": True,
+                "require_feedback": True,
+                "require_search_paths": True,
+                "require_improvement": True,
+                "require_rollback_decision": True,
+            },
+        },
+        threshold=0.9,
+    )
+    metrics = evaluation.summary["metric_averages"]
+    assert metrics["optimizer_portfolio_coverage"] == 1.0
+    assert metrics["optimizer_portfolio_quality"] == 1.0
+
+    loaded = load_optimizer_backend_portfolio(portfolio, required_signals=["society"])
+    assert isinstance(loaded, OptimizerPortfolioEnvironment)
 
 
 @pytest.mark.asyncio
