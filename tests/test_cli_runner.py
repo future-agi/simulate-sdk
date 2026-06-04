@@ -694,6 +694,8 @@ def test_cli_runner_compare_fails_on_score_drop_and_new_redteam_finding(tmp_path
     finding = {
         "type": "red_team_open_high_findings_high",
         "metric": "red_team_campaign_quality",
+        "attack_type": "prompt_injection",
+        "surface": "tool",
         "severity": "high",
         "check": "max_open_high_findings",
         "expected": 0,
@@ -733,6 +735,8 @@ def test_cli_runner_baseline_compacts_result_and_compare_accepts_it(tmp_path):
     finding = {
         "type": "red_team_open_high_findings_high",
         "metric": "red_team_campaign_quality",
+        "attack_type": "prompt_injection",
+        "surface": "tool",
         "severity": "high",
         "check": "max_open_high_findings",
         "expected": 0,
@@ -772,6 +776,8 @@ def test_cli_runner_report_writes_markdown_for_redteam_result(tmp_path):
     finding = {
         "type": "red_team_open_high_findings_high",
         "metric": "red_team_campaign_quality",
+        "attack_type": "prompt_injection",
+        "surface": "tool",
         "severity": "high",
         "check": "max_open_high_findings",
         "expected": 0,
@@ -819,6 +825,8 @@ def test_cli_runner_report_summarizes_failed_compare_result(tmp_path):
     finding = {
         "type": "red_team_open_high_findings_high",
         "metric": "red_team_campaign_quality",
+        "attack_type": "prompt_injection",
+        "surface": "tool",
         "severity": "high",
         "check": "max_open_high_findings",
         "expected": 0,
@@ -846,6 +854,144 @@ def test_cli_runner_report_summarizes_failed_compare_result(tmp_path):
     assert "New error findings" in markdown
     assert "## Findings" in markdown
     assert "score_regression" in markdown
+
+
+def test_cli_runner_promotes_redteam_findings_to_runnable_regression_manifest(tmp_path):
+    finding = {
+        "type": "red_team_open_high_findings_high",
+        "metric": "red_team_campaign_quality",
+        "attack_type": "prompt_injection",
+        "surface": "tool",
+        "severity": "high",
+        "check": "max_open_high_findings",
+        "expected": 0,
+        "actual": 1,
+    }
+    source = _cli_result(score=0.9, findings=[finding], redteam=True)
+    source["redteam"].update(
+        {
+            "taxonomies": ["owasp_llm_top_10"],
+            "attack_types": ["prompt_injection"],
+            "surfaces": ["tool"],
+            "channels": ["chat"],
+            "providers": ["local_cli"],
+            "frameworks": ["agent_simulate"],
+        }
+    )
+    source_path = tmp_path / "redteam-result.json"
+    promotion_path = tmp_path / "promotion.json"
+    manifest_path = tmp_path / "regression.json"
+    replay_path = tmp_path / "regression-result.json"
+    source_path.write_text(json.dumps(source), encoding="utf-8")
+
+    promote_exit = main([
+        "promote-to-regression",
+        str(source_path),
+        "--output",
+        str(promotion_path),
+        "--manifest",
+        str(manifest_path),
+        "--required-env",
+        "SIMULATE_PROMOTED_REGRESSION_KEY",
+    ])
+
+    assert promote_exit == 0
+    promotion = json.loads(promotion_path.read_text(encoding="utf-8"))
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert promotion["kind"] == "agent-simulate.regression_promotion.v1"
+    assert promotion["summary"]["promoted_finding_count"] == 1
+    assert promotion["summary"]["levels"]["error"] == 1
+    assert manifest["name"] == "cli-result-regression"
+    assert manifest["required_env"] == ["SIMULATE_PROMOTED_REGRESSION_KEY"]
+    attack = manifest["simulation"]["environments"][0]["data"]["attacks"][0]
+    assert attack["category"] == "prompt_injection"
+    assert attack["surface"] == "tool"
+    assert manifest["simulation"]["environments"][1]["data"]["findings"][0]["status"] == "fixed"
+
+    # The promoted manifest is executable and enforces declared runtime keys.
+    replay_exit = main(["redteam", str(manifest_path), "--output", str(replay_path)])
+
+    assert replay_exit == 2
+    assert not replay_path.exists()
+
+
+def test_cli_runner_promoted_regression_runs_when_required_env_is_present(tmp_path, monkeypatch):
+    finding = {
+        "type": "red_team_open_high_findings_high",
+        "metric": "red_team_campaign_quality",
+        "attack_type": "prompt_injection",
+        "surface": "tool",
+        "severity": "high",
+        "check": "max_open_high_findings",
+        "expected": 0,
+        "actual": 1,
+    }
+    source_path = tmp_path / "redteam-result.json"
+    manifest_path = tmp_path / "regression.json"
+    replay_path = tmp_path / "regression-result.json"
+    source_path.write_text(json.dumps(_cli_result(score=0.9, findings=[finding], redteam=True)), encoding="utf-8")
+
+    assert main([
+        "promote-to-regression",
+        str(source_path),
+        "--manifest",
+        str(manifest_path),
+        "--required-env",
+        "SIMULATE_PROMOTED_REGRESSION_KEY",
+        "--quiet",
+    ]) == 0
+
+    monkeypatch.setenv("SIMULATE_PROMOTED_REGRESSION_KEY", "real-local-promoted-regression-key")
+    replay_exit = main(["redteam", str(manifest_path), "--output", str(replay_path)])
+
+    assert replay_exit == 0
+    replay = json.loads(replay_path.read_text(encoding="utf-8"))
+    assert replay["status"] == "passed"
+    assert replay["redteam"]["finding_count"] == 0
+
+
+def test_cli_runner_promotes_failed_compare_new_findings(tmp_path):
+    finding = {
+        "type": "red_team_open_high_findings_high",
+        "metric": "red_team_campaign_quality",
+        "attack_type": "prompt_injection",
+        "surface": "tool",
+        "severity": "high",
+        "check": "max_open_high_findings",
+        "expected": 0,
+        "actual": 1,
+    }
+    baseline_path = tmp_path / "baseline.json"
+    current_path = tmp_path / "current.json"
+    compare_path = tmp_path / "compare.json"
+    manifest_path = tmp_path / "compare-regression.json"
+    baseline_path.write_text(json.dumps(_cli_result(score=0.95, redteam=True)), encoding="utf-8")
+    current_path.write_text(json.dumps(_cli_result(score=0.9, findings=[finding], redteam=True)), encoding="utf-8")
+
+    compare_exit = main(["compare", str(baseline_path), str(current_path), "--output", str(compare_path)])
+    promote_exit = main([
+        "promote-to-regression",
+        str(compare_path),
+        "--manifest",
+        str(manifest_path),
+        "--name",
+        "compare-regression",
+    ])
+
+    assert compare_exit == 1
+    assert promote_exit == 0
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    attacks = manifest["simulation"]["environments"][0]["data"]["attacks"]
+    assert len(attacks) == 1
+    assert attacks[0]["category"] == "prompt_injection"
+    assert "score_regression" not in {attack["id"] for attack in attacks}
+
+
+def test_cli_runner_promote_to_regression_requires_findings(tmp_path):
+    source_path = tmp_path / "passing-result.json"
+    source_path.write_text(json.dumps(_cli_result(score=0.96)), encoding="utf-8")
+
+    assert main(["promote-to-regression", str(source_path), "--quiet"]) == 2
 
 
 def test_cli_runner_optimizes_manifest_search_paths_and_writes_outputs(tmp_path, monkeypatch):

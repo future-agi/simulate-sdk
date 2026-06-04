@@ -316,6 +316,20 @@ agent-simulate compare baselines/redteam-main.json artifacts/redteam-result.json
   --max-new-error-findings 0
 ```
 
+Promote red-team or compare CLI findings into a reusable red-team regression
+manifest that can be run later with `agent-simulate redteam`. `--output`
+writes the promotion JSON payload; `--manifest` writes the runnable manifest.
+
+```bash
+agent-simulate promote-to-regression RESULT.json --manifest regressions/<name>.json --output artifacts/<name>-promotion.json
+```
+
+Use `--min-level note|warning|error` to choose the lowest finding level to
+promote, defaulting to `warning`. Use `--max-findings` to cap promoted cases,
+`--required-env` to add required environment keys to the generated manifest,
+`--name` to set the regression manifest name, and `--quiet` for quieter
+automation logs.
+
 Optimization uses the same manifest shape plus an `optimization` block. The
 optimizer searches JSON paths over the run manifest, executes the resulting
 candidate manifest, scores it with `ai-evaluation`, and returns the best
@@ -357,6 +371,8 @@ Manifests currently support:
 - `agent-simulate baseline` creates compact compare-safe baseline artifacts
 - `agent-simulate compare` gates baseline/current result artifacts by score
   delta, new findings, new error findings, and optional per-metric deltas
+- `agent-simulate promote-to-regression RESULT.json --manifest regressions/<name>.json --output artifacts/<name>-promotion.json`
+  turns red-team/compare findings into runnable red-team regression manifests
 - `agent-simulate report RESULT.json --markdown RESULT.md` renders
   human-readable Markdown from CLI JSON artifacts
 - `optimization.target.search_space` over JSON paths in the same manifest when
