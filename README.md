@@ -380,8 +380,14 @@ export SIMULATE_CLI_OPT_EXAMPLE_KEY="your-real-ci-secret-or-local-test-key"
 
 agent-simulate optimize examples/cli_optimizer_portfolio_optimization.json \
   --output artifacts/optimizer-portfolio-optimization.json \
-  --junit artifacts/optimizer-portfolio-optimization.junit.xml
+  --junit artifacts/optimizer-portfolio-optimization.junit.xml \
+  --markdown artifacts/optimizer-portfolio-optimization.md
 ```
+
+Optimize results include a top-level `evaluation` block from `ai-evaluation`
+with `manifest_optimization_coverage` and `manifest_optimization_quality`
+metrics, plus candidate history patches, per-candidate metrics, JUnit status,
+SARIF findings for failing thresholds, and Markdown reporting.
 
 Framework agents can also be declared directly in the manifest. The CLI loads
 the target relative to the manifest file, wraps it with the same

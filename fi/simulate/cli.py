@@ -2569,37 +2569,250 @@ def _optimization_result(
     for item in list(getattr(optimization_result, "history", []) or []):
         metadata = _to_plain(getattr(item, "metadata", {}) or {})
         agent_eval = metadata.get("agent_report_evaluation") or {}
+        patch = metadata.get("patch") or metadata.get("candidate_patch") or {}
         history.append(
             {
                 "candidate_id": getattr(item, "candidate_id", None),
                 "score": getattr(item, "average_score", None),
-                "patch": metadata.get("patch", {}),
+                "patch": patch,
+                "candidate_patch": patch,
+                "search_paths": list(metadata.get("search_paths") or []),
                 "metrics": dict(agent_eval.get("summary", {}).get("metric_averages", {})),
+                "findings": _optimization_history_findings(agent_eval),
+                "evaluation_score": agent_eval.get("score"),
+                "evaluation_passed": agent_eval.get("passed"),
+                "report_summary": metadata.get("report_summary", {}),
             }
         )
     best_candidate = getattr(optimization_result, "best_candidate", None)
+    best_candidate_id = getattr(best_candidate, "id", None)
+    best_config = _to_plain(getattr(best_candidate, "config", {}))
+    search_paths = _optimization_search_paths(optimization_result, history)
+    metric_averages = _optimization_metric_averages(history)
+    manifest_optimization = _manifest_optimization_artifact(
+        name=str(manifest.get("name") or "agent-simulate-cli-optimization"),
+        final_score=final_score,
+        threshold=threshold,
+        passed=passed,
+        best_candidate_id=best_candidate_id,
+        best_config=best_config,
+        search_paths=search_paths,
+        history=history,
+        metric_averages=metric_averages,
+    )
+    evaluation = _to_plain(
+        _evaluate_manifest_optimization_artifact(
+            manifest_optimization,
+            threshold=threshold,
+        )
+    )
+    if not passed:
+        evaluation["passed"] = False
+        for case in _coerce_list(evaluation.get("cases")):
+            if isinstance(case, dict):
+                case["passed"] = False
+    evaluation_passed = bool(evaluation.get("passed", True))
+    overall_passed = passed and evaluation_passed
     return {
         "schema_version": CLI_SCHEMA_VERSION,
         "name": str(manifest.get("name") or "agent-simulate-cli-optimization"),
-        "status": "passed" if passed else "failed",
-        "exit_code": 0 if passed else 1,
+        "status": "passed" if overall_passed else "failed",
+        "exit_code": 0 if overall_passed else 1,
         "summary": {
             "optimization_score": final_score,
             "optimization_passed": passed,
+            "evaluation_score": evaluation.get("score"),
+            "evaluation_passed": evaluation.get("passed"),
+            "metric_averages": dict(evaluation.get("summary", {}).get("metric_averages", {})),
             "threshold": threshold,
             "total_iterations": getattr(optimization_result, "total_iterations", None),
             "total_evaluations": getattr(optimization_result, "total_evaluations", None),
-            "best_candidate_id": getattr(best_candidate, "id", None),
-            "search_paths": _to_plain(getattr(optimization_result, "metadata", {}) or {}).get("search_paths", []),
+            "best_candidate_id": best_candidate_id,
+            "search_paths": search_paths,
         },
         "optimization": {
             "final_score": final_score,
-            "best_candidate_id": getattr(best_candidate, "id", None),
-            "best_config": _to_plain(getattr(best_candidate, "config", {})),
+            "best_candidate_id": best_candidate_id,
+            "best_config": best_config,
             "history": history,
+            "manifest_optimization": manifest_optimization,
         },
+        "evaluation": evaluation,
         "duration_seconds": duration_seconds,
     }
+
+
+def _optimization_history_findings(agent_eval: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    findings = [
+        dict(finding)
+        for finding in _coerce_list(agent_eval.get("findings"))
+        if isinstance(finding, Mapping)
+    ]
+    for case in _coerce_list(agent_eval.get("cases")):
+        if not isinstance(case, Mapping):
+            continue
+        for finding in _coerce_list(case.get("findings")):
+            if isinstance(finding, Mapping):
+                findings.append(dict(finding))
+    return findings
+
+
+def _optimization_search_paths(
+    optimization_result: Any,
+    history: Sequence[Mapping[str, Any]],
+) -> List[str]:
+    metadata_paths = _to_plain(getattr(optimization_result, "metadata", {}) or {}).get("search_paths", [])
+    values = [str(path) for path in _coerce_list(metadata_paths) if str(path)]
+    for item in history:
+        values.extend(str(path) for path in _coerce_list(item.get("search_paths")) if str(path))
+        for path in _patch_leaf_paths(dict(item.get("patch") or {})):
+            values.append(path)
+    return _unique_strings(values)
+
+
+def _patch_leaf_paths(value: Any, prefix: str = "") -> List[str]:
+    if isinstance(value, Mapping):
+        paths: List[str] = []
+        for key, item in value.items():
+            child_prefix = f"{prefix}.{key}" if prefix else str(key)
+            paths.extend(_patch_leaf_paths(item, child_prefix))
+        return paths
+    if isinstance(value, list):
+        paths = []
+        for index, item in enumerate(value):
+            child_prefix = f"{prefix}.{index}" if prefix else str(index)
+            paths.extend(_patch_leaf_paths(item, child_prefix))
+        return paths
+    return [prefix] if prefix else []
+
+
+def _optimization_metric_averages(history: Sequence[Mapping[str, Any]]) -> Dict[str, float]:
+    buckets: Dict[str, List[float]] = {}
+    for item in history:
+        for name, value in dict(item.get("metrics") or {}).items():
+            numeric = _float_or_none(value)
+            if numeric is None:
+                continue
+            buckets.setdefault(str(name), []).append(float(numeric))
+    return {
+        name: round(sum(values) / len(values), 4)
+        for name, values in buckets.items()
+        if values
+    }
+
+
+def _manifest_optimization_artifact(
+    *,
+    name: str,
+    final_score: float,
+    threshold: float,
+    passed: bool,
+    best_candidate_id: Optional[str],
+    best_config: Any,
+    search_paths: Sequence[str],
+    history: Sequence[Mapping[str, Any]],
+    metric_averages: Mapping[str, Any],
+) -> Dict[str, Any]:
+    findings = [
+        dict(finding)
+        for item in history
+        for finding in _coerce_list(item.get("findings"))
+        if isinstance(finding, Mapping)
+    ]
+    return {
+        "kind": "manifest_optimization",
+        "name": name,
+        "final_score": final_score,
+        "threshold": threshold,
+        "passed": passed,
+        "best_candidate_id": best_candidate_id,
+        "best_config": copy.deepcopy(best_config),
+        "search_paths": list(search_paths),
+        "metrics": dict(metric_averages),
+        "findings": findings,
+        "history": [copy.deepcopy(dict(item)) for item in history],
+        "summary": {
+            "history_count": len(history),
+            "candidate_count": len({str(item.get("candidate_id")) for item in history if item.get("candidate_id")}),
+            "patch_count": sum(1 for item in history if dict(item.get("patch") or {})),
+            "metric_count": len(metric_averages),
+            "finding_count": len(findings),
+            "search_path_count": len(search_paths),
+        },
+    }
+
+
+def _evaluate_manifest_optimization_artifact(
+    artifact: Mapping[str, Any],
+    *,
+    threshold: float,
+) -> Any:
+    search_paths = [str(path) for path in _coerce_list(artifact.get("search_paths")) if str(path)]
+    metrics = list(dict(artifact.get("metrics") or {}).keys())
+    report = {
+        "results": [
+            {
+                "messages": [
+                    {"role": "user", "content": "Evaluate manifest optimization result."},
+                    {
+                        "role": "assistant",
+                        "content": (
+                            "Manifest optimization completed with candidate history, "
+                            "patches, metrics, and best configuration evidence."
+                        ),
+                    },
+                ],
+                "artifacts": [
+                    {
+                        "type": "trace",
+                        "metadata": {"kind": "manifest_optimization"},
+                        "data": copy.deepcopy(dict(artifact)),
+                    }
+                ],
+                "metadata": {"manifest_optimization": copy.deepcopy(dict(artifact))},
+            }
+        ]
+    }
+    config = {
+        "required_manifest_optimization": [
+            "manifest_optimization",
+            "final_score",
+            "threshold",
+            "best_candidate",
+            "best_config",
+            "history",
+            "candidate",
+            "patch",
+            "metric",
+            "search_path",
+        ],
+        "manifest_optimization_quality": {
+            "min_final_score": threshold,
+            "min_history_count": 1,
+            "min_candidate_count": 1,
+            "min_patch_count": 1,
+            "min_metric_count": 1,
+            "required_search_paths": search_paths,
+            "required_metrics": metrics,
+            "require_passed": True,
+            "require_best_candidate": True,
+            "require_best_config": True,
+            "require_history": True,
+            "require_candidate_patches": True,
+            "require_metrics": True,
+            "require_search_paths": bool(search_paths),
+        },
+        "metric_weights": {
+            "manifest_optimization_coverage": 4.0,
+            "manifest_optimization_quality": 6.0,
+        },
+    }
+    return evaluate_agent_report(
+        report,
+        config=config,
+        threshold=0.9,
+        attach=False,
+    )
 
 
 def _report_summary(report: Any) -> Dict[str, Any]:
@@ -3024,6 +3237,7 @@ def _build_parser() -> argparse.ArgumentParser:
     optimize.add_argument("-o", "--output", action="append", default=[], help="Write JSON output to this path. .xml paths are treated as JUnit.")
     optimize.add_argument("--junit", action="append", default=[], help="Write compact JUnit XML output.")
     optimize.add_argument("--sarif", action="append", default=[], help="Write SARIF 2.1.0 findings output.")
+    optimize.add_argument("--markdown", "--md", action="append", default=[], help="Write human-readable Markdown output.")
     optimize.add_argument("--threshold", type=float, default=None, help="Override optimization.threshold.")
     optimize.add_argument("--max-candidates", type=int, default=None, help="Override optimization.optimizer.max_candidates.")
     optimize.add_argument("--name", default=None, help="Override the optimization run name.")

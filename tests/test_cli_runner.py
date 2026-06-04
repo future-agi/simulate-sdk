@@ -1234,6 +1234,7 @@ def test_cli_runner_optimizes_manifest_search_paths_and_writes_outputs(tmp_path,
     manifest_path = tmp_path / "optimize.json"
     output_path = tmp_path / "optimize-result.json"
     junit_path = tmp_path / "optimize-result.junit.xml"
+    markdown_path = tmp_path / "optimize-result.md"
     manifest_path.write_text(json.dumps(_optimization_manifest()), encoding="utf-8")
 
     exit_code = main([
@@ -1243,17 +1244,64 @@ def test_cli_runner_optimizes_manifest_search_paths_and_writes_outputs(tmp_path,
         str(output_path),
         "--junit",
         str(junit_path),
+        "--markdown",
+        str(markdown_path),
     ])
 
     assert exit_code == 0
     payload = json.loads(output_path.read_text(encoding="utf-8"))
     assert payload["status"] == "passed"
     assert payload["summary"]["optimization_score"] >= 0.9
+    assert payload["evaluation"]["passed"] is True
+    assert payload["summary"]["metric_averages"]["manifest_optimization_coverage"] == 1.0
+    assert payload["summary"]["metric_averages"]["manifest_optimization_quality"] == 1.0
     assert payload["optimization"]["best_config"]["simulation"]["environments"][0]["data"]["selected_optimizer"] == "bandit"
+    assert payload["optimization"]["manifest_optimization"]["kind"] == "manifest_optimization"
     assert payload["optimization"]["history"]
+    assert any(item["patch"] for item in payload["optimization"]["history"])
+    assert any(
+        "optimizer_portfolio_quality" in item["metrics"]
+        for item in payload["optimization"]["history"]
+    )
     assert min(item["score"] for item in payload["optimization"]["history"]) < 0.9
     assert max(item["score"] for item in payload["optimization"]["history"]) >= 0.9
     assert "failures=\"0\"" in junit_path.read_text(encoding="utf-8")
+    markdown = markdown_path.read_text(encoding="utf-8")
+    assert "manifest_optimization_quality" in markdown
+    assert "## Optimization" in markdown
+
+
+def test_cli_runner_optimize_failing_threshold_emits_evaluation_findings(tmp_path, monkeypatch):
+    pytest.importorskip("fi.opt")
+    monkeypatch.setenv("SIMULATE_CLI_OPT_TEST_KEY", "real-local-opt-key")
+    manifest = _optimization_manifest()
+    manifest["optimization"]["threshold"] = 0.99
+    manifest_path = tmp_path / "optimize-failing.json"
+    output_path = tmp_path / "optimize-failing-result.json"
+    junit_path = tmp_path / "optimize-failing-result.junit.xml"
+    sarif_path = tmp_path / "optimize-failing-result.sarif.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    exit_code = main([
+        "optimize",
+        str(manifest_path),
+        "--output",
+        str(output_path),
+        "--junit",
+        str(junit_path),
+        "--sarif",
+        str(sarif_path),
+    ])
+
+    assert exit_code == 1
+    payload = json.loads(output_path.read_text(encoding="utf-8"))
+    assert payload["status"] == "failed"
+    assert payload["summary"]["optimization_passed"] is False
+    assert payload["summary"]["metric_averages"]["manifest_optimization_quality"] < 1.0
+    assert "failures=\"1\"" in junit_path.read_text(encoding="utf-8")
+    sarif = json.loads(sarif_path.read_text(encoding="utf-8"))
+    rule_ids = {result["ruleId"] for result in sarif["runs"][0]["results"]}
+    assert "manifest_optimization_final_score_low" in rule_ids
 
 
 def test_cli_runner_optimize_dry_run_reports_search_space(tmp_path, monkeypatch):
