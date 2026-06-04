@@ -1,12 +1,17 @@
 {
   "version": "agent-simulate.cli.v1",
   "name": "optimizer-portfolio-cli",
-  "required_env": ["SIMULATE_CLI_EXAMPLE_KEY"],
+  "required_env": [
+    "SIMULATE_CLI_EXAMPLE_KEY"
+  ],
   "scenario": {
     "name": "optimizer-portfolio-cli",
     "dataset": [
       {
-        "persona": {"name": "Riya", "role": "ci-owner"},
+        "persona": {
+          "name": "Riya",
+          "role": "ci-owner"
+        },
         "situation": "Riya needs CI evidence for optimizer backend allocation.",
         "outcome": "The optimizer portfolio gate passes."
       }
@@ -16,10 +21,30 @@
     "type": "scripted",
     "content": "Optimizer portfolio inspected from the CLI.",
     "tool_calls": [
-      {"id": "status", "name": "optimizer_portfolio_status", "arguments": {}},
-      {"id": "list", "name": "list_optimizer_backends", "arguments": {"status": "completed"}},
-      {"id": "backend", "name": "inspect_optimizer_backend", "arguments": {"optimizer": "bandit"}},
-      {"id": "ablation", "name": "inspect_optimizer_ablation", "arguments": {}}
+      {
+        "id": "status",
+        "name": "optimizer_portfolio_status",
+        "arguments": {}
+      },
+      {
+        "id": "list",
+        "name": "list_optimizer_backends",
+        "arguments": {
+          "status": "completed"
+        }
+      },
+      {
+        "id": "backend",
+        "name": "inspect_optimizer_backend",
+        "arguments": {
+          "optimizer": "bandit"
+        }
+      },
+      {
+        "id": "ablation",
+        "name": "inspect_optimizer_ablation",
+        "arguments": {}
+      }
     ]
   },
   "simulation": {
@@ -34,33 +59,88 @@
           "selected_optimizer": "bandit",
           "final_score": 1.0,
           "improved": true,
-          "rollback_decision": {"rollback_required": false},
-          "feedback_cases": [{"id": "case"}],
-          "diagnoses": [{"component": "multi_agent"}],
+          "rollback_decision": {
+            "rollback_required": false
+          },
+          "feedback_cases": [
+            {
+              "id": "case"
+            }
+          ],
+          "diagnoses": [
+            {
+              "component": "multi_agent"
+            }
+          ],
           "search_paths": [
             "optimizer.backend_portfolio.backends",
             "optimizer.backend_selector.policy"
           ],
           "backend_plan": [
-            {"optimizer": "agent", "rank": 1},
-            {"optimizer": "tpe", "rank": 2},
-            {"optimizer": "bandit", "rank": 3}
+            {
+              "optimizer": "agent",
+              "rank": 1
+            },
+            {
+              "optimizer": "tpe",
+              "rank": 2
+            },
+            {
+              "optimizer": "bandit",
+              "rank": 3
+            }
           ],
           "backend_runs": [
-            {"optimizer": "agent", "status": "completed", "final_score": 0.84, "improved": true},
-            {"optimizer": "tpe", "status": "completed", "final_score": 0.91, "improved": true},
-            {"optimizer": "bandit", "status": "completed", "final_score": 1.0, "improved": true}
+            {
+              "optimizer": "agent",
+              "status": "completed",
+              "final_score": 0.84,
+              "improved": true
+            },
+            {
+              "optimizer": "tpe",
+              "status": "completed",
+              "final_score": 0.91,
+              "improved": true
+            },
+            {
+              "optimizer": "bandit",
+              "status": "completed",
+              "final_score": 1.0,
+              "improved": true
+            }
           ],
           "backend_lineage": [
-            {"optimizer": "agent", "selection_relation": "equivalent", "patch_paths": ["optimizer.backend_portfolio.backends"]},
-            {"optimizer": "tpe", "selection_relation": "supporting", "patch_paths": ["optimizer.backend_selector.policy"]},
-            {"optimizer": "bandit", "selection_relation": "selected", "patch_paths": ["optimizer.backend_portfolio.backends"]}
+            {
+              "optimizer": "agent",
+              "selection_relation": "equivalent",
+              "patch_paths": [
+                "optimizer.backend_portfolio.backends"
+              ]
+            },
+            {
+              "optimizer": "tpe",
+              "selection_relation": "supporting",
+              "patch_paths": [
+                "optimizer.backend_selector.policy"
+              ]
+            },
+            {
+              "optimizer": "bandit",
+              "selection_relation": "selected",
+              "patch_paths": [
+                "optimizer.backend_portfolio.backends"
+              ]
+            }
           ],
           "ablation_report": {
             "selected_optimizer": "bandit",
             "selected_candidate_id": "candidate_bandit",
             "dependency": "backend_consensus",
-            "consensus_backends": ["agent", "tpe"],
+            "consensus_backends": [
+              "agent",
+              "tpe"
+            ],
             "selected_backend_required": false
           }
         }
@@ -102,11 +182,28 @@
           "bandit"
         ],
         "optimizer_portfolio_quality": {
-          "required_backends": ["agent", "tpe", "bandit"],
-          "required_completed_backends": ["agent", "tpe", "bandit"],
-          "required_consensus_backends": ["agent", "tpe"],
-          "required_selection_relations": ["selected", "equivalent", "supporting"],
-          "required_dependencies": ["backend_consensus"],
+          "required_backends": [
+            "agent",
+            "tpe",
+            "bandit"
+          ],
+          "required_completed_backends": [
+            "agent",
+            "tpe",
+            "bandit"
+          ],
+          "required_consensus_backends": [
+            "agent",
+            "tpe"
+          ],
+          "required_selection_relations": [
+            "selected",
+            "equivalent",
+            "supporting"
+          ],
+          "required_dependencies": [
+            "backend_consensus"
+          ],
           "required_search_paths": [
             "optimizer.backend_portfolio.backends",
             "optimizer.backend_selector.policy"
@@ -135,6 +232,11 @@
           "require_search_paths": true,
           "require_improvement": true,
           "require_rollback_decision": true
+        },
+        "metric_weights": {
+          "optimizer_portfolio_coverage": 5.0,
+          "optimizer_portfolio_quality": 10.0,
+          "final_response_quality": 1.0
         }
       }
     }

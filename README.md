@@ -281,6 +281,19 @@ agent-simulate run examples/cli_optimizer_portfolio_manifest.json \
   --junit artifacts/optimizer-portfolio.junit.xml
 ```
 
+Optimization uses the same manifest shape plus an `optimization` block. The
+optimizer searches JSON paths over the run manifest, executes the resulting
+candidate manifest, scores it with `ai-evaluation`, and returns the best
+candidate config.
+
+```bash
+export SIMULATE_CLI_OPT_EXAMPLE_KEY="your-real-ci-secret-or-local-test-key"
+
+agent-simulate optimize examples/cli_optimizer_portfolio_optimization.json \
+  --output artifacts/optimizer-portfolio-optimization.json \
+  --junit artifacts/optimizer-portfolio-optimization.junit.xml
+```
+
 The runner fails before execution when `required_env` keys are missing, returns
 exit code `0` for passing evals, `1` for failing evals, and `2` for manifest/env
 validation errors. Use `--dry-run` to validate a manifest and environment
@@ -294,6 +307,8 @@ Manifests currently support:
   `optimizer_society_trace`, `agent_memory_lineage`, `red_team_readiness`,
   `framework_import`, `workspace_run_manifest`, and `observability_replay`
 - local `evaluation.agent_report.config` passed directly to `ai-evaluation`
+- `optimization.target.search_space` over JSON paths in the same manifest when
+  `agent-opt` is installed
 - JSON and JUnit outputs from CLI flags or manifest `outputs`
 
 ### Local environments

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import copy
 import importlib
 import importlib.util
 import json
@@ -38,20 +39,99 @@ class ManifestError(ValueError):
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
-    if args.command == "run":
+    if args.command in {"run", "optimize"}:
         try:
-            result = asyncio.run(run_manifest_command(args))
+            result = (
+                asyncio.run(run_manifest_command(args))
+                if args.command == "run"
+                else optimize_manifest_command(args)
+            )
         except ManifestError as exc:
             print(f"agent-simulate: {exc}", file=sys.stderr)
             return 2
         except Exception as exc:
-            print(f"agent-simulate: run failed: {exc}", file=sys.stderr)
+            print(f"agent-simulate: {args.command} failed: {exc}", file=sys.stderr)
             return 3
         if not result.get("outputs_written") and not getattr(args, "quiet", False):
             print(json.dumps(_public_result(result), indent=2, sort_keys=True))
         return int(result.get("exit_code", 1))
     parser.print_help()
     return 2
+
+
+def optimize_manifest_command(args: argparse.Namespace) -> Dict[str, Any]:
+    manifest_path = Path(args.manifest).expanduser().resolve()
+    manifest = load_manifest(manifest_path)
+    if args.name:
+        manifest["name"] = args.name
+    if args.threshold is not None:
+        manifest.setdefault("optimization", {})["threshold"] = args.threshold
+    if args.max_candidates is not None:
+        manifest.setdefault("optimization", {}).setdefault("optimizer", {})["max_candidates"] = args.max_candidates
+
+    started = time.time()
+    required_env = _required_env(manifest)
+    missing_env = [key for key in required_env if not os.environ.get(key)]
+    if missing_env:
+        raise ManifestError(f"missing required environment variable(s): {', '.join(sorted(missing_env))}")
+    _apply_manifest_env(manifest)
+    optimization = _optimization_config(manifest)
+    if args.dry_run:
+        result = {
+            "schema_version": CLI_SCHEMA_VERSION,
+            "name": str(manifest.get("name") or manifest_path.stem),
+            "status": "passed",
+            "exit_code": 0,
+            "dry_run": True,
+            "summary": {
+                "required_env": sorted(required_env),
+                "search_path_count": len(_target_config(optimization).get("search_space", {})),
+                "max_candidates": _optimizer_config(optimization).get("max_candidates"),
+            },
+            "duration_seconds": round(time.time() - started, 4),
+        }
+        return _write_outputs(result, manifest, args, manifest_path)
+
+    target, optimizer_kwargs = _build_optimizer_inputs(optimization)
+    try:
+        from fi.opt.optimizers import AgentOptimizer
+    except Exception as exc:  # pragma: no cover - optional dependency clarity
+        raise ManifestError("agent-opt is required for `agent-simulate optimize`.") from exc
+
+    manifest_base = copy.deepcopy(dict(manifest))
+    manifest_base.pop("optimization", None)
+
+    def evaluate_candidate(candidate: Any) -> Any:
+        candidate_manifest = _deep_merge(copy.deepcopy(manifest_base), copy.deepcopy(candidate.config))
+        report = asyncio.run(_run_local_text_manifest(candidate_manifest, manifest_path))
+        evaluation = _evaluate_manifest_report(candidate_manifest, report)
+        score = float(getattr(evaluation, "score", 1.0 if evaluation is None else 0.0))
+        try:
+            from fi.opt import CandidateEvaluation
+        except Exception as exc:  # pragma: no cover - optional dependency clarity
+            raise ManifestError("agent-opt CandidateEvaluation is required for optimization.") from exc
+        return CandidateEvaluation(
+            candidate=candidate,
+            score=score,
+            report=report,
+            metadata={
+                "agent_report_evaluation": _to_plain(evaluation) if evaluation is not None else None,
+                "report_summary": _report_summary(report),
+            },
+        )
+
+    result = AgentOptimizer(
+        target=target,
+        evaluate_candidate=evaluate_candidate,
+        **optimizer_kwargs,
+    ).optimize()
+    payload = _optimization_result(
+        manifest=manifest,
+        optimization_result=result,
+        threshold=float(optimization.get("threshold", 0.7)),
+        duration_seconds=round(time.time() - started, 4),
+    )
+    return _write_outputs(payload, manifest, args, manifest_path)
 
 
 async def run_manifest_command(args: argparse.Namespace) -> Dict[str, Any]:
@@ -87,16 +167,7 @@ async def run_manifest_command(args: argparse.Namespace) -> Dict[str, Any]:
         return _write_outputs(result, manifest, args, manifest_path)
 
     report = await _run_local_text_manifest(manifest, manifest_path)
-    evaluation = None
-    evaluation_enabled = bool(manifest.get("evaluation")) and manifest.get("evaluation", {}).get("enabled", True) is not False
-    if evaluation_enabled:
-        agent_report = dict(manifest.get("evaluation", {}).get("agent_report") or manifest.get("agent_report") or {})
-        evaluation = evaluate_agent_report(
-            report,
-            config=dict(agent_report.get("config") or {}),
-            threshold=float(agent_report.get("threshold", 0.7)),
-            attach=True,
-        )
+    evaluation = _evaluate_manifest_report(manifest, report)
 
     result = _run_result(
         manifest=manifest,
@@ -123,6 +194,19 @@ def load_manifest(path: Path) -> Dict[str, Any]:
     if not isinstance(data, Mapping):
         raise ManifestError("manifest root must be an object")
     return dict(data)
+
+
+def _evaluate_manifest_report(manifest: Mapping[str, Any], report: Any) -> Any:
+    evaluation_enabled = bool(manifest.get("evaluation")) and manifest.get("evaluation", {}).get("enabled", True) is not False
+    if not evaluation_enabled:
+        return None
+    agent_report = dict(manifest.get("evaluation", {}).get("agent_report") or manifest.get("agent_report") or {})
+    return evaluate_agent_report(
+        report,
+        config=dict(agent_report.get("config") or {}),
+        threshold=float(agent_report.get("threshold", 0.7)),
+        attach=True,
+    )
 
 
 async def _run_local_text_manifest(manifest: Mapping[str, Any], manifest_path: Path) -> Any:
@@ -283,6 +367,125 @@ def _run_result(
     }
 
 
+def _optimization_config(manifest: Mapping[str, Any]) -> Dict[str, Any]:
+    config = dict(manifest.get("optimization") or {})
+    if not config:
+        raise ManifestError("optimize manifest requires an optimization block")
+    return config
+
+
+def _target_config(optimization: Mapping[str, Any]) -> Dict[str, Any]:
+    target = dict(optimization.get("target") or {})
+    if not target:
+        raise ManifestError("optimization.target is required")
+    if not isinstance(target.get("base_config"), Mapping):
+        raise ManifestError("optimization.target.base_config must be an object")
+    if not isinstance(target.get("search_space"), Mapping) or not target.get("search_space"):
+        raise ManifestError("optimization.target.search_space must be a non-empty object")
+    return target
+
+
+def _optimizer_config(optimization: Mapping[str, Any]) -> Dict[str, Any]:
+    return dict(optimization.get("optimizer") or {})
+
+
+def _build_optimizer_inputs(optimization: Mapping[str, Any]) -> tuple[Any, Dict[str, Any]]:
+    target_config = _target_config(optimization)
+    optimizer_config = _optimizer_config(optimization)
+    try:
+        from fi.opt import OptimizationTarget
+    except Exception as exc:  # pragma: no cover - optional dependency clarity
+        raise ManifestError("agent-opt is required for `agent-simulate optimize`.") from exc
+    target = OptimizationTarget(
+        name=str(target_config.get("name") or "agent-simulate-cli-optimization"),
+        layers=list(target_config.get("layers") or ["harness", "evaluator"]),
+        base_config=copy.deepcopy(dict(target_config.get("base_config") or {})),
+        search_space=copy.deepcopy(dict(target_config.get("search_space") or {})),
+        metadata=copy.deepcopy(dict(target_config.get("metadata") or {})),
+    )
+    allowed_kwargs = {
+        "max_candidates",
+        "include_seed",
+        "auto_diagnose",
+        "diagnostic_score_threshold",
+    }
+    kwargs = {key: optimizer_config[key] for key in allowed_kwargs if key in optimizer_config}
+    return target, kwargs
+
+
+def _optimization_result(
+    *,
+    manifest: Mapping[str, Any],
+    optimization_result: Any,
+    threshold: float,
+    duration_seconds: float,
+) -> Dict[str, Any]:
+    final_score = float(getattr(optimization_result, "final_score", 0.0) or 0.0)
+    passed = final_score >= threshold
+    history = []
+    for item in list(getattr(optimization_result, "history", []) or []):
+        metadata = _to_plain(getattr(item, "metadata", {}) or {})
+        agent_eval = metadata.get("agent_report_evaluation") or {}
+        history.append(
+            {
+                "candidate_id": getattr(item, "candidate_id", None),
+                "score": getattr(item, "average_score", None),
+                "patch": metadata.get("patch", {}),
+                "metrics": dict(agent_eval.get("summary", {}).get("metric_averages", {})),
+            }
+        )
+    best_candidate = getattr(optimization_result, "best_candidate", None)
+    return {
+        "schema_version": CLI_SCHEMA_VERSION,
+        "name": str(manifest.get("name") or "agent-simulate-cli-optimization"),
+        "status": "passed" if passed else "failed",
+        "exit_code": 0 if passed else 1,
+        "summary": {
+            "optimization_score": final_score,
+            "optimization_passed": passed,
+            "threshold": threshold,
+            "total_iterations": getattr(optimization_result, "total_iterations", None),
+            "total_evaluations": getattr(optimization_result, "total_evaluations", None),
+            "best_candidate_id": getattr(best_candidate, "id", None),
+            "search_paths": _to_plain(getattr(optimization_result, "metadata", {}) or {}).get("search_paths", []),
+        },
+        "optimization": {
+            "final_score": final_score,
+            "best_candidate_id": getattr(best_candidate, "id", None),
+            "best_config": _to_plain(getattr(best_candidate, "config", {})),
+            "history": history,
+        },
+        "duration_seconds": duration_seconds,
+    }
+
+
+def _report_summary(report: Any) -> Dict[str, Any]:
+    return {
+        "case_count": len(getattr(report, "results", []) or []),
+        "stop_reasons": [
+            getattr(result, "metadata", {}).get("stop_reason")
+            for result in getattr(report, "results", []) or []
+            if isinstance(getattr(result, "metadata", {}), Mapping)
+        ],
+    }
+
+
+def _deep_merge(base: Any, patch: Any) -> Any:
+    if isinstance(base, dict) and isinstance(patch, Mapping):
+        for key, value in patch.items():
+            base[key] = _deep_merge(base.get(key), value)
+        return base
+    if isinstance(base, list) and isinstance(patch, list):
+        merged = list(base)
+        for index, value in enumerate(patch):
+            if index < len(merged):
+                merged[index] = _deep_merge(merged[index], value)
+            else:
+                merged.append(copy.deepcopy(value))
+        return merged
+    return copy.deepcopy(patch)
+
+
 def _write_outputs(
     result: Dict[str, Any],
     manifest: Mapping[str, Any],
@@ -369,9 +572,9 @@ def _junit_xml(result: Mapping[str, Any]) -> str:
 def _required_env(manifest: Mapping[str, Any]) -> List[str]:
     env = dict(manifest.get("env") or {})
     values = [
-        *list(manifest.get("required_env") or []),
-        *list(env.get("required") or []),
-        *list(env.get("required_keys") or []),
+        *_coerce_list(manifest.get("required_env")),
+        *_coerce_list(env.get("required")),
+        *_coerce_list(env.get("required_keys")),
     ]
     return sorted({str(value) for value in values if str(value)})
 
@@ -470,6 +673,15 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--no-eval", action="store_true", help="Run simulation only.")
     run.add_argument("--dry-run", action="store_true", help="Validate manifest/env without executing.")
     run.add_argument("--quiet", action="store_true", help="Do not print JSON summary when no output path is configured.")
+    optimize = subparsers.add_parser("optimize", help="Optimize a manifest with agent-opt over JSON search paths.")
+    optimize.add_argument("manifest", help="Path to a JSON/YAML optimization manifest.")
+    optimize.add_argument("-o", "--output", action="append", default=[], help="Write JSON output to this path. .xml paths are treated as JUnit.")
+    optimize.add_argument("--junit", action="append", default=[], help="Write compact JUnit XML output.")
+    optimize.add_argument("--threshold", type=float, default=None, help="Override optimization.threshold.")
+    optimize.add_argument("--max-candidates", type=int, default=None, help="Override optimization.optimizer.max_candidates.")
+    optimize.add_argument("--name", default=None, help="Override the optimization run name.")
+    optimize.add_argument("--dry-run", action="store_true", help="Validate manifest/env without executing optimization.")
+    optimize.add_argument("--quiet", action="store_true", help="Do not print JSON summary when no output path is configured.")
     return parser
 
 
