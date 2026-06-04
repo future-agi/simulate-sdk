@@ -1,5 +1,10 @@
 ![Future AGI](banner.png)
 
+> **SDK migration:** new public SDK development now happens in
+> [`agent-learning-kit`](../agent-learning-kit). Use `agent-learn` and
+> `agent_learning.*` for new docs, examples, and integrations. This repository
+> is the backing simulation runtime during the migration.
+
 <div align="center">
 
 # Simulate — test AI agents before users meet them
@@ -519,8 +524,9 @@ Manifests currently support:
   human-readable Markdown from CLI JSON artifacts
 - Python SDK callers can use the same manifest/result contract via
   `load_manifest`, `detect_manifest_command`, `run_manifest_file`,
-  `run_redteam_manifest_file`, `optimize_manifest_file`, `replay_manifests`,
-  `create_baseline`, `compare_results`, `render_report`,
+  `run_redteam_manifest_file`, `optimize_manifest_file`,
+  `replay_manifests`, `create_baseline`,
+  `compare_results`, `render_report`,
   `promote_to_regression`, `build_manifest_agent_callback`, `render_junit`,
   `render_sarif`, and `render_markdown`
 - `optimization.target.search_space` over JSON paths in the same manifest when

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import importlib
 import importlib.util
 import inspect
@@ -15,12 +16,21 @@ from .manifest import CLI_SCHEMA_VERSION, ManifestError
 
 
 EVAL_SUITE_SCHEMA_VERSION = "agent-simulate.eval.v1"
+EVAL_SUITE_OPTIMIZATION_SCHEMA_VERSION = "agent-learning.eval-optimization.v1"
 
 
 @dataclass(frozen=True)
 class EvalSuiteOptions:
     name: Optional[str] = None
     threshold: Optional[float] = None
+    dry_run: bool = False
+
+
+@dataclass(frozen=True)
+class EvalSuiteOptimizationOptions:
+    name: Optional[str] = None
+    threshold: Optional[float] = None
+    max_candidates: Optional[int] = None
     dry_run: bool = False
 
 
@@ -52,6 +62,118 @@ def run_eval_suite_file(
             dry_run=dry_run,
         ),
     )
+
+
+def optimize_eval_suite_file(
+    path: str | Path,
+    *,
+    options: Optional[EvalSuiteOptimizationOptions] = None,
+    name: Optional[str] = None,
+    threshold: Optional[float] = None,
+    max_candidates: Optional[int] = None,
+    dry_run: Optional[bool] = None,
+) -> Dict[str, Any]:
+    """Load and optimize a promptfoo-style eval suite with agent-opt."""
+
+    suite_path = Path(path).expanduser().resolve()
+    suite = load_eval_suite_file(suite_path)
+    return optimize_eval_suite(
+        suite,
+        suite_path=suite_path,
+        options=_merge_eval_suite_optimization_options(
+            options,
+            name=name,
+            threshold=threshold,
+            max_candidates=max_candidates,
+            dry_run=dry_run,
+        ),
+    )
+
+
+def optimize_eval_suite(
+    suite: Mapping[str, Any],
+    *,
+    suite_path: str | Path = ".",
+    options: Optional[EvalSuiteOptimizationOptions] = None,
+    name: Optional[str] = None,
+    threshold: Optional[float] = None,
+    max_candidates: Optional[int] = None,
+    dry_run: Optional[bool] = None,
+) -> Dict[str, Any]:
+    """Optimize an in-memory eval suite and return a unified artifact payload."""
+
+    started = time.time()
+    opts = _merge_eval_suite_optimization_options(
+        options,
+        name=name,
+        threshold=threshold,
+        max_candidates=max_candidates,
+        dry_run=dry_run,
+    )
+    suite_path = _suite_file_like_path(suite_path)
+    runtime_suite = copy.deepcopy(dict(suite))
+    if opts.name:
+        runtime_suite["name"] = opts.name
+    if opts.threshold is not None:
+        runtime_suite.setdefault("optimization", {})["threshold"] = opts.threshold
+    if opts.max_candidates is not None:
+        runtime_suite.setdefault("optimization", {}).setdefault(
+            "optimizer", {}
+        )["max_candidates"] = opts.max_candidates
+
+    prepared = _prepare_eval_suite(runtime_suite, base_dir=suite_path.parent)
+    cli = _cli()
+    optimization = cli._optimization_config(prepared)
+    target_config = cli._target_config(optimization)
+    optimizer_config = cli._optimizer_config(optimization)
+    if opts.dry_run:
+        return {
+            "schema_version": CLI_SCHEMA_VERSION,
+            "kind": EVAL_SUITE_OPTIMIZATION_SCHEMA_VERSION,
+            "name": str(prepared.get("name") or suite_path.stem),
+            "status": "passed",
+            "exit_code": 0,
+            "dry_run": True,
+            "summary": {
+                "provider_count": len(_as_list(prepared.get("providers"))),
+                "prompt_count": len(_as_list(prepared.get("prompts"))),
+                "test_count": len(_as_list(prepared.get("tests"))),
+                "search_path_count": len(target_config.get("search_space", {})),
+                "max_candidates": optimizer_config.get("max_candidates"),
+            },
+            "eval_suite": _eval_suite_descriptor(prepared),
+            "duration_seconds": round(time.time() - started, 4),
+        }
+
+    try:
+        from fi.opt import problem_from_eval_suite
+    except Exception as exc:  # pragma: no cover - optional dependency clarity
+        raise ManifestError("agent-opt is required for eval-suite optimization.") from exc
+
+    problem = problem_from_eval_suite(
+        prepared,
+        suite_path=suite_path,
+        name=str(prepared.get("name") or suite_path.stem),
+    )
+    optimization_result = problem.optimize()
+    payload = cli._optimization_result(
+        manifest=prepared,
+        optimization_result=optimization_result,
+        threshold=float(optimization.get("threshold", 1.0)),
+        duration_seconds=round(time.time() - started, 4),
+    )
+    payload["kind"] = EVAL_SUITE_OPTIMIZATION_SCHEMA_VERSION
+    payload["eval_suite"] = _eval_suite_descriptor(prepared)
+    payload["summary"]["provider_count"] = len(_as_list(prepared.get("providers")))
+    payload["summary"]["prompt_count"] = len(_as_list(prepared.get("prompts")))
+    payload["summary"]["test_count"] = len(_as_list(prepared.get("tests")))
+    payload["optimization"]["source"] = "eval_suite"
+    if "manifest_optimization" in payload["optimization"]:
+        artifact = copy.deepcopy(payload["optimization"]["manifest_optimization"])
+        artifact["kind"] = "eval_suite_optimization"
+        artifact["source"] = "eval_suite"
+        payload["optimization"]["eval_suite_optimization"] = artifact
+    return payload
 
 
 def run_eval_suite(
@@ -445,6 +567,55 @@ def _merge_eval_suite_options(
     )
 
 
+def _merge_eval_suite_optimization_options(
+    options: Optional[EvalSuiteOptimizationOptions],
+    *,
+    name: Optional[str],
+    threshold: Optional[float],
+    max_candidates: Optional[int],
+    dry_run: Optional[bool],
+) -> EvalSuiteOptimizationOptions:
+    opts = options or EvalSuiteOptimizationOptions()
+    return EvalSuiteOptimizationOptions(
+        name=opts.name if name is None else name,
+        threshold=opts.threshold if threshold is None else threshold,
+        max_candidates=opts.max_candidates if max_candidates is None else max_candidates,
+        dry_run=opts.dry_run if dry_run is None else dry_run,
+    )
+
+
+def _suite_file_like_path(path: str | Path) -> Path:
+    resolved = Path(path).expanduser().resolve()
+    if resolved.is_dir():
+        return resolved / "eval_suite.json"
+    return resolved
+
+
+def _eval_suite_descriptor(suite: Mapping[str, Any]) -> Dict[str, Any]:
+    return {
+        "version": suite.get("version") or EVAL_SUITE_SCHEMA_VERSION,
+        "providers": [
+            {"id": provider.get("id"), "type": provider.get("type")}
+            for provider in _as_list(suite.get("providers"))
+            if isinstance(provider, Mapping)
+        ],
+        "prompts": [
+            {"id": prompt.get("id")}
+            for prompt in _as_list(suite.get("prompts"))
+            if isinstance(prompt, Mapping)
+        ],
+        "tests": [
+            {"id": test.get("id")}
+            for test in _as_list(suite.get("tests"))
+            if isinstance(test, Mapping)
+        ],
+    }
+
+
+def _cli() -> Any:
+    return importlib.import_module("fi.simulate.cli")
+
+
 def _as_list(value: Any) -> List[Any]:
     if value is None:
         return []
@@ -461,8 +632,12 @@ def _as_dict(value: Any) -> Dict[str, Any]:
 
 __all__ = [
     "EVAL_SUITE_SCHEMA_VERSION",
+    "EVAL_SUITE_OPTIMIZATION_SCHEMA_VERSION",
+    "EvalSuiteOptimizationOptions",
     "EvalSuiteOptions",
     "load_eval_suite_file",
+    "optimize_eval_suite",
+    "optimize_eval_suite_file",
     "run_eval_suite",
     "run_eval_suite_file",
 ]

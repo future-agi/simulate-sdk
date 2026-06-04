@@ -3375,6 +3375,10 @@ def _optimization_result(
         metadata = _to_plain(getattr(item, "metadata", {}) or {})
         agent_eval = metadata.get("agent_report_evaluation") or {}
         patch = metadata.get("patch") or metadata.get("candidate_patch") or {}
+        report = metadata.get("report")
+        report_summary = metadata.get("report_summary", {})
+        if not report_summary and isinstance(report, Mapping):
+            report_summary = dict(report.get("summary") or {})
         history.append(
             {
                 "candidate_id": getattr(item, "candidate_id", None),
@@ -3386,7 +3390,8 @@ def _optimization_result(
                 "findings": _optimization_history_findings(agent_eval),
                 "evaluation_score": agent_eval.get("score"),
                 "evaluation_passed": agent_eval.get("passed"),
-                "report_summary": metadata.get("report_summary", {}),
+                "report": report,
+                "report_summary": report_summary,
             }
         )
     best_candidate = getattr(optimization_result, "best_candidate", None)
