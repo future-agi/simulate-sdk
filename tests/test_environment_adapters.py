@@ -12,6 +12,7 @@ from fi.simulate import (
     AgentResponse,
     AgentControlPlaneEnvironment,
     AgentIntegrationEnvironment,
+    AgentMemoryLineageEnvironment,
     AgentTrustBoundaryEnvironment,
     AutonomyLoopEnvironment,
     BrowserEnvironment,
@@ -42,6 +43,7 @@ from fi.simulate import (
     WorkspaceRunEnvironment,
     evaluate_agent_report,
     load_adversarial_attack_pack,
+    load_agent_memory_lineage_manifest,
     load_agent_integration_manifest,
     load_browser_trace_export,
     load_voice_export,
@@ -68,6 +70,7 @@ from fi.simulate import (
     normalize_streaming_trace_export,
     normalize_adversarial_attack_pack,
     normalize_agent_control_plane,
+    normalize_agent_memory_lineage_manifest,
     normalize_agent_integration_manifest,
     normalize_workspace_run_manifest,
     normalize_agent_trust_boundary_model,
@@ -1585,6 +1588,186 @@ async def test_retrieval_memory_environment_records_queries_citations_and_memory
     assert state["memory"]["last_resolution"] == "refund eligible"
     assert traces and traces[-1]["citations"]
     assert any(event.type == "retrieval_memory" and event.name == "attribution" for event in result.events)
+
+
+@pytest.mark.asyncio
+async def test_agent_memory_lineage_environment_replays_provenance_policy_and_poisoning_controls():
+    required_evidence = [
+        "target",
+        "store",
+        "memory_record",
+        "operation",
+        "lineage",
+        "source_attribution",
+        "tenant_isolation",
+        "audit",
+        "retention_policy",
+        "deletion_policy",
+        "redaction",
+        "canary",
+        "poison_test",
+        "isolation_test",
+        "retention_test",
+        "observability",
+        "artifact",
+    ]
+    required_signals = [
+        "memory_lineage",
+        "memory_provenance",
+        "write_operation",
+        "read_operation",
+        "recall_operation",
+        "delete_operation",
+        "tenant_isolation",
+        "audit",
+        "canary",
+    ]
+    manifest = normalize_agent_memory_lineage_manifest(
+        name="support-memory-lineage",
+        target={"agent": "support-agent", "environment": "staging", "tenant": "tenant_a"},
+        stores=[
+            {"id": "short_term", "type": "session", "tenant": "tenant_a", "scope": "conversation"},
+            {"id": "long_term", "type": "profile", "tenant": "tenant_a", "scope": "customer"},
+            {"id": "vector_store", "type": "semantic", "tenant": "tenant_a", "signals": ["memory_provenance"]},
+        ],
+        memories=[
+            {
+                "id": "case_summary",
+                "store": "long_term",
+                "tenant": "tenant_a",
+                "source_ids": ["doc_order_123"],
+                "sensitivity": "internal",
+            },
+            {
+                "id": "policy_note",
+                "store": "vector_store",
+                "tenant": "tenant_a",
+                "source_ids": ["policy_v3"],
+                "sensitivity": "public",
+            },
+        ],
+        operations=[
+            {"id": "write_case", "operation": "write", "memory_id": "case_summary", "status": "passed", "audit_id": "audit_1", "trace_id": "trace_1"},
+            {"id": "read_case", "operation": "read", "memory_id": "case_summary", "status": "passed", "audit_id": "audit_2", "trace_id": "trace_2"},
+            {"id": "recall_policy", "operation": "recall", "memory_id": "policy_note", "status": "passed", "audit_id": "audit_3", "trace_id": "trace_3"},
+            {"id": "delete_temp", "operation": "delete", "memory_id": "temp_token", "status": "passed", "audit_id": "audit_4", "trace_id": "trace_4"},
+        ],
+        lineage=[
+            {"from": "doc_order_123", "to": "case_summary", "type": "source_to_memory"},
+            {"from": "policy_v3", "to": "policy_note", "type": "source_to_memory"},
+            {"from": "case_summary", "to": "refund_answer", "type": "memory_to_claim"},
+        ],
+        policies={
+            "source_attribution": {"required": True},
+            "tenant_isolation": {"namespace": "tenant_a"},
+            "audit": {"required": True},
+            "retention": {"ttl_days": 30},
+            "deletion": {"right_to_delete": True},
+            "redaction": {"pii": True},
+            "canaries": {"enabled": True},
+        },
+        poison_tests=[{"id": "poison_profile", "status": "blocked", "signals": ["canary"]}],
+        isolation_tests=[{"id": "tenant_cross_read", "status": "passed"}],
+        retention_tests=[{"id": "delete_temp", "status": "deleted"}],
+        observability={"traces": ["trace_memory"], "logs": ["logs/memory.log"], "webhooks": ["memory.lineage.completed"]},
+        artifacts=[{"id": "lineage_report", "type": "json", "path": "artifacts/memory-lineage.json"}],
+        required_evidence=required_evidence,
+        required_signals=required_signals,
+    )
+    assert manifest["summary"]["blocking_gap_count"] == 0
+    assert manifest["summary"]["has_source_attribution"] is True
+    assert manifest["summary"]["has_tenant_isolation"] is True
+    assert manifest["summary"]["has_audit"] is True
+    assert manifest["summary"]["open_poisoning_count"] == 0
+
+    async def agent(input):
+        return AgentResponse(
+            content="I verified memory provenance, operations, records, policy controls, and gaps.",
+            tool_calls=[
+                {"id": "status", "name": "agent_memory_lineage_status", "arguments": {}},
+                {"id": "ops", "name": "list_memory_lineage_operations", "arguments": {"operation": "write"}},
+                {"id": "record", "name": "inspect_memory_lineage_record", "arguments": {"id": "case_summary"}},
+                {"id": "gaps", "name": "list_memory_lineage_gaps", "arguments": {}},
+            ],
+        )
+
+    report = await LocalTextEngine().run(
+        scenario=_scenario(),
+        agent_callback=agent,
+        environment=AgentMemoryLineageEnvironment(manifest),
+        max_turns=1,
+        min_turns=1,
+    )
+    result = report.results[0]
+    state = result.metadata["environment_state"]["agent_memory_lineage"]
+    assert state["summary"]["store_count"] == 3
+    assert state["summary"]["memory_count"] == 2
+    assert state["summary"]["operation_count"] == 4
+    assert state["summary"]["blocking_gap_count"] == 0
+    assert {"agent_memory_lineage_status", "list_memory_lineage_operations", "inspect_memory_lineage_record", "list_memory_lineage_gaps"} <= {
+        tool["name"] for tool in result.tool_calls
+    }
+    traces = [
+        artifact.data
+        for artifact in result.artifacts
+        if artifact.type == "trace" and artifact.metadata.get("kind") == "agent_memory_lineage"
+    ]
+    assert traces and traces[-1]["summary"]["blocking_gap_count"] == 0
+    assert any(event.type == "agent_memory_lineage" and event.name == "agent_memory_lineage_ready" for event in result.events)
+
+    evaluation = evaluate_agent_report(
+        report,
+        config={
+            "required_agent_memory_lineage": [
+                "agent_memory_lineage",
+                *required_evidence,
+                *required_signals,
+            ],
+            "agent_memory_lineage_quality": {
+                "required_evidence": required_evidence,
+                "required_signals": required_signals,
+                "required_operation_types": ["write", "read", "recall", "delete"],
+                "required_policies": ["source_attribution", "tenant_isolation", "audit", "retention", "deletion", "redaction", "canaries"],
+                "require_target": True,
+                "require_stores": True,
+                "require_memory_records": True,
+                "require_operations": True,
+                "require_lineage": True,
+                "require_source_attribution": True,
+                "require_tenant_isolation": True,
+                "require_audit": True,
+                "require_retention_policy": True,
+                "require_deletion_policy": True,
+                "require_redaction": True,
+                "require_canaries": True,
+                "require_observability": True,
+                "require_artifacts": True,
+                "min_store_count": 3,
+                "min_memory_count": 2,
+                "min_operation_count": 4,
+                "min_attributed_memories": 2,
+                "min_write_operations": 1,
+                "min_read_operations": 1,
+                "min_recall_operations": 1,
+                "min_artifact_count": 1,
+                "min_observability_hooks": 3,
+                "max_unattributed_memories": 0,
+                "max_poisoned_memories": 0,
+                "max_open_poisoning": 0,
+                "max_isolation_violations": 0,
+                "max_retention_violations": 0,
+                "max_policy_violations": 0,
+                "max_blocking_gaps": 0,
+            },
+        },
+        threshold=0.9,
+    )
+    metrics = evaluation.summary["metric_averages"]
+    assert metrics["agent_memory_lineage_coverage"] == 1.0
+    assert metrics["agent_memory_lineage_quality"] == 1.0
+
+    loaded = load_agent_memory_lineage_manifest(manifest)
+    assert isinstance(loaded, AgentMemoryLineageEnvironment)
 
 
 @pytest.mark.asyncio

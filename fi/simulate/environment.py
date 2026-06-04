@@ -5112,6 +5112,687 @@ class RetrievalMemoryEnvironment(EnvironmentAdapter):
         return self._trace_payload()
 
 
+class AgentMemoryLineageEnvironment(EnvironmentAdapter):
+    """Replay agent memory lifecycle, provenance, policy, and poisoning evidence."""
+
+    name = "agent_memory_lineage"
+
+    def __init__(
+        self,
+        manifest: Any = None,
+        *,
+        name: str = "agent-memory-lineage",
+        target: Optional[Mapping[str, Any]] = None,
+        stores: Optional[Iterable[Any]] = None,
+        memories: Optional[Iterable[Any]] = None,
+        operations: Optional[Iterable[Any]] = None,
+        lineage: Optional[Iterable[Any]] = None,
+        policies: Optional[Mapping[str, Any] | Iterable[Any]] = None,
+        poison_tests: Optional[Iterable[Any]] = None,
+        isolation_tests: Optional[Iterable[Any]] = None,
+        retention_tests: Optional[Iterable[Any]] = None,
+        observability: Optional[Mapping[str, Any]] = None,
+        artifacts: Optional[Iterable[Any]] = None,
+        required_evidence: Optional[Iterable[str]] = None,
+        required_signals: Optional[Iterable[str]] = None,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> None:
+        self.initial_manifest = normalize_agent_memory_lineage_manifest(
+            manifest,
+            name=name,
+            target=target,
+            stores=stores,
+            memories=memories,
+            operations=operations,
+            lineage=lineage,
+            policies=policies,
+            poison_tests=poison_tests,
+            isolation_tests=isolation_tests,
+            retention_tests=retention_tests,
+            observability=observability,
+            artifacts=artifacts,
+            required_evidence=required_evidence,
+            required_signals=required_signals,
+            metadata=metadata,
+        )
+        self.manifest: Dict[str, Any] = {}
+
+    def reset(self, **context: Any) -> EnvironmentSnapshot:
+        self.manifest = copy.deepcopy(self.initial_manifest)
+        return EnvironmentSnapshot(
+            tools=self._tool_specs(),
+            artifacts=[self._trace_artifact()],
+            events=[
+                SimulationEvent(
+                    type="agent_memory_lineage",
+                    name="agent_memory_lineage_ready",
+                    payload={
+                        "name": self.manifest.get("name"),
+                        "summary": copy.deepcopy(self.manifest.get("summary", {})),
+                        "signals": copy.deepcopy(self.manifest.get("signals", [])),
+                    },
+                )
+            ],
+            state={"agent_memory_lineage": self._trace_payload()},
+            metadata={"agent_memory_lineage": copy.deepcopy(self.manifest.get("summary", {}))},
+        )
+
+    def handle_tool_call(
+        self,
+        tool_call: Mapping[str, Any],
+        **context: Any,
+    ) -> Optional[ToolExecutionResult]:
+        name = _tool_name(tool_call)
+        if name not in {
+            "agent_memory_lineage_status",
+            "list_memory_lineage_operations",
+            "inspect_memory_lineage_record",
+            "list_memory_lineage_gaps",
+        }:
+            return None
+        arguments = _tool_arguments(tool_call)
+        call_id = _tool_call_id(tool_call)
+
+        if name == "agent_memory_lineage_status":
+            result = self._trace_payload()
+            event_name = "agent_memory_lineage_status"
+            content = f"Agent memory lineage {self.manifest.get('name')} status recorded."
+        elif name == "list_memory_lineage_operations":
+            operation_type = _memory_lineage_key(arguments.get("operation") or arguments.get("type"))
+            status = _memory_lineage_key(arguments.get("status"))
+            store = _memory_lineage_key(arguments.get("store") or arguments.get("store_id"))
+            records = []
+            for item in self.manifest.get("operations", []):
+                if operation_type and item.get("operation") != operation_type:
+                    continue
+                if status and item.get("status") != status:
+                    continue
+                if store and _memory_lineage_key(item.get("store")) != store:
+                    continue
+                records.append(copy.deepcopy(item))
+            result = {"operations": records, "count": len(records)}
+            event_name = "agent_memory_lineage_operations_listed"
+            content = "Listed memory lineage operations."
+        elif name == "inspect_memory_lineage_record":
+            key = str(arguments.get("id") or arguments.get("key") or arguments.get("memory_id") or "")
+            record = _memory_lineage_find_record(self.manifest.get("memories", []), key)
+            result = {"record": copy.deepcopy(record), "id": key}
+            event_name = "agent_memory_lineage_record_inspected"
+            content = "Memory lineage record inspected." if record else f"Memory lineage record not found: {key}"
+        else:
+            summary = copy.deepcopy(self.manifest.get("summary", {}))
+            result = {
+                "blocking_gaps": summary.get("blocking_gaps", []),
+                "missing_required_evidence": summary.get("missing_required_evidence", []),
+                "missing_required_signals": summary.get("missing_required_signals", []),
+                "policy_violations": summary.get("policy_violations", []),
+                "poisoning_failures": summary.get("poisoning_failures", []),
+                "isolation_violations": summary.get("isolation_violations", []),
+            }
+            event_name = "agent_memory_lineage_gaps_listed"
+            content = "Listed memory lineage gaps."
+
+        return ToolExecutionResult(
+            tool_call_id=call_id,
+            tool_name=name,
+            content=content,
+            result=result,
+            success=True,
+            state_updates={"agent_memory_lineage": self._trace_payload()},
+            artifacts=[self._trace_artifact()],
+            events=[SimulationEvent(type="agent_memory_lineage", name=event_name, payload=result)],
+        )
+
+    def _tool_specs(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                "name": "agent_memory_lineage_status",
+                "description": "Return the full agent memory lineage manifest.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            {
+                "name": "list_memory_lineage_operations",
+                "description": "List memory read/write/update/delete/recall operations.",
+                "parameters": {"type": "object", "properties": {"operation": {"type": "string"}}},
+            },
+            {
+                "name": "inspect_memory_lineage_record",
+                "description": "Inspect one persisted memory record by id or key.",
+                "parameters": {"type": "object", "properties": {"id": {"type": "string"}}},
+            },
+            {
+                "name": "list_memory_lineage_gaps",
+                "description": "List missing attribution, poisoning, isolation, retention, deletion, and audit gaps.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        ]
+
+    def _trace_artifact(self) -> SimulationArtifact:
+        return SimulationArtifact(
+            type="trace",
+            role="environment",
+            data=self._trace_payload(),
+            metadata={"kind": "agent_memory_lineage"},
+        )
+
+    def _trace_payload(self) -> Dict[str, Any]:
+        return copy.deepcopy(self.manifest)
+
+
+def normalize_agent_memory_lineage_manifest(
+    payload: Any = None,
+    *,
+    name: str = "agent-memory-lineage",
+    target: Optional[Mapping[str, Any]] = None,
+    stores: Optional[Iterable[Any]] = None,
+    memories: Optional[Iterable[Any]] = None,
+    operations: Optional[Iterable[Any]] = None,
+    lineage: Optional[Iterable[Any]] = None,
+    policies: Optional[Mapping[str, Any] | Iterable[Any]] = None,
+    poison_tests: Optional[Iterable[Any]] = None,
+    isolation_tests: Optional[Iterable[Any]] = None,
+    retention_tests: Optional[Iterable[Any]] = None,
+    observability: Optional[Mapping[str, Any]] = None,
+    artifacts: Optional[Iterable[Any]] = None,
+    required_evidence: Optional[Iterable[str]] = None,
+    required_signals: Optional[Iterable[str]] = None,
+    metadata: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Normalize memory lifecycle/provenance evidence into a replayable manifest."""
+
+    payload_dict = dict(payload) if isinstance(payload, Mapping) else {}
+    target_record = _memory_lineage_mapping(target if target is not None else payload_dict.get("target"))
+    store_records = _memory_lineage_records(stores if stores is not None else payload_dict.get("stores"))
+    memory_records = _memory_lineage_records(memories if memories is not None else payload_dict.get("memories"))
+    operation_records = _memory_lineage_operations(
+        operations if operations is not None else payload_dict.get("operations")
+    )
+    lineage_records = _memory_lineage_records(lineage if lineage is not None else payload_dict.get("lineage"))
+    policy_record = _memory_lineage_policy_map(policies if policies is not None else payload_dict.get("policies"))
+    poison_records = _memory_lineage_records(
+        poison_tests if poison_tests is not None else payload_dict.get("poison_tests", payload_dict.get("poisoning_tests"))
+    )
+    isolation_records = _memory_lineage_records(
+        isolation_tests if isolation_tests is not None else payload_dict.get("isolation_tests")
+    )
+    retention_records = _memory_lineage_records(
+        retention_tests if retention_tests is not None else payload_dict.get("retention_tests", payload_dict.get("deletion_tests"))
+    )
+    observability_record = _memory_lineage_mapping(
+        observability if observability is not None else payload_dict.get("observability")
+    )
+    artifact_records = _memory_lineage_records(artifacts if artifacts is not None else payload_dict.get("artifacts"))
+    required_evidence_keys = _memory_lineage_key_list(
+        required_evidence if required_evidence is not None else payload_dict.get("required_evidence")
+    )
+    required_signal_keys = _memory_lineage_key_list(
+        required_signals if required_signals is not None else payload_dict.get("required_signals")
+    )
+    summary = _memory_lineage_summary(
+        target=target_record,
+        stores=store_records,
+        memories=memory_records,
+        operations=operation_records,
+        lineage=lineage_records,
+        policies=policy_record,
+        poison_tests=poison_records,
+        isolation_tests=isolation_records,
+        retention_tests=retention_records,
+        observability=observability_record,
+        artifacts=artifact_records,
+        required_evidence=required_evidence_keys,
+        required_signals=required_signal_keys,
+    )
+    signals = _memory_lineage_signals(
+        target=target_record,
+        stores=store_records,
+        memories=memory_records,
+        operations=operation_records,
+        lineage=lineage_records,
+        policies=policy_record,
+        poison_tests=poison_records,
+        isolation_tests=isolation_records,
+        retention_tests=retention_records,
+        observability=observability_record,
+        artifacts=artifact_records,
+        summary=summary,
+    )
+    return {
+        "kind": "agent_memory_lineage",
+        "name": str(payload_dict.get("name") or name),
+        "target": target_record,
+        "stores": store_records,
+        "memories": memory_records,
+        "operations": operation_records,
+        "lineage": lineage_records,
+        "policies": policy_record,
+        "poison_tests": poison_records,
+        "isolation_tests": isolation_records,
+        "retention_tests": retention_records,
+        "observability": observability_record,
+        "artifacts": artifact_records,
+        "required_evidence": required_evidence_keys,
+        "required_signals": required_signal_keys,
+        "summary": summary,
+        "signals": signals,
+        "metadata": {
+            **dict(payload_dict.get("metadata") or {}),
+            **dict(metadata or {}),
+        },
+    }
+
+
+def load_agent_memory_lineage_manifest(
+    source: str | os.PathLike[str] | Mapping[str, Any],
+    *,
+    headers: Optional[Mapping[str, str]] = None,
+    auth: Optional[Mapping[str, Any]] = None,
+    pagination: Optional[Mapping[str, Any]] = None,
+    max_pages: int = 20,
+    timeout: float = 30.0,
+    metadata: Optional[Mapping[str, Any]] = None,
+    **kwargs: Any,
+) -> AgentMemoryLineageEnvironment:
+    """Load a local/HTTP memory lineage manifest and return an environment."""
+
+    source_metadata: Dict[str, Any] = {}
+    if isinstance(source, (str, os.PathLike)) or _is_export_source_spec(source):
+        loaded, source_metadata = _load_framework_trace_export_source_with_metadata(
+            source,
+            headers=headers,
+            auth=auth,
+            pagination=pagination,
+            max_pages=max_pages,
+            timeout=timeout,
+        )
+    else:
+        loaded = source
+    if not isinstance(loaded, Mapping):
+        raise TypeError("Agent memory lineage export must be a mapping")
+    return AgentMemoryLineageEnvironment(
+        loaded,
+        metadata={**source_metadata, **dict(metadata or {})},
+        **kwargs,
+    )
+
+
+def _memory_lineage_summary(
+    *,
+    target: Mapping[str, Any],
+    stores: Sequence[Mapping[str, Any]],
+    memories: Sequence[Mapping[str, Any]],
+    operations: Sequence[Mapping[str, Any]],
+    lineage: Sequence[Mapping[str, Any]],
+    policies: Mapping[str, Any],
+    poison_tests: Sequence[Mapping[str, Any]],
+    isolation_tests: Sequence[Mapping[str, Any]],
+    retention_tests: Sequence[Mapping[str, Any]],
+    observability: Mapping[str, Any],
+    artifacts: Sequence[Mapping[str, Any]],
+    required_evidence: Sequence[str],
+    required_signals: Sequence[str],
+) -> Dict[str, Any]:
+    operation_types = {_memory_lineage_key(item.get("operation")) for item in operations if item.get("operation")}
+    source_backed_memory = [
+        item
+        for item in memories
+        if _as_iterable(item.get("source_ids") or item.get("sources") or item.get("doc_ids"))
+    ]
+    unattributed = [
+        str(item.get("id") or item.get("key") or index)
+        for index, item in enumerate(memories, start=1)
+        if not _as_iterable(item.get("source_ids") or item.get("sources") or item.get("doc_ids"))
+        and item.get("requires_attribution", True) is not False
+        and _memory_lineage_key(item.get("status")) not in {"deleted", "expired", "blocked"}
+    ]
+    poisoned_memories = [
+        str(item.get("id") or item.get("key") or index)
+        for index, item in enumerate(memories, start=1)
+        if _memory_lineage_key(item.get("status")) in {"poisoned", "tainted", "untrusted", "compromised"}
+    ]
+    poison_failures = [
+        str(item.get("id") or item.get("name") or index)
+        for index, item in enumerate(poison_tests, start=1)
+        if _memory_lineage_key(item.get("status")) not in {"passed", "blocked", "mitigated", "contained", "accepted"}
+    ]
+    isolation_failures = [
+        str(item.get("id") or item.get("name") or index)
+        for index, item in enumerate(isolation_tests, start=1)
+        if _memory_lineage_key(item.get("status")) not in {"passed", "blocked", "mitigated", "contained"}
+    ]
+    retention_failures = [
+        str(item.get("id") or item.get("name") or index)
+        for index, item in enumerate(retention_tests, start=1)
+        if _memory_lineage_key(item.get("status")) not in {"passed", "deleted", "expired", "purged", "mitigated"}
+    ]
+    policy_violations = [
+        str(item.get("id") or item.get("name") or index)
+        for index, item in enumerate(operations, start=1)
+        if _memory_lineage_key(item.get("status")) in {"policy_violation", "violation", "failed_policy"}
+        or _memory_lineage_key(item.get("policy_decision")) in {"violation", "failed", "bypassed"}
+    ]
+    audited_operation_count = sum(1 for item in operations if item.get("trace_id") or item.get("audit_id") or item.get("evidence"))
+    observability_hook_count = _memory_lineage_observability_count(observability)
+    artifact_count = len(artifacts)
+    policy_keys = set(policies)
+    has_tenant_isolation = bool(policy_keys & {"tenant_isolation", "memory_isolation", "namespace_isolation"}) or any(
+        _memory_lineage_key(item.get("status")) in {"passed", "blocked", "mitigated", "contained"}
+        for item in isolation_tests
+    )
+    has_canaries = bool(policy_keys & {"canaries", "canary_filter", "poisoning_canaries"}) or bool(poison_tests)
+    has_audit = bool(policy_keys & {"audit", "audit_log", "trace"}) or (bool(operations) and audited_operation_count == len(operations))
+    has_retention = bool(policy_keys & {"retention", "ttl", "expiry", "expiration"})
+    has_deletion = bool(policy_keys & {"deletion", "right_to_delete", "purge"})
+    has_redaction = bool(policy_keys & {"redaction", "pii_redaction", "secret_redaction"})
+
+    observed_evidence = {"agent_memory_lineage", "memory_lineage", "memory", "provenance"}
+    if target:
+        observed_evidence.add("target")
+    if stores:
+        observed_evidence.add("store")
+    if memories:
+        observed_evidence.add("memory_record")
+    if operations:
+        observed_evidence.add("operation")
+    for operation_type in operation_types:
+        observed_evidence.add(f"{operation_type}_operation")
+    if lineage:
+        observed_evidence.add("lineage")
+    if source_backed_memory and not unattributed:
+        observed_evidence.add("source_attribution")
+    if has_tenant_isolation:
+        observed_evidence.add("tenant_isolation")
+    if has_audit:
+        observed_evidence.add("audit")
+    if has_retention:
+        observed_evidence.add("retention_policy")
+    if has_deletion:
+        observed_evidence.add("deletion_policy")
+    if has_redaction:
+        observed_evidence.add("redaction")
+    if has_canaries:
+        observed_evidence.add("canary")
+    if poison_tests:
+        observed_evidence.add("poison_test")
+    if isolation_tests:
+        observed_evidence.add("isolation_test")
+    if retention_tests:
+        observed_evidence.add("retention_test")
+    if observability_hook_count:
+        observed_evidence.add("observability")
+    if artifact_count:
+        observed_evidence.add("artifact")
+
+    observed_signals = _memory_lineage_signal_set(
+        target,
+        *stores,
+        *memories,
+        *operations,
+        *lineage,
+        policies,
+        *poison_tests,
+        *isolation_tests,
+        *retention_tests,
+        observability,
+        *artifacts,
+    )
+    observed_signals.update(observed_evidence)
+
+    blocking_gaps: List[str] = []
+    if not target:
+        blocking_gaps.append("target_missing")
+    if not stores:
+        blocking_gaps.append("store_missing")
+    if not memories:
+        blocking_gaps.append("memory_record_missing")
+    if not operations:
+        blocking_gaps.append("operation_missing")
+    if unattributed:
+        blocking_gaps.append("source_attribution_missing")
+    if not has_tenant_isolation:
+        blocking_gaps.append("tenant_isolation_missing")
+    if not has_audit:
+        blocking_gaps.append("audit_missing")
+    if poisoned_memories or poison_failures:
+        blocking_gaps.append("poisoning_open")
+    if isolation_failures:
+        blocking_gaps.append("isolation_violation")
+    if retention_failures:
+        blocking_gaps.append("retention_or_deletion_violation")
+    if policy_violations:
+        blocking_gaps.append("policy_violation")
+
+    missing_required_evidence = sorted(set(required_evidence) - observed_evidence)
+    missing_required_signals = sorted(set(required_signals) - observed_signals)
+    blocking_gaps.extend(f"missing_evidence:{item}" for item in missing_required_evidence)
+    blocking_gaps.extend(f"missing_signal:{item}" for item in missing_required_signals)
+
+    return {
+        "has_target": bool(target),
+        "has_stores": bool(stores),
+        "has_memory_records": bool(memories),
+        "has_operations": bool(operations),
+        "has_lineage": bool(lineage),
+        "has_source_attribution": bool(source_backed_memory) and not unattributed,
+        "has_tenant_isolation": has_tenant_isolation,
+        "has_audit": has_audit,
+        "has_retention_policy": has_retention,
+        "has_deletion_policy": has_deletion,
+        "has_redaction": has_redaction,
+        "has_canaries": has_canaries,
+        "has_observability": observability_hook_count > 0,
+        "has_artifacts": artifact_count > 0,
+        "store_count": len(stores),
+        "memory_count": len(memories),
+        "operation_count": len(operations),
+        "read_operation_count": sum(1 for item in operations if item.get("operation") == "read"),
+        "write_operation_count": sum(1 for item in operations if item.get("operation") == "write"),
+        "update_operation_count": sum(1 for item in operations if item.get("operation") == "update"),
+        "delete_operation_count": sum(1 for item in operations if item.get("operation") == "delete"),
+        "recall_operation_count": sum(1 for item in operations if item.get("operation") == "recall"),
+        "attributed_memory_count": len(source_backed_memory),
+        "unattributed_memory_count": len(unattributed),
+        "unattributed_memories": sorted(unattributed),
+        "poisoned_memory_count": len(poisoned_memories),
+        "poisoned_memories": sorted(poisoned_memories),
+        "open_poisoning_count": len(poison_failures) + len(poisoned_memories),
+        "poisoning_failures": sorted(poison_failures),
+        "isolation_violation_count": len(isolation_failures),
+        "isolation_violations": sorted(isolation_failures),
+        "retention_violation_count": len(retention_failures),
+        "retention_violations": sorted(retention_failures),
+        "policy_violation_count": len(policy_violations),
+        "policy_violations": sorted(policy_violations),
+        "audited_operation_count": audited_operation_count,
+        "artifact_count": artifact_count,
+        "observability_hook_count": observability_hook_count,
+        "observed_evidence": sorted(observed_evidence),
+        "observed_signals": sorted(observed_signals),
+        "operation_types": sorted(operation_types),
+        "policy_keys": sorted(policy_keys),
+        "blocking_gap_count": len(set(blocking_gaps)),
+        "blocking_gaps": sorted(set(blocking_gaps)),
+        "missing_required_evidence": missing_required_evidence,
+        "missing_required_signals": missing_required_signals,
+    }
+
+
+def _memory_lineage_operations(value: Any) -> List[Dict[str, Any]]:
+    records = _memory_lineage_records(value)
+    for index, item in enumerate(records, start=1):
+        operation = _memory_lineage_operation(item.get("operation") or item.get("type") or item.get("op"))
+        item["operation"] = operation
+        item["id"] = str(item.get("id") or item.get("name") or f"{operation}_{index}")
+        if item.get("status") is not None:
+            item["status"] = _memory_lineage_key(item.get("status"))
+        if item.get("policy_decision") is not None:
+            item["policy_decision"] = _memory_lineage_key(item.get("policy_decision"))
+        item["signals"] = sorted(set(_memory_lineage_key_list(item.get("signals"))) | {"operation", f"{operation}_operation"})
+    return records
+
+
+def _memory_lineage_policy_map(value: Any) -> Dict[str, Any]:
+    if value in (None, "", [], {}):
+        return {}
+    if isinstance(value, Mapping):
+        return {
+            _memory_lineage_key(key): copy.deepcopy(val)
+            for key, val in value.items()
+            if _memory_lineage_key(key)
+        }
+    policies: Dict[str, Any] = {}
+    for item in _as_iterable(value):
+        if isinstance(item, Mapping):
+            data = dict(item)
+            key = _memory_lineage_key(data.get("key") or data.get("id") or data.get("name") or data.get("category"))
+            if key:
+                policies[key] = copy.deepcopy(data)
+        else:
+            key = _memory_lineage_key(item)
+            if key:
+                policies[key] = True
+    return policies
+
+
+def _memory_lineage_records(value: Any) -> List[Dict[str, Any]]:
+    records: List[Dict[str, Any]] = []
+    for index, raw in enumerate(_as_iterable(value), start=1):
+        if raw in (None, "", [], {}):
+            continue
+        item = copy.deepcopy(dict(raw)) if isinstance(raw, Mapping) else {"id": str(raw)}
+        item["id"] = str(item.get("id") or item.get("key") or item.get("name") or f"record_{index}")
+        if item.get("status") is not None:
+            item["status"] = _memory_lineage_key(item.get("status"))
+        if item.get("source_ids") is None:
+            sources = item.get("sources", item.get("doc_ids", item.get("source")))
+            source_ids = [str(source) for source in _as_iterable(sources) if source not in (None, "")]
+            if source_ids:
+                item["source_ids"] = source_ids
+        signals = set(_memory_lineage_key_list(item.get("signals")))
+        for field in ("type", "kind", "scope", "tenant", "store", "sensitivity", "category"):
+            normalized = _memory_lineage_key(item.get(field))
+            if normalized:
+                signals.add(normalized)
+        item["signals"] = sorted(signal for signal in signals if signal)
+        records.append(item)
+    return records
+
+
+def _memory_lineage_mapping(value: Any) -> Dict[str, Any]:
+    if value in (None, "", [], {}):
+        return {}
+    if isinstance(value, Mapping):
+        return copy.deepcopy(dict(value))
+    return {"name": str(value)}
+
+
+def _memory_lineage_signals(
+    *,
+    target: Mapping[str, Any],
+    stores: Sequence[Mapping[str, Any]],
+    memories: Sequence[Mapping[str, Any]],
+    operations: Sequence[Mapping[str, Any]],
+    lineage: Sequence[Mapping[str, Any]],
+    policies: Mapping[str, Any],
+    poison_tests: Sequence[Mapping[str, Any]],
+    isolation_tests: Sequence[Mapping[str, Any]],
+    retention_tests: Sequence[Mapping[str, Any]],
+    observability: Mapping[str, Any],
+    artifacts: Sequence[Mapping[str, Any]],
+    summary: Mapping[str, Any],
+) -> List[str]:
+    signals = _memory_lineage_signal_set(
+        target,
+        *stores,
+        *memories,
+        *operations,
+        *lineage,
+        policies,
+        *poison_tests,
+        *isolation_tests,
+        *retention_tests,
+        observability,
+        *artifacts,
+    )
+    signals.update(_memory_lineage_key_list(summary.get("observed_evidence")))
+    signals.update(_memory_lineage_key_list(summary.get("operation_types")))
+    signals.update(_memory_lineage_key_list(summary.get("policy_keys")))
+    return sorted(signal for signal in signals if signal)
+
+
+def _memory_lineage_signal_set(*values: Any) -> set[str]:
+    signals = {"agent_memory_lineage", "memory_lineage", "memory_provenance", "memory", "provenance"}
+    for value in values:
+        if not isinstance(value, Mapping):
+            continue
+        signals.update(_memory_lineage_key_list(value.get("signals")))
+        for key in value.keys():
+            normalized = _memory_lineage_key(key)
+            if normalized in {
+                "tenant_isolation",
+                "memory_isolation",
+                "source_attribution",
+                "audit",
+                "retention",
+                "deletion",
+                "redaction",
+                "canary",
+                "poison_test",
+                "trace_id",
+                "source_ids",
+            }:
+                signals.add(normalized)
+        for field in ("type", "kind", "scope", "tenant", "store", "sensitivity", "category", "operation"):
+            normalized = _memory_lineage_key(value.get(field))
+            if normalized:
+                signals.add(normalized)
+    return {signal for signal in signals if signal}
+
+
+def _memory_lineage_observability_count(observability: Mapping[str, Any]) -> int:
+    count = sum(
+        len(_as_iterable(observability.get(key)))
+        for key in ("traces", "logs", "metrics", "dashboards", "webhooks", "events", "runs")
+    )
+    return count or (1 if observability else 0)
+
+
+def _memory_lineage_find_record(records: Sequence[Mapping[str, Any]], key: str) -> Optional[Dict[str, Any]]:
+    normalized = _memory_lineage_key(key)
+    for item in records:
+        if normalized in {_memory_lineage_key(item.get("id")), _memory_lineage_key(item.get("key")), _memory_lineage_key(item.get("name"))}:
+            return copy.deepcopy(dict(item))
+    return None
+
+
+def _memory_lineage_key_list(value: Any) -> List[str]:
+    return sorted({_memory_lineage_key(item) for item in _as_iterable(value) if _memory_lineage_key(item)})
+
+
+def _memory_lineage_operation(value: Any) -> str:
+    normalized = _memory_lineage_key(value)
+    aliases = {
+        "memory_write": "write",
+        "write_memory": "write",
+        "remember": "write",
+        "memory_read": "read",
+        "retrieve_memory": "read",
+        "memory_retrieval": "read",
+        "recall_memory": "recall",
+        "memory_recall": "recall",
+        "forget": "delete",
+        "purge": "delete",
+        "erase": "delete",
+        "sanitize": "update",
+        "consolidate": "update",
+    }
+    return aliases.get(normalized, normalized or "operation")
+
+
+def _memory_lineage_key(value: Any) -> str:
+    return str(value or "").strip().lower().replace("-", "_").replace(" ", "_").replace(".", "_")
+
+
 class FileEnvironment(EnvironmentAdapter):
     """In-memory file environment with read/write/list tools."""
 
