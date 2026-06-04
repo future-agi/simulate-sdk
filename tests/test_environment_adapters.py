@@ -6493,6 +6493,178 @@ async def test_red_team_campaign_environment_scores_campaign_coverage_and_qualit
 
 
 @pytest.mark.asyncio
+async def test_red_team_campaign_matrix_cells_require_bound_evidence():
+    campaign = normalize_red_team_campaign_manifest(
+        name="matrix-bound-red-team",
+        target={"agent": "support-agent"},
+        attack_packs=[
+            {
+                "id": "pack",
+                "attacks": [{"id": "prompt", "category": "prompt_injection", "surface": "tool"}],
+                "surfaces": ["tool"],
+            }
+        ],
+        scenarios=[
+            {
+                "id": "prompt_tool_chat_local",
+                "attack_type": "prompt_injection",
+                "surface": "tool",
+                "channel": "chat",
+                "provider": "local_cli",
+                "turn_count": 2,
+            }
+        ],
+        runs=[
+            {
+                "id": "prompt_tool_chat_local_run",
+                "framework": "agent_simulate",
+                "provider": "local_cli",
+                "channel": "chat",
+                "status": "passed",
+                "attack_types": ["prompt_injection"],
+                "surfaces": ["tool"],
+                "artifacts": [
+                    {
+                        "id": "prompt_tool_chat_local_artifact",
+                        "path": "artifacts/prompt_tool_chat_local.json",
+                    }
+                ],
+            }
+        ],
+        mitigations=[
+            {
+                "id": "prompt_tool_chat_local_mitigation",
+                "status": "implemented",
+                "controls": ["instruction_hierarchy"],
+                "attack_type": "prompt_injection",
+                "surface": "tool",
+                "channel": "chat",
+                "provider": "local_cli",
+            }
+        ],
+        required_attack_types=["prompt_injection"],
+        required_surfaces=["tool"],
+        required_channels=["chat"],
+        required_providers=["local_cli"],
+    )
+
+    summary = campaign["summary"]
+    assert summary["coverage_cell_count"] == 1
+    assert summary["covered_cell_count"] == 1
+    assert summary["missing_coverage_cells"] == []
+    assert summary["missing_run_artifact_cells"] == []
+    assert summary["missing_mitigation_cells"] == []
+
+    broken = normalize_red_team_campaign_manifest(
+        name="matrix-bound-red-team-broken",
+        target={"agent": "support-agent"},
+        attack_packs=[
+            {
+                "id": "pack",
+                "attacks": [{"id": "prompt", "category": "prompt_injection", "surface": "tool"}],
+                "surfaces": ["tool"],
+            }
+        ],
+        scenarios=[],
+        runs=[
+            {
+                "id": "prompt_tool_chat_local_run",
+                "framework": "agent_simulate",
+                "provider": "local_cli",
+                "channel": "chat",
+                "status": "failed",
+                "attack_types": ["prompt_injection"],
+                "surfaces": ["tool"],
+            }
+        ],
+        mitigations=[{"id": "generic", "status": "implemented", "controls": ["instruction_hierarchy"]}],
+        required_attack_types=["prompt_injection"],
+        required_surfaces=["tool"],
+        required_channels=["chat"],
+        required_providers=["local_cli"],
+    )
+    broken_summary = broken["summary"]
+    assert broken_summary["coverage_cell_count"] == 1
+    assert broken_summary["covered_cell_count"] == 0
+    assert broken_summary["missing_coverage_cells"][0]["id"] == "prompt_injection|tool|chat|local_cli"
+    assert set(broken_summary["missing_coverage_cells"][0]["missing"]) == {"scenario", "passed_run"}
+    assert broken_summary["missing_run_artifact_cells"][0]["id"] == "prompt_injection|tool|chat|local_cli"
+    assert broken_summary["missing_mitigation_cells"][0]["id"] == "prompt_injection|tool|chat|local_cli"
+
+    async def agent(input):
+        return AgentResponse(
+            content="Campaign gaps inspected.",
+            tool_calls=[{"id": "gaps", "name": "list_red_team_campaign_gaps", "arguments": {}}],
+        )
+
+    report = await LocalTextEngine().run(
+        scenario=_scenario(),
+        agent_callback=agent,
+        environment=RedTeamCampaignEnvironment(broken),
+        max_turns=1,
+        min_turns=1,
+    )
+    tool_result = next(
+        event.payload
+        for event in report.results[0].events
+        if event.name == "red_team_campaign_gaps_listed"
+    )
+    assert tool_result["missing_coverage_cells"][0]["id"] == "prompt_injection|tool|chat|local_cli"
+    assert tool_result["missing_run_artifact_cells"][0]["id"] == "prompt_injection|tool|chat|local_cli"
+    assert tool_result["missing_mitigation_cells"][0]["id"] == "prompt_injection|tool|chat|local_cli"
+
+
+def test_red_team_readiness_fails_when_campaign_has_matrix_binding_gaps():
+    campaign = {
+        "kind": "red_team_campaign",
+        "summary": {
+            "has_target": True,
+            "attack_count": 1,
+            "scenario_count": 1,
+            "run_count": 1,
+            "passed_run_count": 1,
+            "multi_turn_scenario_count": 1,
+            "artifact_count": 1,
+            "mitigation_count": 1,
+            "observability_hook_count": 1,
+            "failed_run_count": 0,
+            "open_high_finding_count": 0,
+            "missing_required_taxonomies": [],
+            "missing_required_attack_types": [],
+            "missing_required_surfaces": [],
+            "missing_required_channels": [],
+            "missing_required_providers": [],
+            "missing_coverage_cells": [
+                {
+                    "id": "prompt_injection|tool|chat|local_cli",
+                    "attack_type": "prompt_injection",
+                    "surface": "tool",
+                    "channel": "chat",
+                    "provider": "local_cli",
+                    "missing": ["passed_run"],
+                }
+            ],
+            "missing_run_artifact_cells": [],
+            "missing_mitigation_cells": [],
+        },
+    }
+    readiness = normalize_red_team_readiness_manifest(
+        name="readiness-with-campaign-gap",
+        target={"agent": "support-agent"},
+        red_team_campaign=campaign,
+        workspace_run={"kind": "workspace_run_manifest", "summary": {"has_repository": True}},
+        trust_boundary={"kind": "agent_trust_boundary_model", "summary": {"has_sandbox": True}},
+        control_plane={"kind": "agent_control_plane", "summary": {"has_rollback": True}},
+        observability={"traces": ["trace_readiness"]},
+        artifacts=[{"id": "readiness", "type": "readiness_report"}],
+    )
+
+    assert readiness["summary"]["red_team_campaign_ready"] is False
+    assert "red_team_campaign" in readiness["summary"]["failed_components"]
+    assert "red_team_campaign_not_ready" in readiness["summary"]["blocking_gaps"]
+
+
+@pytest.mark.asyncio
 async def test_red_team_readiness_environment_scores_composed_preflight_gate():
     framework_import = normalize_framework_import_manifest(
         {
@@ -6532,8 +6704,15 @@ async def test_red_team_readiness_environment_scores_composed_preflight_gate():
             {"id": "prompt_injection", "category": "prompt_injection", "surface": "tool", "payload": "Ignore policy."},
             {"id": "memory_poisoning", "category": "memory_poisoning", "surface": "memory", "payload": "Store false policy."},
             {"id": "social_engineering", "category": "social_engineering", "surface": "voice", "payload": "Bypass identity."},
-        ],
-    )
+            ],
+        )
+    campaign_cell_ids = [
+        f"{attack_type}|{surface}|{channel}|{provider}"
+        for attack_type in ("prompt_injection", "memory_poisoning", "tool_abuse", "social_engineering")
+        for surface in ("tool", "memory", "voice")
+        for channel in ("chat", "voice")
+        for provider in ("livekit_bridge", "langgraph")
+    ]
     campaign = normalize_red_team_campaign_manifest(
         name="support-agent-red-team",
         target={"agent": "support-agent", "frameworks": ["livekit", "langgraph"], "environment": "staging"},
@@ -6543,20 +6722,23 @@ async def test_red_team_readiness_environment_scores_composed_preflight_gate():
             {"key": "mcp_security"},
         ],
         attack_packs=[attack_pack],
-        scenarios=[
-            {"id": "tool_hijack", "attack_type": "prompt_injection", "surface": "tool", "provider": "livekit_bridge", "channel": "chat", "turn_count": 4},
-            {"id": "voice_pressure", "attack_type": "social_engineering", "surface": "voice", "provider": "livekit_bridge", "channel": "voice", "turn_count": 5},
-            {"id": "memory_poison", "attack_type": "memory_poisoning", "surface": "memory", "provider": "langgraph", "channel": "chat", "turn_count": 2},
-        ],
-        runs=[
-            {"id": "garak_llm", "framework": "garak", "provider": "livekit_bridge", "channel": "chat", "status": "passed", "taxonomies": ["owasp_llm_top_10"], "attack_types": ["prompt_injection"], "surfaces": ["tool"], "artifacts": [{"path": "artifacts/garak.jsonl", "type": "red_team_report"}]},
-            {"id": "pyrit_agentic", "framework": "pyrit", "provider": "langgraph", "channel": "chat", "status": "passed", "taxonomies": ["owasp_agentic_ai", "mcp_security"], "attack_types": ["memory_poisoning", "tool_abuse"], "surfaces": ["memory", "tool"], "artifacts": [{"path": "artifacts/pyrit.jsonl", "type": "red_team_report"}]},
-            {"id": "voice_manual", "framework": "manual", "provider": "livekit_bridge", "channel": "voice", "status": "passed", "taxonomies": ["owasp_agentic_ai"], "attack_types": ["social_engineering"], "surfaces": ["voice"], "turn_count": 5, "artifacts": [{"path": "artifacts/voice.wav", "type": "audio"}]},
-        ],
-        findings=[{"id": "low_prompt_leak", "severity": "low", "status": "accepted"}],
-        artifacts=[{"id": "summary", "type": "campaign_report", "path": "artifacts/campaign.json"}],
-        observability={"traces": ["trace_red_team"], "logs": ["artifacts/garak.jsonl"], "webhooks": ["red_team.completed"]},
-        mitigations=[{"id": "secret_filter", "status": "implemented"}, {"id": "tool_gate", "status": "implemented"}],
+            scenarios=[
+                {"id": "tool_hijack", "attack_type": "prompt_injection", "surface": "tool", "provider": "livekit_bridge", "channel": "chat", "turn_count": 4, "matrix_cell_ids": campaign_cell_ids},
+                {"id": "voice_pressure", "attack_type": "social_engineering", "surface": "voice", "provider": "livekit_bridge", "channel": "voice", "turn_count": 5, "matrix_cell_ids": campaign_cell_ids},
+                {"id": "memory_poison", "attack_type": "memory_poisoning", "surface": "memory", "provider": "langgraph", "channel": "chat", "turn_count": 2, "matrix_cell_ids": campaign_cell_ids},
+            ],
+            runs=[
+                {"id": "garak_llm", "framework": "garak", "provider": "livekit_bridge", "channel": "chat", "status": "passed", "taxonomies": ["owasp_llm_top_10"], "attack_types": ["prompt_injection"], "surfaces": ["tool"], "matrix_cell_ids": campaign_cell_ids, "artifacts": [{"path": "artifacts/garak.jsonl", "type": "red_team_report"}]},
+                {"id": "pyrit_agentic", "framework": "pyrit", "provider": "langgraph", "channel": "chat", "status": "passed", "taxonomies": ["owasp_agentic_ai", "mcp_security"], "attack_types": ["memory_poisoning", "tool_abuse"], "surfaces": ["memory", "tool"], "matrix_cell_ids": campaign_cell_ids, "artifacts": [{"path": "artifacts/pyrit.jsonl", "type": "red_team_report"}]},
+                {"id": "voice_manual", "framework": "manual", "provider": "livekit_bridge", "channel": "voice", "status": "passed", "taxonomies": ["owasp_agentic_ai"], "attack_types": ["social_engineering"], "surfaces": ["voice"], "turn_count": 5, "matrix_cell_ids": campaign_cell_ids, "artifacts": [{"path": "artifacts/voice.wav", "type": "audio"}]},
+            ],
+            findings=[{"id": "low_prompt_leak", "severity": "low", "status": "accepted"}],
+            artifacts=[{"id": "summary", "type": "campaign_report", "path": "artifacts/campaign.json", "matrix_cell_ids": campaign_cell_ids}],
+            observability={"traces": ["trace_red_team"], "logs": ["artifacts/garak.jsonl"], "webhooks": ["red_team.completed"]},
+            mitigations=[
+                {"id": "secret_filter", "status": "implemented", "matrix_cell_ids": campaign_cell_ids},
+                {"id": "tool_gate", "status": "implemented", "matrix_cell_ids": campaign_cell_ids},
+            ],
         required_taxonomies=["owasp_llm_top_10", "owasp_agentic_ai", "mcp_security"],
         required_attack_types=["prompt_injection", "memory_poisoning", "tool_abuse", "social_engineering"],
         required_surfaces=["tool", "memory", "voice"],

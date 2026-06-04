@@ -3390,7 +3390,8 @@ def _normalize_red_team_runs(value: Any) -> List[Dict[str, Any]]:
         surfaces = _red_team_key_list(item.get("surfaces") or item.get("surface"))
         framework = _red_team_key(item.get("framework") or item.get("tool") or item.get("runner"))
         provider = _red_team_key(item.get("provider"))
-        channel = _red_team_key(item.get("channel") or item.get("modality"))
+        channels = _red_team_dimension_values(item, "channels", "channel", "modalities", "modality")
+        channel = channels[0] if channels else ""
         signals = {
             "run",
             "red_team",
@@ -3411,6 +3412,7 @@ def _normalize_red_team_runs(value: Any) -> List[Dict[str, Any]]:
                 "framework": framework,
                 "provider": provider,
                 "channel": channel,
+                "channels": channels,
                 "status": status,
                 "passed": status == "passed",
                 "taxonomies": taxonomies,
@@ -3418,6 +3420,16 @@ def _normalize_red_team_runs(value: Any) -> List[Dict[str, Any]]:
                 "surfaces": surfaces,
                 "findings": findings,
                 "open_high_finding_count": len(open_high),
+                "matrix_cell_ids": _red_team_dimension_values(
+                    item,
+                    "matrix_cell_ids",
+                    "matrix_cells",
+                    "coverage_cell_ids",
+                    "cell_ids",
+                    "matrix_cell_id",
+                    "coverage_cell_id",
+                    "cell_id",
+                ),
                 "signals": sorted(signal for signal in signals if signal),
             }
         )
@@ -3454,11 +3466,29 @@ def _normalize_red_team_artifacts(value: Any, *, runs: Sequence[Mapping[str, Any
     for index, raw in enumerate(_as_iterable(value), start=1):
         item = copy.deepcopy(dict(raw)) if isinstance(raw, Mapping) else {"path": str(raw)}
         artifact_type = _red_team_key(item.get("type") or item.get("kind") or item.get("format") or "artifact")
+        attack_types = _red_team_dimension_values(item, "attack_types", "attacks", "attack_type", "category")
+        surfaces = _red_team_dimension_values(item, "surfaces", "surface")
+        channels = _red_team_dimension_values(item, "channels", "channel", "modalities", "modality")
+        providers = _red_team_dimension_values(item, "providers", "provider")
         item.update(
             {
                 "id": str(item.get("id") or item.get("name") or f"artifact_{index}"),
                 "type": artifact_type,
                 "path": str(item.get("path") or item.get("uri") or item.get("url") or ""),
+                "attack_types": attack_types,
+                "surfaces": surfaces,
+                "channels": channels,
+                "providers": providers,
+                "matrix_cell_ids": _red_team_dimension_values(
+                    item,
+                    "matrix_cell_ids",
+                    "matrix_cells",
+                    "coverage_cell_ids",
+                    "cell_ids",
+                    "matrix_cell_id",
+                    "coverage_cell_id",
+                    "cell_id",
+                ),
                 "signals": sorted(
                     {
                         "artifact",
@@ -3474,7 +3504,28 @@ def _normalize_red_team_artifacts(value: Any, *, runs: Sequence[Mapping[str, Any
             item = copy.deepcopy(dict(artifact)) if isinstance(artifact, Mapping) else {"path": str(artifact)}
             item.setdefault("id", f"{run.get('id')}_artifact_{len(records) + 1}")
             item.setdefault("type", "artifact")
+            item.setdefault("run_id", run.get("id"))
+            item.setdefault("provider", run.get("provider"))
+            item.setdefault("channel", run.get("channel"))
+            item.setdefault("channels", run.get("channels"))
+            item.setdefault("attack_types", run.get("attack_types"))
+            item.setdefault("surfaces", run.get("surfaces"))
+            item.setdefault("matrix_cell_ids", run.get("matrix_cell_ids"))
             item["signals"] = sorted({"artifact", *_as_iterable(item.get("signals"))})
+            item["attack_types"] = _red_team_dimension_values(item, "attack_types", "attacks", "attack_type", "category")
+            item["surfaces"] = _red_team_dimension_values(item, "surfaces", "surface")
+            item["channels"] = _red_team_dimension_values(item, "channels", "channel", "modalities", "modality")
+            item["providers"] = _red_team_dimension_values(item, "providers", "provider")
+            item["matrix_cell_ids"] = _red_team_dimension_values(
+                item,
+                "matrix_cell_ids",
+                "matrix_cells",
+                "coverage_cell_ids",
+                "cell_ids",
+                "matrix_cell_id",
+                "coverage_cell_id",
+                "cell_id",
+            )
             records.append(item)
     return records
 
@@ -3483,15 +3534,199 @@ def _normalize_red_team_mitigations(value: Any) -> List[Dict[str, Any]]:
     records: List[Dict[str, Any]] = []
     for index, raw in enumerate(_as_iterable(value), start=1):
         item = copy.deepcopy(dict(raw)) if isinstance(raw, Mapping) else {"name": str(raw)}
+        attack_types = _red_team_dimension_values(item, "attack_types", "attacks", "attack_type", "category")
+        surfaces = _red_team_dimension_values(item, "surfaces", "surface")
+        channels = _red_team_dimension_values(item, "channels", "channel", "modalities", "modality")
+        providers = _red_team_dimension_values(item, "providers", "provider")
         item.update(
             {
                 "id": str(item.get("id") or item.get("name") or f"mitigation_{index}"),
                 "status": _red_team_key(item.get("status") or item.get("state") or "implemented"),
                 "controls": _red_team_key_list(item.get("controls") or item.get("control")),
+                "attack_types": attack_types,
+                "surfaces": surfaces,
+                "channels": channels,
+                "providers": providers,
+                "matrix_cell_ids": _red_team_dimension_values(
+                    item,
+                    "matrix_cell_ids",
+                    "matrix_cells",
+                    "coverage_cell_ids",
+                    "cell_ids",
+                    "matrix_cell_id",
+                    "coverage_cell_id",
+                    "cell_id",
+                ),
             }
         )
         records.append(item)
     return records
+
+
+def _red_team_dimension_values(item: Mapping[str, Any], *fields: str) -> List[str]:
+    values: set[str] = set()
+    for field in fields:
+        if field not in item:
+            continue
+        values.update(_red_team_key(value) for value in _as_iterable(item.get(field)) if _red_team_key(value))
+    return sorted(values)
+
+
+def _red_team_cell_id(
+    *,
+    attack_type: str,
+    surface: str,
+    channel: str,
+    provider: str,
+) -> str:
+    return "|".join([attack_type, surface, channel, provider])
+
+
+def _red_team_required_matrix_cells(
+    *,
+    required_attack_types: Sequence[str],
+    required_surfaces: Sequence[str],
+    required_channels: Sequence[str],
+    required_providers: Sequence[str],
+) -> List[Dict[str, str]]:
+    dimensions = [
+        sorted({_red_team_key(item) for item in required_attack_types if _red_team_key(item)}),
+        sorted({_red_team_key(item) for item in required_surfaces if _red_team_key(item)}),
+        sorted({_red_team_key(item) for item in required_channels if _red_team_key(item)}),
+        sorted({_red_team_key(item) for item in required_providers if _red_team_key(item)}),
+    ]
+    if any(not dimension for dimension in dimensions):
+        return []
+    cells: List[Dict[str, str]] = []
+    for attack_type in dimensions[0]:
+        for surface in dimensions[1]:
+            for channel in dimensions[2]:
+                for provider in dimensions[3]:
+                    cells.append(
+                        {
+                            "id": _red_team_cell_id(
+                                attack_type=attack_type,
+                                surface=surface,
+                                channel=channel,
+                                provider=provider,
+                            ),
+                            "attack_type": attack_type,
+                            "surface": surface,
+                            "channel": channel,
+                            "provider": provider,
+                        }
+                    )
+    return cells
+
+
+def _red_team_item_covers_cell(item: Mapping[str, Any], cell: Mapping[str, str]) -> bool:
+    declared_cell_ids = _red_team_dimension_values(
+        item,
+        "matrix_cell_ids",
+        "matrix_cells",
+        "coverage_cell_ids",
+        "cell_ids",
+        "matrix_cell_id",
+        "coverage_cell_id",
+        "cell_id",
+    )
+    if cell.get("id") in set(declared_cell_ids):
+        return True
+    required = {
+        "attack_type": _red_team_dimension_values(item, "attack_types", "attacks", "attack_type", "category"),
+        "surface": _red_team_dimension_values(item, "surfaces", "surface"),
+        "channel": _red_team_dimension_values(item, "channels", "channel", "modalities", "modality"),
+        "provider": _red_team_dimension_values(item, "providers", "provider"),
+    }
+    for dimension, values in required.items():
+        if cell.get(dimension) not in set(values):
+            return False
+    return True
+
+
+def _red_team_missing_cell(cell: Mapping[str, Any], missing: Sequence[str]) -> Dict[str, Any]:
+    return {
+        "id": str(cell.get("id") or ""),
+        "attack_type": str(cell.get("attack_type") or ""),
+        "surface": str(cell.get("surface") or ""),
+        "channel": str(cell.get("channel") or ""),
+        "provider": str(cell.get("provider") or ""),
+        "missing": sorted({str(item) for item in missing if item}),
+    }
+
+
+def _red_team_campaign_matrix_summary(
+    *,
+    scenarios: Sequence[Mapping[str, Any]],
+    runs: Sequence[Mapping[str, Any]],
+    artifacts: Sequence[Mapping[str, Any]],
+    mitigations: Sequence[Mapping[str, Any]],
+    required_attack_types: Sequence[str],
+    required_surfaces: Sequence[str],
+    required_channels: Sequence[str],
+    required_providers: Sequence[str],
+) -> Dict[str, Any]:
+    required_cells = _red_team_required_matrix_cells(
+        required_attack_types=required_attack_types,
+        required_surfaces=required_surfaces,
+        required_channels=required_channels,
+        required_providers=required_providers,
+    )
+    coverage_matrix: List[Dict[str, Any]] = []
+    missing_coverage_cells: List[Dict[str, Any]] = []
+    missing_run_artifact_cells: List[Dict[str, Any]] = []
+    missing_mitigation_cells: List[Dict[str, Any]] = []
+    for cell in required_cells:
+        scenario_ids = sorted(str(item.get("id")) for item in scenarios if item.get("id") and _red_team_item_covers_cell(item, cell))
+        run_ids = sorted(str(item.get("id")) for item in runs if item.get("id") and _red_team_item_covers_cell(item, cell))
+        passed_run_ids = sorted(
+            str(item.get("id"))
+            for item in runs
+            if item.get("id") and item.get("status") == "passed" and _red_team_item_covers_cell(item, cell)
+        )
+        artifact_ids = sorted(str(item.get("id")) for item in artifacts if item.get("id") and _red_team_item_covers_cell(item, cell))
+        mitigation_ids = sorted(
+            str(item.get("id"))
+            for item in mitigations
+            if item.get("id")
+            and item.get("status") in {"implemented", "passed", "mitigated"}
+            and _red_team_item_covers_cell(item, cell)
+        )
+        matrix_cell = {
+            **cell,
+            "scenario_ids": scenario_ids,
+            "run_ids": run_ids,
+            "passed_run_ids": passed_run_ids,
+            "artifact_ids": artifact_ids,
+            "mitigation_ids": mitigation_ids,
+            "has_scenario": bool(scenario_ids),
+            "has_run": bool(run_ids),
+            "has_passed_run": bool(passed_run_ids),
+            "has_artifact": bool(artifact_ids),
+            "has_mitigation": bool(mitigation_ids),
+        }
+        coverage_matrix.append(matrix_cell)
+        coverage_missing = []
+        if not scenario_ids:
+            coverage_missing.append("scenario")
+        if not passed_run_ids:
+            coverage_missing.append("passed_run")
+        if coverage_missing:
+            missing_coverage_cells.append(_red_team_missing_cell(cell, coverage_missing))
+        if not artifact_ids:
+            missing_run_artifact_cells.append(_red_team_missing_cell(cell, ["artifact"]))
+        if not mitigation_ids:
+            missing_mitigation_cells.append(_red_team_missing_cell(cell, ["mitigation"]))
+    return {
+        "coverage_cell_count": len(coverage_matrix),
+        "covered_cell_count": sum(1 for cell in coverage_matrix if cell.get("has_scenario") and cell.get("has_passed_run")),
+        "artifact_bound_cell_count": sum(1 for cell in coverage_matrix if cell.get("has_artifact")),
+        "mitigation_bound_cell_count": sum(1 for cell in coverage_matrix if cell.get("has_mitigation")),
+        "coverage_matrix": coverage_matrix,
+        "missing_coverage_cells": missing_coverage_cells,
+        "missing_run_artifact_cells": missing_run_artifact_cells,
+        "missing_mitigation_cells": missing_mitigation_cells,
+    }
 
 
 def _red_team_campaign_summary(
@@ -3532,7 +3767,7 @@ def _red_team_campaign_summary(
         observed_taxonomies.update(_red_team_key_list(run.get("taxonomies")))
         observed_attack_types.update(_red_team_key_list(run.get("attack_types")))
         observed_surfaces.update(_red_team_key_list(run.get("surfaces")))
-        observed_channels.add(_red_team_key(run.get("channel")))
+        observed_channels.update(_red_team_dimension_values(run, "channels", "channel", "modalities", "modality"))
         observed_providers.add(_red_team_key(run.get("provider")))
         frameworks.add(_red_team_key(run.get("framework")))
     for finding in findings:
@@ -3557,6 +3792,16 @@ def _red_team_campaign_summary(
     )
     if observability and not observability_hook_count:
         observability_hook_count = 1
+    matrix_summary = _red_team_campaign_matrix_summary(
+        scenarios=scenarios,
+        runs=runs,
+        artifacts=artifacts,
+        mitigations=mitigations,
+        required_attack_types=required_attack_types,
+        required_surfaces=required_surfaces,
+        required_channels=required_channels,
+        required_providers=required_providers,
+    )
     return {
         "has_target": bool(target),
         "attack_pack_count": len(attack_packs),
@@ -3586,6 +3831,7 @@ def _red_team_campaign_summary(
         "missing_required_surfaces": sorted(set(required_surfaces) - observed_surfaces),
         "missing_required_channels": sorted(set(required_channels) - observed_channels),
         "missing_required_providers": sorted(set(required_providers) - observed_providers),
+        **matrix_summary,
     }
 
 
@@ -4085,6 +4331,11 @@ class RedTeamCampaignEnvironment(EnvironmentAdapter):
                 "missing_required_surfaces": summary.get("missing_required_surfaces", []),
                 "missing_required_channels": summary.get("missing_required_channels", []),
                 "missing_required_providers": summary.get("missing_required_providers", []),
+                "missing_coverage_cells": summary.get("missing_coverage_cells", []),
+                "missing_run_artifact_cells": summary.get("missing_run_artifact_cells", []),
+                "missing_mitigation_cells": summary.get("missing_mitigation_cells", []),
+                "coverage_cell_count": summary.get("coverage_cell_count", 0),
+                "covered_cell_count": summary.get("covered_cell_count", 0),
                 "failed_runs": summary.get("failed_runs", []),
                 "open_high_findings": summary.get("open_high_findings", []),
             }
@@ -15636,6 +15887,9 @@ def _red_team_readiness_campaign_ready(payload: Mapping[str, Any]) -> bool:
                 "missing_required_surfaces",
                 "missing_required_channels",
                 "missing_required_providers",
+                "missing_coverage_cells",
+                "missing_run_artifact_cells",
+                "missing_mitigation_cells",
             )
         )
     )
