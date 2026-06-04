@@ -8,6 +8,7 @@ import pytest
 from fi.simulate import (
     MANIFEST_SCHEMA_VERSION,
     ManifestError,
+    build_manifest_agent_callback,
     compare_results,
     create_baseline,
     detect_manifest_command,
@@ -23,6 +24,30 @@ from fi.simulate import (
     run_manifest_file,
     validate_manifest_env,
 )
+
+
+FRAMEWORK_AGENT_MODULE = """
+class LangGraphLikeAgent:
+    async def ainvoke(self, payload):
+        assert "manifest-declared framework target" in payload["input"]
+        assert payload["metadata"]["framework"] == "langgraph"
+        assert payload["metadata"]["suite"] == "manifest-framework"
+        return {
+            "content": "Framework manifest target passed with runtime trace evidence.",
+            "tool_calls": [
+                {
+                    "id": "trace",
+                    "name": "inspect_framework_runtime",
+                    "arguments": {"framework": "langgraph"},
+                }
+            ],
+            "metadata": {"runtime_contract": {"passed": True}},
+        }
+
+
+def build_agent():
+    return LangGraphLikeAgent()
+"""
 
 
 def _local_run_manifest():
@@ -49,6 +74,36 @@ def _local_run_manifest():
     }
 
 
+def _framework_run_manifest():
+    return {
+        "version": MANIFEST_SCHEMA_VERSION,
+        "name": "public-framework-manifest-api",
+        "required_env": ["SIMULATE_PUBLIC_FRAMEWORK_KEY"],
+        "scenario": {
+            "name": "public-framework-manifest-api",
+            "dataset": [
+                {
+                    "persona": {"name": "Maya", "role": "sdk-owner"},
+                    "situation": "Maya needs a manifest-declared framework target certified.",
+                    "outcome": "Framework manifest target passed with runtime trace evidence.",
+                }
+            ],
+        },
+        "agent": {
+            "type": "framework",
+            "framework": "langgraph",
+            "target": "framework_agent.py:build_agent",
+            "factory": True,
+            "method": "ainvoke",
+            "input_mode": "dict",
+            "trace_runtime": True,
+            "metadata": {"suite": "manifest-framework"},
+        },
+        "simulation": {"engine": "local_text", "max_turns": 1, "min_turns": 1},
+        "evaluation": {"enabled": False},
+    }
+
+
 def test_public_manifest_api_detects_commands_and_validates_env(monkeypatch):
     manifest = _local_run_manifest()
 
@@ -60,6 +115,32 @@ def test_public_manifest_api_detects_commands_and_validates_env(monkeypatch):
     assert missing_manifest_env(manifest) == ["SIMULATE_PUBLIC_MANIFEST_KEY"]
     with pytest.raises(ManifestError, match="SIMULATE_PUBLIC_MANIFEST_KEY"):
         validate_manifest_env(manifest)
+
+
+@pytest.mark.asyncio
+async def test_public_manifest_builds_framework_agent_callback(tmp_path, monkeypatch):
+    monkeypatch.setenv("SIMULATE_PUBLIC_FRAMEWORK_KEY", "real-local-framework-key")
+    (tmp_path / "framework_agent.py").write_text(
+        FRAMEWORK_AGENT_MODULE,
+        encoding="utf-8",
+    )
+    callback = build_manifest_agent_callback(
+        _framework_run_manifest()["agent"],
+        base_dir=tmp_path,
+    )
+
+    result = await run_manifest_file(
+        _write_manifest(tmp_path / "framework.json", _framework_run_manifest()),
+        no_eval=True,
+    )
+
+    assert callback.metadata["framework"] == "langgraph"
+    assert result["status"] == "passed"
+    case = result["report"]["results"][0]
+    assert "Framework manifest target passed" in case["transcript"]
+    runtime = case["metadata"]["environment_state"]["framework_runtime"]
+    assert runtime["framework"] == "langgraph"
+    assert runtime["summary"]["tool_call_count"] == 1
 
 
 def test_public_run_manifest_file_executes_real_local_manifest(tmp_path, monkeypatch):
@@ -90,6 +171,11 @@ def test_public_run_manifest_file_executes_real_local_manifest(tmp_path, monkeyp
     assert "public manifest runtime executed" in result["report"]["results"][0][
         "transcript"
     ].lower()
+
+
+def _write_manifest(path: Path, manifest: dict):
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+    return path
 
 
 def test_public_optimize_manifest_file_runs_when_agent_opt_is_available(monkeypatch):

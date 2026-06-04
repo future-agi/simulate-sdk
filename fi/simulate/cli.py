@@ -353,7 +353,81 @@ def _build_agent_callback(agent: Mapping[str, Any], base_dir: Path) -> Callable[
         if not target:
             raise ManifestError("agent.type=python requires agent.callable")
         return _load_callable(target, base_dir)
+    if agent_type in {"framework", "framework_adapter", "framework_callable"}:
+        return _build_framework_agent_callback(agent, base_dir)
     raise ManifestError(f"unsupported agent.type: {agent_type}")
+
+
+def _build_framework_agent_callback(
+    agent: Mapping[str, Any],
+    base_dir: Path,
+) -> Callable[..., Any]:
+    framework = str(agent.get("framework") or "").strip()
+    if not framework:
+        raise ManifestError("agent.type=framework requires agent.framework")
+    target = str(agent.get("target") or agent.get("callable") or "").strip()
+    if not target:
+        raise ManifestError("agent.type=framework requires agent.target or agent.callable")
+
+    from fi.simulate.agent.frameworks import wrap_framework
+
+    loaded = _load_callable(target, base_dir)
+    framework_agent = _materialize_framework_agent(loaded, agent)
+    return wrap_framework(
+        framework,
+        framework_agent,
+        method=_optional_string(agent.get("method")),
+        input_mode=_manifest_input_mode(agent.get("input_mode")),
+        system_prompt=_optional_string(agent.get("system_prompt")),
+        output_key=_optional_string(agent.get("output_key")),
+        metadata=_optional_mapping(agent.get("metadata"), "agent.metadata"),
+        trace_runtime=bool(agent.get("trace_runtime", agent.get("trace", False))),
+        runtime_metadata=_optional_mapping(
+            agent.get("runtime_metadata"),
+            "agent.runtime_metadata",
+        ),
+    )
+
+
+def _materialize_framework_agent(loaded: Callable[..., Any], agent: Mapping[str, Any]) -> Any:
+    if not bool(agent.get("factory") or agent.get("instantiate")):
+        return loaded
+    args = _coerce_list(agent.get("factory_args", agent.get("args")))
+    kwargs = _optional_mapping(
+        agent.get("factory_kwargs", agent.get("kwargs")),
+        "agent.factory_kwargs",
+    )
+    try:
+        return loaded(*args, **kwargs)
+    except TypeError as exc:
+        raise ManifestError(f"agent framework factory failed: {exc}") from exc
+
+
+def _manifest_input_mode(value: Any) -> Optional[str]:
+    if value in (None, ""):
+        return None
+    mode = str(value).lower().replace("-", "_")
+    allowed = {"auto", "agent_input", "dict", "messages", "text"}
+    if mode not in allowed:
+        raise ManifestError(
+            "agent.input_mode must be one of: "
+            f"{', '.join(sorted(allowed))}"
+        )
+    return mode
+
+
+def _optional_mapping(value: Any, field: str) -> Dict[str, Any]:
+    if value in (None, ""):
+        return {}
+    if not isinstance(value, Mapping):
+        raise ManifestError(f"{field} must be an object")
+    return dict(value)
+
+
+def _optional_string(value: Any) -> Optional[str]:
+    if value in (None, ""):
+        return None
+    return str(value)
 
 
 def _build_environments(specs: Iterable[Mapping[str, Any]], base_dir: Path) -> List[Any]:

@@ -13,6 +13,29 @@ from fi.simulate import (
 from fi.simulate.cli import main
 
 
+FRAMEWORK_AGENT_MODULE = """
+class LangGraphLikeAgent:
+    async def ainvoke(self, payload):
+        assert "manifest-declared framework target" in payload["input"]
+        assert payload["metadata"]["framework"] == "langgraph"
+        return {
+            "content": "CLI framework manifest target passed with runtime trace evidence.",
+            "tool_calls": [
+                {
+                    "id": "trace",
+                    "name": "inspect_framework_runtime",
+                    "arguments": {"framework": "langgraph"},
+                }
+            ],
+            "metadata": {"runtime_contract": {"passed": True}},
+        }
+
+
+def build_agent():
+    return LangGraphLikeAgent()
+"""
+
+
 def _portfolio_manifest():
     return {
         "version": "agent-simulate.cli.v1",
@@ -515,6 +538,35 @@ def _redteam_manifest():
     }
 
 
+def _framework_manifest():
+    return {
+        "version": "agent-simulate.cli.v1",
+        "name": "cli-framework-manifest",
+        "required_env": ["SIMULATE_CLI_FRAMEWORK_KEY"],
+        "scenario": {
+            "name": "cli-framework-manifest",
+            "dataset": [
+                {
+                    "persona": {"name": "Riya", "role": "ci-owner"},
+                    "situation": "Riya needs a manifest-declared framework target certified from the CLI.",
+                    "outcome": "CLI framework manifest target passed with runtime trace evidence.",
+                }
+            ],
+        },
+        "agent": {
+            "type": "framework",
+            "framework": "langgraph",
+            "target": "framework_agent.py:build_agent",
+            "factory": True,
+            "method": "ainvoke",
+            "input_mode": "dict",
+            "trace_runtime": True,
+        },
+        "simulation": {"engine": "local_text", "max_turns": 1, "min_turns": 1},
+        "evaluation": {"enabled": False},
+    }
+
+
 def test_cli_runner_executes_manifest_and_writes_json_and_junit(tmp_path, monkeypatch):
     monkeypatch.setenv("SIMULATE_CLI_TEST_KEY", "real-local-test-key")
     manifest_path = tmp_path / "manifest.json"
@@ -530,6 +582,28 @@ def test_cli_runner_executes_manifest_and_writes_json_and_junit(tmp_path, monkey
     assert payload["summary"]["metric_averages"]["optimizer_portfolio_coverage"] == 1.0
     assert payload["summary"]["metric_averages"]["optimizer_portfolio_quality"] == 1.0
     assert "failures=\"0\"" in junit_path.read_text(encoding="utf-8")
+
+
+def test_cli_runner_executes_framework_manifest_agent(tmp_path, monkeypatch):
+    monkeypatch.setenv("SIMULATE_CLI_FRAMEWORK_KEY", "real-local-framework-key")
+    (tmp_path / "framework_agent.py").write_text(
+        FRAMEWORK_AGENT_MODULE,
+        encoding="utf-8",
+    )
+    manifest_path = tmp_path / "framework.json"
+    output_path = tmp_path / "framework-result.json"
+    manifest_path.write_text(json.dumps(_framework_manifest()), encoding="utf-8")
+
+    exit_code = main(["run", str(manifest_path), "--output", str(output_path)])
+
+    assert exit_code == 0
+    payload = json.loads(output_path.read_text(encoding="utf-8"))
+    assert payload["status"] == "passed"
+    case = payload["report"]["results"][0]
+    assert "CLI framework manifest target passed" in case["transcript"]
+    runtime = case["metadata"]["environment_state"]["framework_runtime"]
+    assert runtime["framework"] == "langgraph"
+    assert runtime["summary"]["tool_call_count"] == 1
 
 
 def test_cli_runner_fails_fast_on_missing_required_env(tmp_path, monkeypatch):

@@ -383,6 +383,19 @@ agent-simulate optimize examples/cli_optimizer_portfolio_optimization.json \
   --junit artifacts/optimizer-portfolio-optimization.junit.xml
 ```
 
+Framework agents can also be declared directly in the manifest. The CLI loads
+the target relative to the manifest file, wraps it with the same
+`wrap_framework` presets used by the Python SDK, and can emit framework runtime
+trace evidence for `ai-evaluation` and `agent-opt`.
+
+```bash
+export SIMULATE_CLI_FRAMEWORK_EXAMPLE_KEY="your-real-ci-secret-or-local-test-key"
+
+agent-simulate run examples/cli_framework_manifest.json \
+  --output artifacts/framework-runtime-result.json \
+  --junit artifacts/framework-runtime.junit.xml
+```
+
 The same manifest runtime is available as a Python API for SDKs, services, and
 Future AGI UI workers that should run simulations without shelling out:
 
@@ -431,7 +444,10 @@ without running the simulation.
 Manifests currently support:
 
 - `simulation.engine: local_text`
-- scripted, echo, or `module:function` Python-callable agents
+- scripted, echo, `module:function` Python-callable agents, and
+  manifest-declared framework agents with `agent.type: framework`,
+  `agent.framework`, `agent.target`, optional `agent.factory`, `agent.method`,
+  `agent.input_mode`, `agent.output_key`, `agent.trace_runtime`, and metadata
 - replay environments such as `optimizer_backend_portfolio`,
   `optimizer_society_trace`, `agent_memory_lineage`,
   `adversarial_attack_pack`, `red_team_campaign`, `red_team_readiness`,
@@ -458,8 +474,8 @@ Manifests currently support:
   `load_manifest`, `detect_manifest_command`, `run_manifest_file`,
   `run_redteam_manifest_file`, `optimize_manifest_file`, `replay_manifests`,
   `create_baseline`, `compare_results`, `render_report`,
-  `promote_to_regression`, `render_junit`, `render_sarif`, and
-  `render_markdown`
+  `promote_to_regression`, `build_manifest_agent_callback`, `render_junit`,
+  `render_sarif`, and `render_markdown`
 - `optimization.target.search_space` over JSON paths in the same manifest when
   `agent-opt` is installed
 - JSON, JUnit, SARIF, and Markdown outputs from CLI flags or manifest `outputs`

@@ -89,6 +89,23 @@ def apply_manifest_env(manifest: Mapping[str, Any]) -> None:
     _cli()._apply_manifest_env(manifest)
 
 
+def build_manifest_agent_callback(
+    agent: Mapping[str, Any],
+    *,
+    base_dir: str | Path = ".",
+) -> Any:
+    """Build the runtime callback for a manifest ``agent`` block.
+
+    Supports scripted, echo, python callable, and framework adapter agents using
+    the same loader/wrapper path as the CLI.
+    """
+
+    return _cli()._build_agent_callback(
+        copy.deepcopy(dict(agent)),
+        Path(base_dir).expanduser().resolve(),
+    )
+
+
 async def run_local_text_manifest(
     manifest: Mapping[str, Any],
     manifest_path: str | Path,
@@ -690,6 +707,7 @@ __all__ = [
     "ManifestOptimizationOptions",
     "ManifestRunOptions",
     "apply_manifest_env",
+    "build_manifest_agent_callback",
     "build_manifest_optimization_problem",
     "compare_result_files",
     "compare_results",
