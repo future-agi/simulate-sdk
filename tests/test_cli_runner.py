@@ -12,7 +12,7 @@ from fi.simulate import (
 )
 from fi.simulate.cli import main
 
-from manifest_fixtures import environment_registry_manifest
+from manifest_fixtures import environment_registry_manifest, redteam_matrix_manifest
 
 
 FRAMEWORK_AGENT_MODULE = """
@@ -731,6 +731,52 @@ def test_cli_runner_redteam_runs_manifest_and_writes_json_junit_sarif(tmp_path, 
     sarif = json.loads(sarif_path.read_text(encoding="utf-8"))
     assert sarif["version"] == "2.1.0"
     assert sarif["runs"][0]["tool"]["driver"]["name"] == "agent-simulate redteam"
+    assert sarif["runs"][0]["results"] == []
+
+
+def test_cli_runner_redteam_auto_generates_attack_matrix(tmp_path, monkeypatch):
+    monkeypatch.setenv("SIMULATE_CLI_REDTEAM_MATRIX_KEY", "real-local-redteam-matrix-key")
+    manifest_path = tmp_path / "redteam-matrix.json"
+    output_path = tmp_path / "redteam-matrix-result.json"
+    junit_path = tmp_path / "redteam-matrix.junit.xml"
+    sarif_path = tmp_path / "redteam-matrix.sarif.json"
+    manifest_path.write_text(json.dumps(redteam_matrix_manifest()), encoding="utf-8")
+
+    exit_code = main(
+        [
+            "redteam",
+            str(manifest_path),
+            "--output",
+            str(output_path),
+            "--junit",
+            str(junit_path),
+            "--sarif",
+            str(sarif_path),
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(output_path.read_text(encoding="utf-8"))
+    metrics = payload["summary"]["metric_averages"]
+    assert payload["status"] == "passed"
+    assert payload["redteam"]["auto_generate"] is True
+    assert {"adversarial_attack_pack", "red_team_campaign"} <= set(payload["redteam"]["environment_types"])
+    assert metrics["adversarial_resilience"] == 1.0
+    assert metrics["red_team_campaign_coverage"] == 1.0
+    assert metrics["red_team_campaign_quality"] == 1.0
+
+    case = payload["report"]["results"][0]
+    state = case["metadata"]["environment_state"]
+    attack_pack = state["adversarial"]["attack_pack"]
+    campaign = state["red_team_campaign"]
+    assert attack_pack["summary"]["attack_count"] == 6
+    assert attack_pack["summary"]["canary_count"] == 1
+    assert campaign["summary"]["scenario_count"] == 12
+    assert campaign["summary"]["run_count"] == 4
+    assert campaign["summary"]["missing_required_attack_types"] == []
+    assert campaign["summary"]["missing_required_providers"] == []
+    assert "failures=\"0\"" in junit_path.read_text(encoding="utf-8")
+    sarif = json.loads(sarif_path.read_text(encoding="utf-8"))
     assert sarif["runs"][0]["results"] == []
 
 

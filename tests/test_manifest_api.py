@@ -16,7 +16,9 @@ from fi.simulate import (
     load_manifest,
     missing_manifest_env,
     optimize_manifest_file,
+    prepare_redteam_manifest,
     promote_to_regression,
+    redteam_manifest_file,
     render_junit,
     render_markdown,
     render_report,
@@ -27,7 +29,7 @@ from fi.simulate import (
     validate_manifest_env,
 )
 
-from manifest_fixtures import environment_registry_manifest
+from manifest_fixtures import environment_registry_manifest, redteam_matrix_manifest
 
 
 FRAMEWORK_AGENT_MODULE = """
@@ -215,6 +217,39 @@ def test_public_manifest_environment_registry_builds_and_runs(tmp_path, monkeypa
         and event["payload"].get("tool") == "lookup_policy"
     ]
     assert [event["success"] for event in tool_events] == [False, True]
+
+
+def test_public_redteam_manifest_prepares_generated_matrix(tmp_path, monkeypatch):
+    monkeypatch.setenv("SIMULATE_PUBLIC_REDTEAM_MATRIX_KEY", "real-local-redteam-matrix-key")
+    manifest = redteam_matrix_manifest(
+        name="public-redteam-matrix",
+        required_env="SIMULATE_PUBLIC_REDTEAM_MATRIX_KEY",
+    )
+    original = copy.deepcopy(manifest)
+    manifest_path = tmp_path / "redteam-matrix.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    prepared = prepare_redteam_manifest(manifest)
+    result = asyncio.run(redteam_manifest_file(manifest_path))
+
+    assert manifest == original
+    env_types = {
+        item["type"]
+        for item in prepared["simulation"]["environments"]
+    }
+    assert {"adversarial_attack_pack", "red_team_campaign"} <= env_types
+    assert prepared["simulation"]["environments"][0]["data"]["metadata"]["source"] == "redteam.auto_generate"
+    assert result["status"] == "passed"
+    assert result["exit_code"] == 0
+    assert result["redteam"]["auto_generate"] is True
+    assert {"adversarial_attack_pack", "red_team_campaign"} <= set(result["redteam"]["environment_types"])
+    metrics = result["summary"]["metric_averages"]
+    assert metrics["adversarial_resilience"] == 1.0
+    assert metrics["red_team_campaign_quality"] == 1.0
+    state = result["report"]["results"][0]["metadata"]["environment_state"]
+    assert state["adversarial"]["attack_pack"]["summary"]["attack_count"] == 6
+    assert state["red_team_campaign"]["summary"]["scenario_count"] == 12
+    assert state["red_team_campaign"]["summary"]["open_high_finding_count"] == 0
 
 
 def _write_manifest(path: Path, manifest: dict):

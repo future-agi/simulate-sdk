@@ -128,6 +128,14 @@ def build_manifest_environments(
     return _cli()._build_environments(specs, Path(base_dir).expanduser().resolve())
 
 
+def prepare_redteam_manifest(manifest: Mapping[str, Any]) -> Dict[str, Any]:
+    """Return a red-team manifest with CLI defaults and generated environments applied."""
+
+    runtime_manifest = copy.deepcopy(dict(manifest))
+    _cli()._prepare_redteam_manifest(runtime_manifest)
+    return runtime_manifest
+
+
 async def run_local_text_manifest(
     manifest: Mapping[str, Any],
     manifest_path: str | Path,
@@ -743,6 +751,7 @@ __all__ = [
     "missing_manifest_env",
     "optimize_manifest",
     "optimize_manifest_file",
+    "prepare_redteam_manifest",
     "promote_to_regression",
     "promote_to_regression_file",
     "public_result",

@@ -313,6 +313,20 @@ agent-simulate redteam examples/cli_redteam_manifest.json \
   --sarif artifacts/redteam.sarif.json
 ```
 
+For a promptfoo-style matrix run, set `redteam.auto_generate: true` and declare
+the taxonomies, attacks, surfaces, providers, and frameworks. The CLI
+materializes a local adversarial attack pack plus campaign evidence before
+running the same `ai-evaluation` gates.
+
+```bash
+export SIMULATE_CLI_REDTEAM_MATRIX_EXAMPLE_KEY="your-real-ci-secret-or-local-test-key"
+
+agent-simulate redteam examples/cli_redteam_matrix_manifest.json \
+  --output artifacts/redteam-matrix-result.json \
+  --junit artifacts/redteam-matrix.junit.xml \
+  --sarif artifacts/redteam-matrix.sarif.json
+```
+
 Create compact baselines from passing results before storing them in the repo
 or artifact registry. Baselines keep scores, metrics, findings, and red-team
 summaries, while dropping bulky raw report payloads by default.
@@ -482,6 +496,9 @@ Manifests currently support:
 - pure-data local environment adapters: `tool_mock`/`mock_tools`,
   `tool_fault_injection`/`tool_fault`, `file`/`files`, `world_contract`, and
   `framework_trace`
+- `redteam.auto_generate: true` for materializing a local attack matrix into an
+  `adversarial_attack_pack` plus `red_team_campaign` from taxonomy, attack,
+  surface, channel, provider, framework, blocked-tool, and canary declarations
 - local `evaluation.agent_report.config` passed directly to `ai-evaluation`
 - `agent-simulate baseline` creates compact compare-safe baseline artifacts
 - `agent-simulate compare` gates baseline/current result artifacts by score
@@ -1194,6 +1211,7 @@ See [`examples/local_langgraph_event_stream_replay.py`](examples/local_langgraph
 See [`examples/local_cross_trial_memory_skill.py`](examples/local_cross_trial_memory_skill.py) for cross-trial memory/skill checks over LangGraph/LangChain-style framework trace events.
 See [`examples/local_world_contract_replay.py`](examples/local_world_contract_replay.py) for world contract state-machine checks over actors, resources, transitions, invariants, success conditions, policy gates, adversarial surfaces, and final state.
 See [`examples/cli_world_framework_manifest.json`](examples/cli_world_framework_manifest.json) for a promptfoo-style CLI manifest that combines tool mocks, fault injection, files, world contracts, framework trace evidence, JSON/JUnit/SARIF output, and local `ai-evaluation` gates.
+See [`examples/cli_redteam_matrix_manifest.json`](examples/cli_redteam_matrix_manifest.json) for a promptfoo-style red-team matrix that generates local adversarial attack-pack and campaign evidence from one `redteam` block.
 See [`examples/local_evidence_grounding.py`](examples/local_evidence_grounding.py) for retrieval plus image artifact evidence checks that catch source contradictions and unsupported artifact claims.
 See [`examples/local_structured_artifact_semantics.py`](examples/local_structured_artifact_semantics.py) for parsed receipt/form/table/log-style structured artifacts with semantic field, row, event-sequence, and answer-claim checks.
 See [`examples/local_domain_package_quality.py`](examples/local_domain_package_quality.py) for support ticket, ledger, calendar, and email-thread package fixtures with deterministic workflow-invariant scoring.
