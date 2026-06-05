@@ -22,7 +22,6 @@ keywords = [
 classifiers = [
   "Development Status :: 4 - Beta",
   "Intended Audience :: Developers",
-  "License :: OSI Approved :: Apache Software License",
   "Operating System :: OS Independent",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.10",
@@ -30,9 +29,6 @@ classifiers = [
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
   "Topic :: Scientific/Engineering :: Artificial Intelligence",
-  "Topic :: Software Development :: Libraries :: Python Modules",
-  "Topic :: Software Development :: Testing",
-  "Topic :: Multimedia :: Sound/Audio :: Speech",
 ]
 packages = [
   { include = "legacy_simulate_source_marker" }
@@ -54,11 +50,6 @@ python = ">=3.10,<3.14"
 livekit = []
 evaluation = []
 all = []
-
-[tool.poetry.group.dev.dependencies]
-pytest = ">=8.0.0"
-black = ">=24.0.0"
-ruff = ">=0.4.0"
 
 [build-system]
 requires = ["poetry-core"]
